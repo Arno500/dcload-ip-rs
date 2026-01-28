@@ -1,0 +1,140 @@
+{
+  // Utilisez IntelliSense pour en savoir plus sur les attributs possibles.
+  // Pointez pour afficher la description des attributs existants.
+  // Pour plus d'informations, visitez : https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'dcload-ip-rs'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=dcload-ip-rs",
+          "--package=dcload-ip-rs"
+        ],
+        "filter": {
+          "name": "dcload-ip-rs",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "--host",
+        "192.168.1.64",
+        // "--address",
+        // "0xac010000",
+        "u-exec",
+        // "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\1ST_READ.BIN",
+        "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
+        // "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\1ST_READ_UNSCRAMBLED.BIN",
+        // "C:\\Users\\arnod\\Documents\\Dreamcast\\loader.elf",
+        "-d",
+        // "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!].gdi",
+        "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi",
+        // "-m",
+        // "test"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "RUST_LOG": "debug"
+      },
+      "stdio": "",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ],
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Run dc-load-ip",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=dcload-ip-rs",
+          "--package=dcload-ip-rs"
+        ],
+        "filter": {
+          "name": "dcload-ip-rs",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "--host",
+        "192.168.1.64",
+        // "--address",
+        // "0xac010000",
+        "u-exec",
+        "C:\\Users\\arnod\\Documents\\Dreamcast\\loader.elf",
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "RUST_LOG": "debug"
+      },
+      "stdio": "",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ],
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Run Dreamshell",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=dcload-ip-rs",
+          "--package=dcload-ip-rs"
+        ],
+        "filter": {
+          "name": "dcload-ip-rs",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "--host",
+        "192.168.1.64",
+        // "--address",
+        // "0xac010000",
+        "u-exec",
+        "C:\\Users\\arnod\\Documents\\Dreamcast\\DS.elf",
+        "-d",
+        // "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!].gdi",
+        "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi",
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "RUST_LOG": "debug"
+      },
+      "stdio": "",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ],
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'dcload-ip-rs'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=dcload-ip-rs",
+          "--package=dcload-ip-rs"
+        ],
+        "filter": {
+          "name": "dcload-ip-rs",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
