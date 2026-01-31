@@ -27,7 +27,7 @@ impl Gdi {
                                 let start_lba = parts[1].parse().unwrap_or(0);
                                 let track_type: u8 = parts[2].parse().unwrap_or(0);
                                 let sector_size: u8 = parts[3].parse().unwrap_or(0);
-                                let track = Path::join(parent_path, parts[4].to_string())
+                                let track = Path::join(parent_path, parts[4])
                                     .to_string_lossy()
                                     .into();
                                 let offset: u32 = parts[5].parse().unwrap_or(0);

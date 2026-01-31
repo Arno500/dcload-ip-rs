@@ -5,7 +5,7 @@ pub enum DCLoadCmds {
     Execute(),
     LoadBinary(),
     PartBinary(Box<[u8; 1440]>),
-    DoneBinary(),
+    DoneBinary(Option<Box<[u8; 1440]>>),
     SendBinary(),
     SendBinaryQuiet(),
     Version(Option<Box<[u8; 1440]>>),
@@ -24,7 +24,7 @@ pub struct DCLoadCmd {
 
 impl From<DCLoadCmd> for Vec<u8> {
     fn from(val: DCLoadCmd) -> Self {
-        let mut data: Vec<u8> = Vec::with_capacity(12);
+        let mut data: Vec<u8> = Vec::new();
         let mut cmd_bytes = match val.cmd {
             DCLoadCmds::Execute() => b"EXEC".to_vec(),
             DCLoadCmds::LoadBinary() => b"LBIN".to_vec(),
@@ -32,7 +32,7 @@ impl From<DCLoadCmd> for Vec<u8> {
                 data = bin.to_vec();
                 b"PBIN".to_vec()
             }
-            DCLoadCmds::DoneBinary() => b"DBIN".to_vec(),
+            DCLoadCmds::DoneBinary(_) => b"DBIN".to_vec(),
             DCLoadCmds::SendBinary() => b"SBIN".to_vec(),
             DCLoadCmds::SendBinaryQuiet() => b"SBIQ".to_vec(),
             DCLoadCmds::Version(None) => b"VERS".to_vec(),
@@ -65,7 +65,7 @@ pub struct DCReturnCmd {
 }
 
 impl TryFrom<Vec<u8>> for DCReturnCmd {
-    type Error = &'static str;
+    type Error = String;
 
     fn try_from(input: Vec<u8>) -> Result<DCReturnCmd, Self::Error> {
         if input.len() < 5 {
@@ -79,14 +79,14 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
                     error_code: Some(u32::from_be(return_code)),
                 });
             }
-            return Err("Input data invalid for DCReturnCmd");
+            return Err("Input data invalid for DCReturnCmd".to_string());
         }
 
         if input.len() < 12 {
-            return Err("Input data too short to be a valid DCLoadCmd");
+            return Err("Input data too short to be a valid DCLoadCmd".to_string());
         }
         if &input[0..2] == b"DC" {
-            let client_cmd = DCLoadClientCmds::try_from(input);
+            let client_cmd = DCLoadClientCmds::try_from(input.clone());
             if let Ok(client_cmd) = client_cmd {
                 return Ok(DCReturnCmd {
                     cmd: None,
@@ -105,19 +105,30 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
                 let mut bin = [0u8; 1440];
                 let len = input.len() - 12;
                 if len > 1440 {
-                    return Err("Input data too long for PBIN command");
+                    return Err("Input data too long for PBIN command".to_string());
                 }
                 bin[..len].copy_from_slice(&input[12..]);
                 DCLoadCmds::PartBinary(Box::new(bin))
             }
-            b"DBIN" => DCLoadCmds::DoneBinary(),
+            b"DBIN" => {
+                let mut bin = [0u8; 1440];
+                let len = input.len() - 12;
+                if len > 1440 {
+                    return Err("Input data too long for DBIN command".to_string());
+                } else if len == 0 {
+                    DCLoadCmds::DoneBinary(None)
+                } else {
+                    bin[..len].copy_from_slice(&input[12..]);
+                    DCLoadCmds::DoneBinary(Some(Box::new(bin)))
+                }
+            },
             b"SBIN" => DCLoadCmds::SendBinary(),
             b"SBIQ" => DCLoadCmds::SendBinaryQuiet(),
             b"VERS" => {
                 let mut bin = [0u8; 1440];
                 let len = input.len() - 12;
                 if len > 1440 {
-                    return Err("Input data too long for VERS command");
+                    return Err("Input data too long for VERS command".to_string());
                 }
                 bin[..len].copy_from_slice(&input[12..]);
                 DCLoadCmds::Version(Some(Box::new(bin)))
@@ -126,7 +137,7 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
             b"RBOT" => DCLoadCmds::Reboot(),
             b"MAPL" => DCLoadCmds::Mapl(),
             b"PMCR" => DCLoadCmds::PerformanceCounter(),
-            _ => return Err("Unknown command"),
+            _ => return Err("Unknown command".to_string()),
         };
         let address = u32::from_be_bytes(input[4..8].try_into().unwrap());
         let size = u32::from_be_bytes(input[8..12].try_into().unwrap());

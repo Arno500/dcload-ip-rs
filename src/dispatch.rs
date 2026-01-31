@@ -1,15 +1,22 @@
 use std::{
-    io::{Error, ErrorKind}, path::Path, thread::sleep, time::Duration
+    io::{Error, ErrorKind},
+    path::Path,
+    thread::sleep,
+    time::Duration,
 };
 
 use elf::{ElfBytes, endian::AnyEndian, section::SectionHeader};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::{
-    CHUNK_SIZE, PROTOCOL_VERSION, cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd}, disc_formats::{
+    CHUNK_SIZE, PROTOCOL_VERSION,
+    cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
+    disc_formats::{
         self,
         types::{StubDisc, get_disc_format},
-    }, fs, io::ExternalDcIo
+    },
+    fs,
+    io::ExternalDcIo,
 };
 
 pub fn upload(
@@ -128,7 +135,7 @@ pub fn reboot(
 pub fn receive_syscalls(
     conn: &mut impl ExternalDcIo,
     cd_path: Option<String>,
-    mount: Option<String>
+    mount: Option<String>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     let mut disc = get_disc_format(StubDisc {});
     if let Some(cd_path) = cd_path
@@ -170,10 +177,6 @@ pub fn receive_syscalls(
                                         warn!("Failed to handle FS syscall: {}", e);
                                     }
                                 }
-                            }
-                            // This is a FS related syscall handle somewhere else
-                            _ => {
-                                warn!("Received unhandled syscall: {:?}", inner_cmd);
                             }
                         }
                     }
@@ -261,13 +264,13 @@ pub fn send_data(
     if let Ok(cmds) = call_command(
         conn,
         DCLoadCmd {
-            cmd: DCLoadCmds::DoneBinary(),
+            cmd: DCLoadCmds::DoneBinary(None),
             address: 0,
             size: 0,
         },
     ) && let Some(ret_cmd) = cmds.first()
         && let Some(cmd) = ret_cmd.cmd.clone()
-        && cmd.cmd == DCLoadCmds::DoneBinary()
+        && cmd.cmd == DCLoadCmds::DoneBinary(None)
         && cmd.size > 0
     {
         let mut last_cmd = cmd;
@@ -307,7 +310,7 @@ pub fn send_data(
             if let Ok(cmds) = call_command(
                 conn,
                 DCLoadCmd {
-                    cmd: DCLoadCmds::DoneBinary(),
+                    cmd: DCLoadCmds::DoneBinary(None),
                     address: 0,
                     size: 0,
                 },
@@ -378,4 +381,139 @@ fn await_result(
             Ok(conn.handle_data(&evt)?)
         }
     }
+}
+
+pub fn receive_data(
+    conn: &mut impl ExternalDcIo,
+    timeout: Option<Duration>,
+    address: u32,
+    size: usize,
+    quiet: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let expected_chunks = size.div_ceil(1440);
+    let mut data: Vec<u8> = Vec::with_capacity(size);
+    let mut chunk_map: Vec<bool> = vec![false; expected_chunks];
+
+    conn.send_command(DCLoadCmd {
+        cmd: if quiet {
+            DCLoadCmds::SendBinaryQuiet()
+        } else {
+            DCLoadCmds::SendBinary()
+        },
+        address,
+        size: size as u32,
+    })?;
+
+    let bar = ProgressBar::new(size as u64).with_style(ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+    )?);
+
+    for _ in 0..expected_chunks {
+        match await_result(conn, timeout) {
+            Err(e) => {
+                warn!("Error waiting for data chunk: {}", e);
+            }
+            Ok(cmds) => {
+                for cmd in cmds {
+                    if let Some(inner_cmd) = cmd.cmd {
+                        match inner_cmd.cmd {
+                            DCLoadCmds::DoneBinary(Some(chunk)) => {
+                                if inner_cmd.address - address >= (size as u32 + 1440) / 1440 {
+                                    warn!("Bad packet received for DoneBinary, ignoring");
+                                    continue;
+                                }
+                                // Append data chunk to data vector
+                                let offset = (inner_cmd.address - address) as usize;
+                                data[offset..offset + chunk.len()].copy_from_slice(&chunk[..]);
+                                chunk_map[(inner_cmd.address - address) as usize / 1440] = true;
+                                bar.inc(chunk.len() as u64);
+                            }
+                            _ => {
+                                warn!(
+                                    "Unexpected command received while waiting for data: {:?}",
+                                    inner_cmd
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    loop {
+        for (i, received) in chunk_map.clone().iter().enumerate() {
+            if !received {
+                debug!("Missing chunk {}", i);
+                conn.send_command(DCLoadCmd {
+                    cmd: DCLoadCmds::SendBinaryQuiet(),
+                    address: address + (i as u32 * 1440),
+                    size: if size.is_multiple_of(1440) {
+                        1440
+                    } else {
+                        size as u32 - (i as u32 * 1440)
+                    },
+                })?;
+    
+                match await_result(conn, timeout) {
+                    Err(e) => {
+                        warn!("Error waiting for data chunk: {}", e);
+                    }
+                    Ok(cmds) => {
+                        for cmd in cmds {
+                            if let Some(inner_cmd) = cmd.cmd {
+                                match inner_cmd.cmd {
+                                    DCLoadCmds::DoneBinary(Some(chunk)) => {
+                                        if inner_cmd.address - address >= (size as u32 + 1440) / 1440 {
+                                            warn!("Bad packet received for DoneBinary, ignoring");
+                                            continue;
+                                        }
+                                        // Append data chunk to data vector
+                                        let offset = (inner_cmd.address - address) as usize;
+                                        data[offset..offset + chunk.len()].copy_from_slice(&chunk[..]);
+                                        chunk_map[(inner_cmd.address - address) as usize / 1440] = true;
+                                        bar.inc(chunk.len() as u64);
+    
+                                        match await_result(conn, timeout) {
+                                            Err(e) => {
+                                                warn!("Error waiting for data chunk: {}", e);
+                                            }
+                                            Ok(cmds) => {
+                                                for cmd in cmds {
+                                                    if let Some(inner_cmd) = cmd.cmd {
+                                                        match inner_cmd.cmd {
+                                                            DCLoadCmds::DoneBinary(None) => {}
+                                                            _ => {
+                                                                warn!(
+                                                                    "Unexpected command received after receiving data: {:?}",
+                                                                    inner_cmd
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        warn!(
+                                            "Unexpected command received while waiting for data: {:?}",
+                                            inner_cmd
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if chunk_map.iter().all(|&x| x) {
+            break;
+        }
+    }
+
+    bar.finish_with_message("Data reception complete");
+
+    Ok(data)
 }

@@ -1,6 +1,8 @@
+use std::{io::Write, time::Duration};
+
 use crate::{
     cmds::{DCLoadClientFSCmds, DCLoadCmd},
-    dispatch::send_data,
+    dispatch::{receive_data, send_data},
     io::ExternalDcIo,
     types::DCLoadStat,
 };
@@ -150,7 +152,7 @@ pub fn handle_fs_syscall(
     match cmd {
         DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size),
         // Placeholder implementations for other FS commands
-        DCLoadClientFSCmds::Write(_, _, _) => Err("Write not implemented".into()),
+        DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size),
         DCLoadClientFSCmds::Read(_, _, _) => Err("Read not implemented".into()),
         DCLoadClientFSCmds::Open(_, _, _) => Err("Open not implemented".into()),
         DCLoadClientFSCmds::Close(_) => Err("Close not implemented".into()),
@@ -181,13 +183,54 @@ fn fstat(
     let stat = file.metadata()?;
 
     let stat_data = metadata_to_stat(stat);
-    let stat_bytes: Vec<u8> = stat_data.into();
+    push_data_and_return(
+        conn,
+        stat_data.into(),
+        address,
+    )
+}
 
-    send_data(conn, stat_bytes.as_slice(), address, None)?;
+fn write(
+    conn: &mut impl ExternalDcIo,
+    fd: u32,
+    address: u32,
+    size: u32,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let fd_wrapper = FileDescriptor::from_raw_fd(fd);
+    let mut file = fd_wrapper.get_file();
+
+    let data = download_data(conn, address, size)?;
+    let bytes_written = file.write(&data)? as u32;
+
+    Ok(DCLoadCmd {
+        address: bytes_written,
+        size: bytes_written,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
+}
+
+fn push_data_and_return(
+    conn: &mut impl ExternalDcIo,
+    data: Vec<u8>,
+    address: u32,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    send_data(conn, data.as_slice(), address, None)?;
 
     Ok(DCLoadCmd {
         address: 0,
         size: 0,
         cmd: crate::cmds::DCLoadCmds::ReturnValue(),
     })
+}
+
+fn download_data(
+    conn: &mut impl ExternalDcIo,
+    address: u32,
+    size: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let data = receive_data(conn, Some(Duration::from_millis(250)), address, size as usize, true)?;
+
+    // Need to handle exceptions
+
+    Ok(data)
 }
