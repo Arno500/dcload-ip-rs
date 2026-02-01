@@ -143,6 +143,11 @@ pub fn receive_syscalls(
     {
         disc = get_disc_format(gdi);
     }
+    let base_path = mount.as_ref().map(Path::new);
+    if let Some(base_path) = base_path
+        && !base_path.exists() {
+            panic!("Mount path does not exist");
+        }
     loop {
         match await_result(conn, None) {
             Err(e) => warn!("Error waiting for syscall: {}", e),
@@ -169,7 +174,7 @@ pub fn receive_syscalls(
                                 return Ok(());
                             }
                             DCLoadClientCmds::FSCommand(cmd) => {
-                                match fs::handle_fs_syscall(conn, cmd) {
+                                match fs::handle_fs_syscall(conn, cmd, base_path) {
                                     Ok(result) => {
                                         conn.send_command(result)?;
                                     }

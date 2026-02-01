@@ -1,10 +1,10 @@
-use std::{io::Write, time::Duration};
+use std::{fs::File, io::{Read, Write}, path::Path, time::{Duration, SystemTime}};
 
 use crate::{
     cmds::{DCLoadClientFSCmds, DCLoadCmd},
     dispatch::{receive_data, send_data},
     io::ExternalDcIo,
-    types::DCLoadStat,
+    types::{DCLoadStat, ExceptionStruct},
 };
 
 // Cross-platform file descriptor abstraction
@@ -25,8 +25,17 @@ mod fd_impl {
             FileDescriptor { file }
         }
 
+        pub fn from_file(file: File) -> Self {
+            FileDescriptor { file }
+        }
+
         pub fn get_file(&self) -> &File {
             &self.file
+        }
+
+        pub fn get_fd(&self) -> u32 {
+            use std::os::unix::io::AsRawFd;
+            self.file.as_raw_fd() as u32
         }
     }
 }
@@ -50,8 +59,17 @@ mod fd_impl {
             FileDescriptor { file }
         }
 
+        pub fn from_file(file: File) -> Self {
+            FileDescriptor { file }
+        }
+
         pub fn get_file(&self) -> &File {
             &self.file
+        }
+
+        pub fn get_fd(&self) -> u32 {
+            use std::os::windows::io::AsRawHandle;
+            self.file.as_raw_handle() as u32
         }
     }
 }
@@ -69,8 +87,16 @@ mod fd_impl {
             panic!("File descriptor handling not implemented for this platform")
         }
 
+        pub fn from_file(file: File) -> Self {
+            FileDescriptor { file }
+        }
+
         pub fn get_file(&self) -> &File {
             &self.file
+        }
+
+        pub fn get_fd(&self) -> u32 {
+            panic!("File descriptor handling not implemented for this platform")
         }
     }
 }
@@ -148,13 +174,14 @@ fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
 pub fn handle_fs_syscall(
     conn: &mut impl ExternalDcIo,
     cmd: DCLoadClientFSCmds,
+    base_path: &Path
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     match cmd {
         DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size),
         // Placeholder implementations for other FS commands
         DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size),
-        DCLoadClientFSCmds::Read(_, _, _) => Err("Read not implemented".into()),
-        DCLoadClientFSCmds::Open(_, _, _) => Err("Open not implemented".into()),
+        DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size),
+        DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, base_path),
         DCLoadClientFSCmds::Close(_) => Err("Close not implemented".into()),
         DCLoadClientFSCmds::Create(_, _) => Err("Create not implemented".into()),
         DCLoadClientFSCmds::Link(_) => Err("Link not implemented".into()),
@@ -209,6 +236,81 @@ fn write(
     })
 }
 
+fn read(
+    conn: &mut impl ExternalDcIo,
+    fd: u32,
+    address: u32,
+    size: u32,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let fd_wrapper = FileDescriptor::from_raw_fd(fd);
+    let mut file = fd_wrapper.get_file();
+
+    let mut buffer = vec![0u8; size as usize];
+    let bytes_read = file.read(&mut buffer)? as u32;
+    buffer.truncate(bytes_read as usize);
+
+    push_data_and_return(conn, buffer, address)
+}
+
+fn open(
+    flags: u32,
+    _mode: u32,
+    path: String,
+    base_path: &Path,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let mut file_options = File::options();
+    if flags & 0x0001 != 0 {
+        file_options.write(true);
+    }
+    if flags & 0x0002 != 0 {
+        file_options.read(true).write(true);
+    }
+    if flags & 0x0008 != 0 {
+        file_options.append(true);
+    }
+    if flags & 0x0200 != 0 {
+        file_options.create(true);
+    }
+    if flags & 0x0400 != 0 {
+        file_options.truncate(true);
+    }
+    if flags & 0x0800 != 0 {
+        // O_EXCL is not directly supported in Rust's standard library.
+        // It can be handled by checking if the file exists before creating it.
+        if std::path::Path::new(&path).exists() {
+            // https://docs.rs/libc/latest/libc/constant.EEXIST.html
+            return Ok(DCLoadCmd { cmd: crate::cmds::DCLoadCmds::ReturnValue(), address: 17, size: 17 })
+        }
+    }
+
+    let file = file_options.open(join_and_check_path(base_path, path)?)?;
+    #[cfg(target_os = "linux")]
+    {
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(_mode as u32);
+        file.set_permissions(perms)?;
+    }
+    let fd = FileDescriptor::from_file(file).get_fd();
+
+    Ok(DCLoadCmd {
+        address: fd,
+        size: fd,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
+}
+
+fn join_and_check_path(base: &Path, relative: String) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let full_path = base.join(relative);
+    let canonical_base = base.canonicalize()?;
+    let canonical_full = full_path.canonicalize()?;
+
+    if !canonical_full.starts_with(&canonical_base) {
+        return Err("Attempted directory traversal outside of base path".into());
+    }
+
+    Ok(full_path)
+}
+
 fn push_data_and_return(
     conn: &mut impl ExternalDcIo,
     data: Vec<u8>,
@@ -230,7 +332,39 @@ fn download_data(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let data = receive_data(conn, Some(Duration::from_millis(250)), address, size as usize, true)?;
 
-    // Need to handle exceptions
+    if &data[0..4] == b"EXPT" {
+        let exception_frame: ExceptionStruct = unsafe { std::mem::transmute::<[u8; 2176 / 8], ExceptionStruct>(*<&[u8; 2176 / 8]>::try_from(&data[..2176])?) };
+        let error_string = exception_code_to_string(exception_frame.expt_code);
+
+        error!("Received exception from client: {} (code: 0x{:x})", error_string, exception_frame.expt_code);
+        error!("Exception frame:");
+        error!("{:#?}", exception_frame);
+
+        // Write raw exception data to a file for further analysis
+        std::fs::write(format!("dc_exception_dump-{}.bin", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()), &data)?;
+
+        return Err("Received error from client".into());
+    }
 
     Ok(data)
+}
+
+fn exception_code_to_string(code: u32) -> &'static str {
+    match code {
+        0x1e0 => "User break",
+        0x0e0 => "Address error (read)",
+        0x040 => "TLB miss exception (read)",
+        0x0a0 => "TLB protection violation exception (read)",
+        0x180 => "General illegal instruction exception",
+        0x1a0 => "Slot illegal instruction exception",
+        0x800 => "General FPU disable exception",
+        0x820 => "Slot FPU disable exception",
+        0x100 => "Address error (write)",
+        0x060 => "TLB miss exception (write)",
+        0x0c0 => "TLB protection violation exception (write)",
+        0x120 => "FPU exception",
+        0x080 => "Initial page write exception",
+        0x160 => "Unconditional trap (TRAPA)",
+        _ => "Unknown exception",
+    }
 }
