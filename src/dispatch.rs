@@ -174,13 +174,17 @@ pub fn receive_syscalls(
                                 return Ok(());
                             }
                             DCLoadClientCmds::FSCommand(cmd) => {
-                                match fs::handle_fs_syscall(conn, cmd, base_path) {
-                                    Ok(result) => {
-                                        conn.send_command(result)?;
+                                if let Some(base_path) = base_path {
+                                    match fs::handle_fs_syscall(conn, cmd, base_path) {
+                                        Ok(result) => {
+                                            conn.send_command(result)?;
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to handle FS syscall: {}", e);
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!("Failed to handle FS syscall: {}", e);
-                                    }
+                                } else {
+                                    warn!("Received FS syscall without base path argument set, ignoring")
                                 }
                             }
                         }

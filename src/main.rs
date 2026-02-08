@@ -1,8 +1,8 @@
-use std::{fmt::Error, process::ExitCode};
+use std::{process::ExitCode};
 
 use crate::{dispatch::send_version, io::DcIoUDP};
 
-use clap::{Command, CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use clap_num::maybe_hex;
 use pretty_env_logger::formatted_timed_builder;
 

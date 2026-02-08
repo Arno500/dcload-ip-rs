@@ -1,4 +1,4 @@
-use std::{fs::File, io::{Read, Write}, path::Path, time::{Duration, SystemTime}};
+use std::{fs::{File, OpenOptions}, io::{Read, Write}, mem::ManuallyDrop, path::{Path, PathBuf}, time::{Duration, SystemTime}, u32};
 
 use crate::{
     cmds::{DCLoadClientFSCmds, DCLoadCmd},
@@ -11,10 +11,11 @@ use crate::{
 #[cfg(target_os = "linux")]
 mod fd_impl {
     use std::fs::File;
+    use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
 
     pub struct FileDescriptor {
-        file: File,
+        file: ManuallyDrop<File>,
     }
 
     impl FileDescriptor {
@@ -22,15 +23,19 @@ mod fd_impl {
         /// This uses the actual FD passed from the client.
         pub fn from_raw_fd(fd: u32) -> Self {
             let file = unsafe { File::from_raw_fd(fd as i32) };
-            FileDescriptor { file }
+            FileDescriptor { file: ManuallyDrop::new(file) }
         }
 
         pub fn from_file(file: File) -> Self {
-            FileDescriptor { file }
+            FileDescriptor { file: ManuallyDrop::new(file) }
         }
 
         pub fn get_file(&self) -> &File {
             &self.file
+        }
+
+        pub fn get_droppable_file(&mut self) -> &mut ManuallyDrop<File> {
+            &mut self.file
         }
 
         pub fn get_fd(&self) -> u32 {
@@ -43,10 +48,11 @@ mod fd_impl {
 #[cfg(target_os = "windows")]
 mod fd_impl {
     use std::fs::File;
+    use std::mem::ManuallyDrop;
     use std::os::windows::io::FromRawHandle;
 
     pub struct FileDescriptor {
-        file: File,
+        file: ManuallyDrop<File>,
     }
 
     impl FileDescriptor {
@@ -56,15 +62,19 @@ mod fd_impl {
             // Cast the fd to a HANDLE pointer value
             let handle = fd as *mut std::ffi::c_void;
             let file = unsafe { File::from_raw_handle(handle) };
-            FileDescriptor { file }
+            FileDescriptor { file: ManuallyDrop::new(file) }
         }
 
         pub fn from_file(file: File) -> Self {
-            FileDescriptor { file }
+            FileDescriptor { file: ManuallyDrop::new(file) }
         }
 
         pub fn get_file(&self) -> &File {
             &self.file
+        }
+
+        pub fn get_droppable_file(&mut self) -> &mut ManuallyDrop<File> {
+            &mut self.file
         }
 
         pub fn get_fd(&self) -> u32 {
@@ -77,6 +87,7 @@ mod fd_impl {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod fd_impl {
     use std::fs::File;
+    use std::mem::ManuallyDrop;
 
     pub struct FileDescriptor {
         file: File,
@@ -93,6 +104,10 @@ mod fd_impl {
 
         pub fn get_file(&self) -> &File {
             &self.file
+        }
+
+        pub fn get_droppable_file(&mut self) -> &mut ManuallyDrop<File> {
+            &mut self.file
         }
 
         pub fn get_fd(&self) -> u32 {
@@ -145,28 +160,18 @@ fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i32)
             .unwrap_or(0),
-        st_dev: 0,
-        st_ino: 0,
-        st_nlink: 0,
-        st_rdev: 0,
-        st_spare1: 0,
         st_mtime_priv: stat
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i32)
             .unwrap_or(0),
-        st_spare2: 0,
         st_ctime_priv: stat
             .created()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i32)
             .unwrap_or(0),
-        st_spare3: 0,
-        st_blksize: 0,
-        st_blocks: 0,
-        st_spare4: [0; 2],
         ..Default::default()
     }
 }
@@ -181,9 +186,9 @@ pub fn handle_fs_syscall(
         // Placeholder implementations for other FS commands
         DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size),
         DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size),
-        DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, base_path),
-        DCLoadClientFSCmds::Close(_) => Err("Close not implemented".into()),
-        DCLoadClientFSCmds::Create(_, _) => Err("Create not implemented".into()),
+        DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, base_path, false),
+        DCLoadClientFSCmds::Close(fd) => close(fd),
+        DCLoadClientFSCmds::Create(flags, path) => create(flags, path, base_path),
         DCLoadClientFSCmds::Link(_) => Err("Link not implemented".into()),
         DCLoadClientFSCmds::Unlink(_) => Err("Unlink not implemented".into()),
         DCLoadClientFSCmds::ChDir(_) => Err("ChDir not implemented".into()),
@@ -257,7 +262,56 @@ fn open(
     _mode: u32,
     path: String,
     base_path: &Path,
+    create: bool
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let safe_path = join_and_check_path(base_path, path)?;
+    let mut file_options = match parse_file_flags(flags, safe_path.clone()) {
+        Ok(file_options) => file_options,
+        Err(e) => return Ok(e)
+    };
+    if create {
+        file_options.create(true).write(true).truncate(true);
+    }
+    match file_options.open(safe_path) {
+        Ok(file) => {
+            #[cfg(target_os = "linux")]
+            {
+                let mut perms = file.metadata()?.permissions();
+                perms.set_mode(_mode as u32);
+                file.set_permissions(perms)?;
+            }
+            let fd = FileDescriptor::from_file(file).get_fd();
+            Ok(DCLoadCmd {
+                address: fd,
+                size: fd,
+                cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+            })
+        }
+        Err(_) => Ok(DCLoadCmd { cmd: crate::cmds::DCLoadCmds::ReturnValue(), address: u32::MAX, size: u32::MAX })
+    }
+
+}
+
+fn close(fd: u32) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let mut filedescriptor = FileDescriptor::from_raw_fd(fd);
+    let file = filedescriptor.get_droppable_file();
+    unsafe {
+        ManuallyDrop::drop(file);
+    }
+
+    // Unfortunately in Rust, the possible errors are swallowed, so we consider a close() to always succeed
+    Ok(DCLoadCmd {
+        address: 0,
+        size: 0,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
+}
+
+fn create(flags: u32, path: String, base_path: &Path) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    open(flags, 0, path, base_path, true)
+}
+
+fn parse_file_flags(flags: u32, path: PathBuf) -> Result<OpenOptions, DCLoadCmd> {
     let mut file_options = File::options();
     if flags & 0x0001 != 0 {
         file_options.write(true);
@@ -279,24 +333,11 @@ fn open(
         // It can be handled by checking if the file exists before creating it.
         if std::path::Path::new(&path).exists() {
             // https://docs.rs/libc/latest/libc/constant.EEXIST.html
-            return Ok(DCLoadCmd { cmd: crate::cmds::DCLoadCmds::ReturnValue(), address: 17, size: 17 })
+            return Err(DCLoadCmd { cmd: crate::cmds::DCLoadCmds::ReturnValue(), address: 17, size: 17 })
         }
     }
+    Ok(file_options)
 
-    let file = file_options.open(join_and_check_path(base_path, path)?)?;
-    #[cfg(target_os = "linux")]
-    {
-        let mut perms = file.metadata()?.permissions();
-        perms.set_mode(_mode as u32);
-        file.set_permissions(perms)?;
-    }
-    let fd = FileDescriptor::from_file(file).get_fd();
-
-    Ok(DCLoadCmd {
-        address: fd,
-        size: fd,
-        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
-    })
 }
 
 fn join_and_check_path(base: &Path, relative: String) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
