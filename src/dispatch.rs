@@ -1,6 +1,6 @@
 use std::{
     io::{Error, ErrorKind},
-    path::Path,
+    path::{Path, PathBuf},
     thread::sleep,
     time::Duration,
 };
@@ -15,7 +15,7 @@ use crate::{
         self,
         types::{StubDisc, get_disc_format},
     },
-    fs,
+    fs::{self, FSSyscallState},
     io::ExternalDcIo,
 };
 
@@ -145,9 +145,14 @@ pub fn receive_syscalls(
     }
     let base_path = mount.as_ref().map(Path::new);
     if let Some(base_path) = base_path
-        && !base_path.exists() {
-            panic!("Mount path does not exist");
-        }
+        && !base_path.exists()
+    {
+        panic!("Mount path does not exist");
+    }
+    let mut fs_syscall_state = FSSyscallState {
+        base_path: base_path.map(|p| p.to_path_buf()),
+        emulated_current_dir: Path::new(".").to_path_buf(),
+    };
     loop {
         match await_result(conn, None) {
             Err(e) => warn!("Error waiting for syscall: {}", e),
@@ -174,17 +179,13 @@ pub fn receive_syscalls(
                                 return Ok(());
                             }
                             DCLoadClientCmds::FSCommand(cmd) => {
-                                if let Some(base_path) = base_path {
-                                    match fs::handle_fs_syscall(conn, cmd, base_path) {
-                                        Ok(result) => {
-                                            conn.send_command(result)?;
-                                        }
-                                        Err(e) => {
-                                            warn!("Failed to handle FS syscall: {}", e);
-                                        }
+                                match fs::handle_fs_syscall(conn, cmd, &mut fs_syscall_state) {
+                                    Ok(result) => {
+                                        conn.send_command(result)?;
                                     }
-                                } else {
-                                    warn!("Received FS syscall without base path argument set, ignoring")
+                                    Err(e) => {
+                                        warn!("Failed to handle FS syscall: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -463,7 +464,7 @@ pub fn receive_data(
                         size as u32 - (i as u32 * 1440)
                     },
                 })?;
-    
+
                 match await_result(conn, timeout) {
                     Err(e) => {
                         warn!("Error waiting for data chunk: {}", e);
@@ -473,16 +474,20 @@ pub fn receive_data(
                             if let Some(inner_cmd) = cmd.cmd {
                                 match inner_cmd.cmd {
                                     DCLoadCmds::DoneBinary(Some(chunk)) => {
-                                        if inner_cmd.address - address >= (size as u32 + 1440) / 1440 {
+                                        if inner_cmd.address - address
+                                            >= (size as u32 + 1440) / 1440
+                                        {
                                             warn!("Bad packet received for DoneBinary, ignoring");
                                             continue;
                                         }
                                         // Append data chunk to data vector
                                         let offset = (inner_cmd.address - address) as usize;
-                                        data[offset..offset + chunk.len()].copy_from_slice(&chunk[..]);
-                                        chunk_map[(inner_cmd.address - address) as usize / 1440] = true;
+                                        data[offset..offset + chunk.len()]
+                                            .copy_from_slice(&chunk[..]);
+                                        chunk_map[(inner_cmd.address - address) as usize / 1440] =
+                                            true;
                                         bar.inc(chunk.len() as u64);
-    
+
                                         match await_result(conn, timeout) {
                                             Err(e) => {
                                                 warn!("Error waiting for data chunk: {}", e);
