@@ -1,10 +1,9 @@
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    fs::{File, FileTimes, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     mem::ManuallyDrop,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
-    u32,
 };
 
 use crate::{
@@ -219,11 +218,13 @@ pub fn handle_fs_syscall(
             DCLoadClientFSCmds::Link(path) => link(path, state),
             DCLoadClientFSCmds::Unlink(path) => unlink(path, state),
             DCLoadClientFSCmds::ChDir(path) => chdir(path, state),
-            DCLoadClientFSCmds::ChMod(_, _) => Err("ChMod not implemented".into()),
-            DCLoadClientFSCmds::LSeek(_, _, _) => Err("LSeek not implemented".into()),
-            DCLoadClientFSCmds::Time() => Err("Time not implemented".into()),
-            DCLoadClientFSCmds::Stat(_, _, _) => Err("Stat not implemented".into()),
-            DCLoadClientFSCmds::UTime(_, _, _, _) => Err("UTime not implemented".into()),
+            DCLoadClientFSCmds::ChMod(mode, path) => chmod(mode, path, state),
+            DCLoadClientFSCmds::LSeek(fd, offset, whence) => lseek(fd, offset, whence),
+            DCLoadClientFSCmds::Time() => time(),
+            DCLoadClientFSCmds::Stat(address, size, path) => stat(conn, address, size, path, state),
+            DCLoadClientFSCmds::UTime(mode, access_time, modif_time, path) => {
+                utime(mode, access_time, modif_time, path, state)
+            }
             DCLoadClientFSCmds::OpenDir(_) => Err("OpenDir not implemented".into()),
             DCLoadClientFSCmds::CloseDir(_) => Err("CloseDir not implemented".into()),
             DCLoadClientFSCmds::ReadDir(_, _, _) => Err("ReadDir not implemented".into()),
@@ -275,6 +276,7 @@ fn read(
     let mut file = fd_wrapper.get_file();
 
     let mut buffer = vec![0u8; size as usize];
+    // Not fully confident that it will respect the seek, and if it will properly fill the buffer (but it should as of today)
     let bytes_read = file.read(&mut buffer)? as u32;
     buffer.truncate(bytes_read as usize);
 
@@ -301,7 +303,7 @@ fn open(
             #[cfg(target_family = "unix")]
             {
                 let mut perms = file.metadata()?.permissions();
-                perms.set_mode(_mode as u32);
+                perms.set_mode(_mode);
                 file.set_permissions(perms)?;
             }
             let fd = FileDescriptor::from_file(file).get_fd();
@@ -435,6 +437,92 @@ fn chdir(
             cmd: crate::cmds::DCLoadCmds::ReturnValue(),
         })
     }
+}
+
+fn chmod(
+    _mode: u32,
+    _path: String,
+    _state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    #[cfg(target_family = "unix")]
+    {
+        let path = join_and_check_path(_state, _path);
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(_mode);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(DCLoadCmd {
+        address: 0,
+        size: 0,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
+}
+
+fn lseek(fd: u32, offset: u32, whence: u32) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let file_descriptor = FileDescriptor::from_raw_fd(fd);
+    let mut file = file_descriptor.get_file();
+    let result = match whence {
+        0 => file.seek(SeekFrom::Start(offset as u64))?,
+        1 => file.seek(SeekFrom::Current(offset as i64))?,
+        2 => file.seek(SeekFrom::End(offset as i64))?,
+        _ => return Err(format!("Invalid whence: {}", whence).into()),
+    } as u32;
+    Ok(DCLoadCmd {
+        address: result,
+        size: result,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
+}
+
+fn time() -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs() as u32;
+    Ok(DCLoadCmd {
+        address: time,
+        size: time,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
+}
+
+fn stat(
+    conn: &mut impl ExternalDcIo,
+    address: u32,
+    _size: u32,
+    path: String,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let file = join_and_check_path(state, path)?;
+    let stat = file.metadata()?;
+
+    let stat_data = metadata_to_stat(stat);
+    push_data_and_return(conn, stat_data.into(), address)
+}
+
+fn utime(
+    mode: u32,
+    access_time: u32,
+    modif_time: u32,
+    path: String,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let file = join_and_check_path(state, path)?;
+    let file = File::open(file)?;
+    let times = match mode {
+        0 => FileTimes::new()
+            .set_accessed(SystemTime::now())
+            .set_modified(SystemTime::now()),
+        1 => FileTimes::new()
+            .set_accessed(SystemTime::UNIX_EPOCH + Duration::from_secs(access_time as u64))
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(modif_time as u64)),
+        _ => return Err(format!("Invalid mode while setting timestamp on file: {}", mode).into()),
+    };
+    file.set_times(times)?;
+    Ok(DCLoadCmd {
+        address: 0,
+        size: 0,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
 }
 
 fn parse_file_flags(flags: u32, path: PathBuf) -> Result<OpenOptions, DCLoadCmd> {
