@@ -3,6 +3,13 @@
   // Pointez pour afficher la description des attributs existants.
   // Pour plus d'informations, visitez : https://go.microsoft.com/fwlink/?linkid=830387
   "version": "0.2.0",
+  "setupCommands": [
+    {
+      "description": "Disable target async",
+      "text": "set target-async off",
+      "ignoreFailures": true
+    }
+  ],
   "configurations": [
     {
       "type": "lldb",
@@ -68,6 +75,8 @@
         // "0xac010000",
         "u-exec",
         "C:\\Users\\arnod\\Documents\\Dreamcast\\loader.elf",
+        // "-m",
+        // "test"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
@@ -102,9 +111,11 @@
         // "0xac010000",
         "u-exec",
         "C:\\Users\\arnod\\Documents\\Dreamcast\\DS.elf",
-        "-d",
+        // "-d",
         // "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!].gdi",
-        "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi",
+        // "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi",
+        "-m",
+        "test"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
