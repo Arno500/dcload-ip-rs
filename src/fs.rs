@@ -136,7 +136,7 @@ fn fstat(
         .ok_or("Invalid FD")?;
     let stat = file.metadata()?;
     let stat_data = metadata_to_stat(stat);
-    push_data_and_return(conn, stat_data.into(), address)
+    push_data_and_return(conn, stat_data.into(), address, 0)
 }
 
 fn write(
@@ -197,8 +197,9 @@ fn read(
     // Not fully confident that it will respect the seek, and if it will properly fill the buffer (but it should as of today)
     let bytes_read = file.read(&mut buffer)? as u32;
     buffer.truncate(bytes_read as usize);
+    file.seek(SeekFrom::Current(size as i64))?;
 
-    push_data_and_return(conn, buffer, address)
+    push_data_and_return(conn, buffer, address, bytes_read)
 }
 
 fn open(
@@ -426,7 +427,7 @@ fn stat(
     let stat = file.metadata()?;
 
     let stat_data = metadata_to_stat(stat);
-    push_data_and_return(conn, stat_data.into(), address)
+    push_data_and_return(conn, stat_data.into(), address, 0)
 }
 
 fn utime(
@@ -551,12 +552,7 @@ fn readdir(
             d_reclen: 0,
             d_type: filetype_to_int(unwrapped_entry.file_type()?),
         };
-        push_data_and_return(conn, out.into(), address)?;
-        Ok(DCLoadCmd {
-            address: 1,
-            size: 1,
-            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
-        })
+        push_data_and_return(conn, out.into(), address, 1)
     } else {
         Ok(DCLoadCmd {
             address: 0,
@@ -670,12 +666,13 @@ fn push_data_and_return(
     conn: &mut impl ExternalDcIo,
     data: Vec<u8>,
     address: u32,
+    return_code: u32
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     send_data(conn, data.as_slice(), address, None)?;
 
     Ok(DCLoadCmd {
-        address: 0,
-        size: 0,
+        address: return_code,
+        size: return_code,
         cmd: crate::cmds::DCLoadCmds::ReturnValue(),
     })
 }

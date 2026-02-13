@@ -186,11 +186,11 @@ pub fn receive_syscalls(
                                 debug!("Received FSCommand syscall: {:?}", cmd);
                                 match fs::handle_fs_syscall(conn, cmd, &mut fs_syscall_state) {
                                     Ok(result) => {
-                                        conn.send_command(result)?;
+                                        call_command(conn, result)?;
                                     }
                                     Err(e) => {
                                         warn!("Failed to handle FS syscall: {}", e);
-                                        conn.send_command(DCLoadCmd {
+                                        call_command(conn, DCLoadCmd {
                                             cmd: DCLoadCmds::ReturnValue(),
                                             address: u32::MAX,
                                             size: u32::MAX,
