@@ -152,8 +152,11 @@ pub fn receive_syscalls(
     let mut fs_syscall_state = FSSyscallState {
         base_path: base_path.map(|p| p.to_path_buf()),
         emulated_current_dir: Path::new(".").to_path_buf(),
+        openfiles: vec![],
         opendirs: vec![],
     };
+    fs_syscall_state.opendirs.resize_with(256, || None);
+    fs_syscall_state.openfiles.resize_with(256, || None);
     loop {
         match await_result(conn, None) {
             Err(e) => warn!("Error waiting for syscall: {}", e),
@@ -187,6 +190,11 @@ pub fn receive_syscalls(
                                     }
                                     Err(e) => {
                                         warn!("Failed to handle FS syscall: {}", e);
+                                        conn.send_command(DCLoadCmd {
+                                            cmd: DCLoadCmds::ReturnValue(),
+                                            address: u32::MAX,
+                                            size: u32::MAX,
+                                        })?;
                                     }
                                 }
                             }
@@ -249,9 +257,14 @@ pub fn send_data(
 
     // Rust have some chunking utilities, let's use them to split in 1440 bytes packets automatically
     let mut chunked = data.chunks(CHUNK_SIZE);
-    let bar = ProgressBar::new(data.len().try_into()?).with_style(ProgressStyle::with_template(
+    let bar = if data.len() < 1000 {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(data.len().try_into()?).with_style(ProgressStyle::with_template(
         "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-    )?);
+    )?)
+    };
+
     if let Some(progress_bar) = progress_bar {
         progress_bar.add(bar.clone());
     }
@@ -416,9 +429,13 @@ pub fn receive_data(
         size: size as u32,
     })?;
 
-    let bar = ProgressBar::new(size as u64).with_style(ProgressStyle::with_template(
+    let bar = if size < 1000 {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(size as u64).with_style(ProgressStyle::with_template(
         "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-    )?);
+    )?)
+    };
 
     for _ in 0..expected_chunks {
         match await_result(conn, timeout) {
@@ -436,7 +453,8 @@ pub fn receive_data(
                                 }
                                 // Append data chunk to data vector
                                 let offset = (inner_cmd.address - address) as usize;
-                                data[offset..(offset + chunk.len()).min(size)].copy_from_slice(&chunk[..chunk.len().min(size)]);
+                                data[offset..(offset + chunk.len()).min(size)]
+                                    .copy_from_slice(&chunk[..chunk.len().min(size)]);
                                 chunk_map[(inner_cmd.address - address) as usize / 1440] = true;
                                 bar.inc(chunk.len() as u64);
                             }

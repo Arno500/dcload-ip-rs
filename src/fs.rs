@@ -1,8 +1,7 @@
 use std::{
     fs::{self, File, FileTimes, FileType, OpenOptions, ReadDir},
     io::{Read, Seek, SeekFrom, Write},
-    mem::ManuallyDrop,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -15,125 +14,8 @@ use crate::{
 
 // It seems KOS struggles with dirent <= 100, so let's offset
 const DIR_OFFSET: u32 = 1337;
-
-// Cross-platform file descriptor abstraction
-#[cfg(target_family = "unix")]
-mod fd_impl {
-    use std::fs::File;
-    use std::mem::ManuallyDrop;
-    use std::os::unix::io::FromRawFd;
-
-    pub struct FileDescriptor {
-        file: ManuallyDrop<File>,
-    }
-
-    impl FileDescriptor {
-        /// Create a FileDescriptor from a raw file descriptor on Linux.
-        /// This uses the actual FD passed from the client.
-        pub fn from_raw_fd(fd: u32) -> Self {
-            let file = unsafe { File::from_raw_fd(fd as i32) };
-            FileDescriptor {
-                file: ManuallyDrop::new(file),
-            }
-        }
-
-        pub fn from_file(file: File) -> Self {
-            FileDescriptor {
-                file: ManuallyDrop::new(file),
-            }
-        }
-
-        pub fn get_file(&self) -> &File {
-            &self.file
-        }
-
-        pub fn get_droppable_file(&mut self) -> &mut ManuallyDrop<File> {
-            &mut self.file
-        }
-
-        pub fn get_fd(&self) -> u32 {
-            use std::os::unix::io::AsRawFd;
-            self.file.as_raw_fd() as u32
-        }
-    }
-}
-
-#[cfg(target_family = "windows")]
-mod fd_impl {
-    use std::fs::File;
-    use std::mem::ManuallyDrop;
-    use std::os::windows::io::FromRawHandle;
-
-    pub struct FileDescriptor {
-        file: ManuallyDrop<File>,
-    }
-
-    impl FileDescriptor {
-        /// Create a FileDescriptor from an emulated file descriptor on Windows.
-        /// On Windows, the fd parameter is interpreted as a HANDLE value.
-        pub fn from_raw_fd(fd: u32) -> Self {
-            // Cast the fd to a HANDLE pointer value
-            let handle = fd as *mut std::ffi::c_void;
-            let file = unsafe { File::from_raw_handle(handle) };
-            FileDescriptor {
-                file: ManuallyDrop::new(file),
-            }
-        }
-
-        pub fn from_file(file: File) -> Self {
-            FileDescriptor {
-                file: ManuallyDrop::new(file),
-            }
-        }
-
-        pub fn get_file(&self) -> &File {
-            &self.file
-        }
-
-        pub fn get_droppable_file(&mut self) -> &mut ManuallyDrop<File> {
-            &mut self.file
-        }
-
-        pub fn get_fd(&self) -> u32 {
-            use std::os::windows::io::AsRawHandle;
-            self.file.as_raw_handle() as u32
-        }
-    }
-}
-
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
-mod fd_impl {
-    use std::fs::File;
-    use std::mem::ManuallyDrop;
-
-    pub struct FileDescriptor {
-        file: File,
-    }
-
-    impl FileDescriptor {
-        pub fn from_raw_fd(_fd: u32) -> Self {
-            panic!("File descriptor handling not implemented for this platform")
-        }
-
-        pub fn from_file(file: File) -> Self {
-            FileDescriptor { file }
-        }
-
-        pub fn get_file(&self) -> &File {
-            &self.file
-        }
-
-        pub fn get_droppable_file(&mut self) -> &mut ManuallyDrop<File> {
-            &mut self.file
-        }
-
-        pub fn get_fd(&self) -> u32 {
-            panic!("File descriptor handling not implemented for this platform")
-        }
-    }
-}
-
-pub use fd_impl::FileDescriptor;
+// To leave some space for traditional FDs like stdout and stderr
+const FILE_OFFSET: u32 = 10;
 
 fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
     DCLoadStat {
@@ -196,6 +78,7 @@ fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
 pub struct FSSyscallState {
     pub base_path: Option<PathBuf>,
     pub emulated_current_dir: PathBuf,
+    pub openfiles: Vec<Option<File>>,
     pub opendirs: Vec<Option<(PathBuf, ReadDir)>>,
 }
 
@@ -212,23 +95,23 @@ pub fn handle_fs_syscall(
         })
     } else {
         match cmd {
-            DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size),
-            DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size),
-            DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size),
+            DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size, state),
+            DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size, state),
+            DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size, state),
             DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, state, false),
-            DCLoadClientFSCmds::Close(fd) => close(fd),
+            DCLoadClientFSCmds::Close(fd) => close(fd, state),
             DCLoadClientFSCmds::Create(flags, path) => create(flags, path, state),
             DCLoadClientFSCmds::Link(path) => link(path, state),
             DCLoadClientFSCmds::Unlink(path) => unlink(path, state),
             DCLoadClientFSCmds::ChDir(path) => chdir(path, state),
             DCLoadClientFSCmds::ChMod(mode, path) => chmod(mode, path, state),
-            DCLoadClientFSCmds::LSeek(fd, offset, whence) => lseek(fd, offset, whence),
+            DCLoadClientFSCmds::LSeek(fd, offset, whence) => lseek(fd, offset, whence, state),
             DCLoadClientFSCmds::Time() => time(),
             DCLoadClientFSCmds::Stat(address, size, path) => stat(conn, address, size, path, state),
             DCLoadClientFSCmds::UTime(mode, access_time, modif_time, path) => {
                 utime(mode, access_time, modif_time, path, state)
             }
-            DCLoadClientFSCmds::OpenDir(path) => opendir(path, state),
+            DCLoadClientFSCmds::OpenDir(path) => wrapped_opendir(path, state),
             DCLoadClientFSCmds::CloseDir(dirent) => closedir(state, dirent),
             DCLoadClientFSCmds::ReadDir(dirent, address, size) => {
                 readdir(conn, dirent, address, size, state)
@@ -243,11 +126,15 @@ fn fstat(
     fd: u32,
     address: u32,
     _size: u32,
+    state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let fd_wrapper = FileDescriptor::from_raw_fd(fd);
-    let file = fd_wrapper.get_file();
+    let file = state
+        .openfiles
+        .get_mut((fd - FILE_OFFSET) as usize)
+        .ok_or("Invalid FD")?
+        .as_mut()
+        .ok_or("Invalid FD")?;
     let stat = file.metadata()?;
-
     let stat_data = metadata_to_stat(stat);
     push_data_and_return(conn, stat_data.into(), address)
 }
@@ -257,9 +144,30 @@ fn write(
     fd: u32,
     address: u32,
     size: u32,
+    state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let fd_wrapper = FileDescriptor::from_raw_fd(fd);
-    let mut file = fd_wrapper.get_file();
+    if fd < FILE_OFFSET {
+        let data = download_data(conn, address, size)?;
+
+        match fd {
+            1 => info!("{}", String::from_utf8(data)?),
+            2 => error!("{}", String::from_utf8(data)?),
+            _ => return Err("Invalid FD".into()),
+        }
+
+        return Ok(DCLoadCmd {
+            address: size,
+            size,
+            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+        });
+    }
+
+    let file = state
+        .openfiles
+        .get_mut((fd - FILE_OFFSET) as usize)
+        .ok_or("Invalid FD")?
+        .as_mut()
+        .ok_or("Invalid FD")?;
 
     let data = download_data(conn, address, size)?;
     let bytes_written = file.write(&data)? as u32;
@@ -276,9 +184,14 @@ fn read(
     fd: u32,
     address: u32,
     size: u32,
+    state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let fd_wrapper = FileDescriptor::from_raw_fd(fd);
-    let mut file = fd_wrapper.get_file();
+    let file = state
+        .openfiles
+        .get_mut((fd - FILE_OFFSET) as usize)
+        .ok_or("Invalid FD")?
+        .as_mut()
+        .ok_or("Invalid FD")?;
 
     let mut buffer = vec![0u8; size as usize];
     // Not fully confident that it will respect the seek, and if it will properly fill the buffer (but it should as of today)
@@ -292,7 +205,7 @@ fn open(
     flags: u32,
     _mode: u32,
     path: String,
-    state: &FSSyscallState,
+    state: &mut FSSyscallState,
     create: bool,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     let safe_path = join_and_check_path(state, path)?;
@@ -303,37 +216,39 @@ fn open(
     if create {
         file_options.create(true).write(true).truncate(true);
     }
-    match file_options.open(safe_path) {
-        Ok(file) => {
-            #[cfg(target_family = "unix")]
-            {
-                let mut perms = file.metadata()?.permissions();
-                perms.set_mode(_mode);
-                file.set_permissions(perms)?;
-            }
-            let fd = FileDescriptor::from_file(file).get_fd();
-            Ok(DCLoadCmd {
-                address: fd,
-                size: fd,
-                cmd: crate::cmds::DCLoadCmds::ReturnValue(),
-            })
-        }
-        Err(_) => Ok(DCLoadCmd {
-            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
-            address: u32::MAX,
-            size: u32::MAX,
-        }),
+
+    let file = file_options.open(safe_path)?;
+    #[cfg(target_family = "unix")]
+    {
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(_mode);
+        file.set_permissions(perms)?;
     }
+    for (i, entry) in state.openfiles.iter().enumerate() {
+        if entry.is_none() {
+            state.openfiles[i] = Some(file);
+            return Ok(DCLoadCmd {
+                address: i as u32 + FILE_OFFSET,
+                size: i as u32 + FILE_OFFSET,
+                cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+            });
+        }
+    }
+
+    Err("Too many open files".into())
 }
 
-fn close(fd: u32) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let mut filedescriptor = FileDescriptor::from_raw_fd(fd);
-    let file = filedescriptor.get_droppable_file();
-    unsafe {
-        ManuallyDrop::drop(file);
+fn close(fd: u32, state: &mut FSSyscallState) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let file_entry = state
+        .openfiles
+        .get_mut((fd - FILE_OFFSET) as usize)
+        .ok_or("Invalid FD")?;
+    if file_entry.is_some() {
+        *file_entry = None;
+    } else {
+        return Err("Invalid FD".into());
     }
 
-    // Unfortunately in Rust, the possible errors are swallowed, so we consider a close() to always succeed
     Ok(DCLoadCmd {
         address: 0,
         size: 0,
@@ -344,7 +259,7 @@ fn close(fd: u32) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
 fn create(
     flags: u32,
     path: String,
-    state: &FSSyscallState,
+    state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     open(flags, 0, path, state, true)
 }
@@ -463,9 +378,19 @@ fn chmod(
     })
 }
 
-fn lseek(fd: u32, offset: u32, whence: u32) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let file_descriptor = FileDescriptor::from_raw_fd(fd);
-    let mut file = file_descriptor.get_file();
+fn lseek(
+    fd: u32,
+    offset: u32,
+    whence: u32,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let file = state
+        .openfiles
+        .get_mut((fd - FILE_OFFSET) as usize)
+        .ok_or("Invalid FD")?
+        .as_mut()
+        .ok_or("Invalid FD")?;
+
     let result = match whence {
         0 => file.seek(SeekFrom::Start(offset as u64))?,
         1 => file.seek(SeekFrom::Current(offset as i64))?,
@@ -530,6 +455,24 @@ fn utime(
     })
 }
 
+// Specifically this one should return 0 when there is an error
+fn wrapped_opendir(
+    path: String,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    match opendir(path, state) {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            warn!("{}", err);
+            Ok(DCLoadCmd {
+                address: 0,
+                size: 0,
+                cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+            })
+        }
+    }
+}
+
 fn opendir(
     path: String,
     state: &mut FSSyscallState,
@@ -585,8 +528,7 @@ fn readdir(
     if let Some(entry) = entry
         && let Ok(unwrapped_entry) = entry
     {
-        let out = DCLoadDirEnt {
-            d_name: unwrapped_entry
+        let filename = unwrapped_entry
                 .file_name()
                 .into_string()
                 .map_err(|_e| -> String {
@@ -594,9 +536,15 @@ fn readdir(
                         "Could not convert directory name: {:?}",
                         unwrapped_entry.file_name()
                     )
-                })?
-                .as_bytes()
-                .try_into()?,
+                })?;
+        if filename.len() > 255 {
+            return Err("Invalid filename".into());
+        }
+        let mut buffer = [0u8; 256];
+        buffer[..filename.len()].copy_from_slice(filename.as_bytes());
+        buffer[filename.len()] = 0;
+        let out = DCLoadDirEnt {
+            d_name: buffer,
             // Have some doubts on this one if it should be required, hopefully not
             d_ino: 0,
             d_off: 0,
@@ -653,6 +601,9 @@ fn filetype_to_int(filetype: FileType) -> u8 {
 
 fn parse_file_flags(flags: u32, path: PathBuf) -> Result<OpenOptions, DCLoadCmd> {
     let mut file_options = File::options();
+    if flags == 0 {
+        file_options.read(true);
+    }
     if flags & 0x0001 != 0 {
         file_options.write(true);
     }
@@ -683,23 +634,36 @@ fn parse_file_flags(flags: u32, path: PathBuf) -> Result<OpenOptions, DCLoadCmd>
     Ok(file_options)
 }
 
+fn sanitize_relative(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, Component::RootDir))
+        .collect()
+}
+
 fn join_and_check_path(
     state: &FSSyscallState,
     relative: String,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    if let Some(base) = &state.base_path {
-        let full_path = base.join(relative).join(&state.emulated_current_dir);
-        let canonical_base = base.canonicalize()?;
-        let canonical_full = full_path.canonicalize()?;
+    let base = state
+        .base_path
+        .as_ref()
+        .expect("Base path should not be empty there");
 
-        if !canonical_full.starts_with(&canonical_base) {
-            return Err("Attempted directory traversal outside of base path".into());
-        }
+    let sanitized = sanitize_relative(Path::new(&relative));
 
-        Ok(full_path)
-    } else {
-        panic!("Base path should not be empty there, that should have been catched above")
+    let full_path = base
+        .canonicalize()? // resolve real base
+        .join(&state.emulated_current_dir)
+        .join(sanitized);
+
+    let canonical_full = full_path.canonicalize()?;
+    let canonical_base = base.canonicalize()?;
+
+    if !canonical_full.starts_with(&canonical_base) {
+        return Err("Attempted directory traversal outside of base path".into());
     }
+
+    Ok(full_path)
 }
 
 fn push_data_and_return(
@@ -729,7 +693,7 @@ fn download_data(
         true,
     )?;
 
-    if &data[0..4] == b"EXPT" {
+    if data.len() >= 4 && &data[0..4] == b"EXPT" {
         let exception_frame: ExceptionStruct = unsafe {
             std::mem::transmute::<[u8; 2176 / 8], ExceptionStruct>(*<&[u8; 2176 / 8]>::try_from(
                 &data[..2176],

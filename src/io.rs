@@ -57,7 +57,7 @@ impl ExternalDcIo for DcIoUDP {
             if ev.key == self.key {
                 match self.socket.recv_from(&mut self.buf) {
                     Ok((n, addr)) => {
-                        debug!("Received {} bytes from {}", n, addr);
+                        trace!("Received {} bytes from {}", n, addr);
                         match DCReturnCmd::try_from(self.buf[..n].to_vec()) {
                             Ok(cmd) => cmds.push(cmd),
                             Err(err) => warn!("Failed to parse command: {}", err),

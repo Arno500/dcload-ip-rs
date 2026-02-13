@@ -82,9 +82,6 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
             return Err("Input data invalid for DCReturnCmd".to_string());
         }
 
-        if input.len() < 12 {
-            return Err("Input data too short to be a valid DCLoadCmd".to_string());
-        }
         if &input[0..2] == b"DC" {
             let client_cmd = DCLoadClientCmds::try_from(input.clone());
             if let Ok(client_cmd) = client_cmd {
@@ -97,6 +94,10 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
             if let Err(err) = client_cmd {
                 return Err(format!("Failed to parse syscall command: {:?}", err));
             }
+        }
+        if input.len() < 12 {
+            debug!("{:?}", input);
+            return Err("Input data too short to be a valid DCLoadCmd".to_string());
         }
         let cmd = match &input[0..4] {
             b"EXEC" => DCLoadCmds::Execute(),
