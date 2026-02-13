@@ -128,7 +128,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Err(e) => Err(e),
             Ok((addr, _size)) => {
                 info!("Upload complete, executing at 0x{:08x}", addr);
-                match dispatch::execute(&mut udpsender, addr, console || disc.is_some(), disc.is_some()) {
+                match dispatch::execute(&mut udpsender, addr, console || disc.is_some() || mount.is_some(), disc.is_some()) {
                     Err(e) => Err(e),
                     Ok(_) => {
                         if disc.is_some() || mount.is_some() || console {

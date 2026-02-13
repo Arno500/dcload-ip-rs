@@ -5,9 +5,9 @@ pub enum DCLoadCmds {
     Execute(),
     LoadBinary(),
     PartBinary(Box<[u8; 1440]>),
-    DoneBinary(Option<Box<[u8; 1440]>>),
-    SendBinary(),
-    SendBinaryQuiet(),
+    DoneBinary(),
+    SendBinary(Option<Box<[u8; 1440]>>),
+    SendBinaryQuiet(Option<Box<[u8; 1440]>>),
     Version(Option<Box<[u8; 1440]>>),
     ReturnValue(),
     Reboot(),
@@ -32,9 +32,9 @@ impl From<DCLoadCmd> for Vec<u8> {
                 data = bin.to_vec();
                 b"PBIN".to_vec()
             }
-            DCLoadCmds::DoneBinary(_) => b"DBIN".to_vec(),
-            DCLoadCmds::SendBinary() => b"SBIN".to_vec(),
-            DCLoadCmds::SendBinaryQuiet() => b"SBIQ".to_vec(),
+            DCLoadCmds::DoneBinary() => b"DBIN".to_vec(),
+            DCLoadCmds::SendBinary(_) => b"SBIN".to_vec(),
+            DCLoadCmds::SendBinaryQuiet(_) => b"SBIQ".to_vec(),
             DCLoadCmds::Version(None) => b"VERS".to_vec(),
             DCLoadCmds::Version(Some(ver)) => {
                 data = ver.to_vec();
@@ -110,20 +110,31 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
                 bin[..len].copy_from_slice(&input[12..]);
                 DCLoadCmds::PartBinary(Box::new(bin))
             }
-            b"DBIN" => {
+            b"DBIN" => DCLoadCmds::DoneBinary(),
+            b"SBIN" => {
                 let mut bin = [0u8; 1440];
                 let len = input.len() - 12;
                 if len > 1440 {
-                    return Err("Input data too long for DBIN command".to_string());
+                    return Err("Input data too long for SBIN command".to_string());
                 } else if len == 0 {
-                    DCLoadCmds::DoneBinary(None)
+                    DCLoadCmds::SendBinary(None)
                 } else {
                     bin[..len].copy_from_slice(&input[12..]);
-                    DCLoadCmds::DoneBinary(Some(Box::new(bin)))
+                    DCLoadCmds::SendBinary(Some(Box::new(bin)))
                 }
             },
-            b"SBIN" => DCLoadCmds::SendBinary(),
-            b"SBIQ" => DCLoadCmds::SendBinaryQuiet(),
+            b"SBIQ" => {
+                let mut bin = [0u8; 1440];
+                let len = input.len() - 12;
+                if len > 1440 {
+                    return Err("Input data too long for SBIQ command".to_string());
+                } else if len == 0 {
+                    DCLoadCmds::SendBinaryQuiet(None)
+                } else {
+                    bin[..len].copy_from_slice(&input[12..]);
+                    DCLoadCmds::SendBinaryQuiet(Some(Box::new(bin)))
+                }
+            },
             b"VERS" => {
                 let mut bin = [0u8; 1440];
                 let len = input.len() - 12;

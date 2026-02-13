@@ -152,7 +152,7 @@ pub fn receive_syscalls(
     let mut fs_syscall_state = FSSyscallState {
         base_path: base_path.map(|p| p.to_path_buf()),
         emulated_current_dir: Path::new(".").to_path_buf(),
-        opendirs: vec![]
+        opendirs: vec![],
     };
     loop {
         match await_result(conn, None) {
@@ -180,6 +180,7 @@ pub fn receive_syscalls(
                                 return Ok(());
                             }
                             DCLoadClientCmds::FSCommand(cmd) => {
+                                debug!("Received FSCommand syscall: {:?}", cmd);
                                 match fs::handle_fs_syscall(conn, cmd, &mut fs_syscall_state) {
                                     Ok(result) => {
                                         conn.send_command(result)?;
@@ -275,13 +276,13 @@ pub fn send_data(
     if let Ok(cmds) = call_command(
         conn,
         DCLoadCmd {
-            cmd: DCLoadCmds::DoneBinary(None),
+            cmd: DCLoadCmds::DoneBinary(),
             address: 0,
             size: 0,
         },
     ) && let Some(ret_cmd) = cmds.first()
         && let Some(cmd) = ret_cmd.cmd.clone()
-        && cmd.cmd == DCLoadCmds::DoneBinary(None)
+        && cmd.cmd == DCLoadCmds::DoneBinary()
         && cmd.size > 0
     {
         let mut last_cmd = cmd;
@@ -321,7 +322,7 @@ pub fn send_data(
             if let Ok(cmds) = call_command(
                 conn,
                 DCLoadCmd {
-                    cmd: DCLoadCmds::DoneBinary(None),
+                    cmd: DCLoadCmds::DoneBinary(),
                     address: 0,
                     size: 0,
                 },
@@ -402,14 +403,14 @@ pub fn receive_data(
     quiet: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let expected_chunks = size.div_ceil(1440);
-    let mut data: Vec<u8> = Vec::with_capacity(size);
+    let mut data = vec![0u8; size];
     let mut chunk_map: Vec<bool> = vec![false; expected_chunks];
 
     conn.send_command(DCLoadCmd {
         cmd: if quiet {
-            DCLoadCmds::SendBinaryQuiet()
+            DCLoadCmds::SendBinaryQuiet(None)
         } else {
-            DCLoadCmds::SendBinary()
+            DCLoadCmds::SendBinary(None)
         },
         address,
         size: size as u32,
@@ -428,17 +429,18 @@ pub fn receive_data(
                 for cmd in cmds {
                     if let Some(inner_cmd) = cmd.cmd {
                         match inner_cmd.cmd {
-                            DCLoadCmds::DoneBinary(Some(chunk)) => {
+                            DCLoadCmds::SendBinary(Some(chunk)) => {
                                 if inner_cmd.address - address >= (size as u32 + 1440) / 1440 {
                                     warn!("Bad packet received for DoneBinary, ignoring");
                                     continue;
                                 }
                                 // Append data chunk to data vector
                                 let offset = (inner_cmd.address - address) as usize;
-                                data[offset..offset + chunk.len()].copy_from_slice(&chunk[..]);
+                                data[offset..(offset + chunk.len()).min(size)].copy_from_slice(&chunk[..chunk.len().min(size)]);
                                 chunk_map[(inner_cmd.address - address) as usize / 1440] = true;
                                 bar.inc(chunk.len() as u64);
                             }
+                            DCLoadCmds::DoneBinary() => break,
                             _ => {
                                 warn!(
                                     "Unexpected command received while waiting for data: {:?}",
@@ -457,7 +459,7 @@ pub fn receive_data(
             if !received {
                 debug!("Missing chunk {}", i);
                 conn.send_command(DCLoadCmd {
-                    cmd: DCLoadCmds::SendBinaryQuiet(),
+                    cmd: DCLoadCmds::SendBinaryQuiet(None),
                     address: address + (i as u32 * 1440),
                     size: if size.is_multiple_of(1440) {
                         1440
@@ -474,7 +476,7 @@ pub fn receive_data(
                         for cmd in cmds {
                             if let Some(inner_cmd) = cmd.cmd {
                                 match inner_cmd.cmd {
-                                    DCLoadCmds::DoneBinary(Some(chunk)) => {
+                                    DCLoadCmds::SendBinary(Some(chunk)) => {
                                         if inner_cmd.address - address
                                             >= (size as u32 + 1440) / 1440
                                         {
@@ -497,7 +499,7 @@ pub fn receive_data(
                                                 for cmd in cmds {
                                                     if let Some(inner_cmd) = cmd.cmd {
                                                         match inner_cmd.cmd {
-                                                            DCLoadCmds::DoneBinary(None) => {}
+                                                            DCLoadCmds::DoneBinary() => {}
                                                             _ => {
                                                                 warn!(
                                                                     "Unexpected command received after receiving data: {:?}",
@@ -510,6 +512,7 @@ pub fn receive_data(
                                             }
                                         }
                                     }
+                                    DCLoadCmds::DoneBinary() => break,
                                     _ => {
                                         warn!(
                                             "Unexpected command received while waiting for data: {:?}",

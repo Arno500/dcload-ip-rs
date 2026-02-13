@@ -196,7 +196,7 @@ fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
 pub struct FSSyscallState {
     pub base_path: Option<PathBuf>,
     pub emulated_current_dir: PathBuf,
-    pub opendirs: Vec<Option<ReadDir>>,
+    pub opendirs: Vec<Option<(PathBuf, ReadDir)>>,
 }
 
 pub fn handle_fs_syscall(
@@ -213,7 +213,6 @@ pub fn handle_fs_syscall(
     } else {
         match cmd {
             DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size),
-            // Placeholder implementations for other FS commands
             DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size),
             DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size),
             DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, state, false),
@@ -234,7 +233,7 @@ pub fn handle_fs_syscall(
             DCLoadClientFSCmds::ReadDir(dirent, address, size) => {
                 readdir(conn, dirent, address, size, state)
             }
-            DCLoadClientFSCmds::RewindDir(_) => Err("RewindDir not implemented".into()),
+            DCLoadClientFSCmds::RewindDir(dirent) => rewinddir(dirent, state),
         }
     }
 }
@@ -536,11 +535,11 @@ fn opendir(
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     let path = join_and_check_path(state, path)?;
-    let dir = fs::read_dir(path)?;
+    let dir = fs::read_dir(&path)?;
 
     for (i, entry) in state.opendirs.iter().enumerate() {
         if entry.is_none() {
-            state.opendirs[i] = Some(dir);
+            state.opendirs[i] = Some((path, dir));
             return Ok(DCLoadCmd {
                 address: i as u32 + DIR_OFFSET,
                 size: i as u32 + DIR_OFFSET,
@@ -575,11 +574,13 @@ fn readdir(
     _size: u32,
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let index = (dirent - DIR_OFFSET) as usize;
-    let dir: &mut ReadDir = state.opendirs[index]
+    let index = dirent
+        .checked_sub(DIR_OFFSET)
+        .ok_or("Invalid dirent value")? as usize;
+    let dir: &mut (PathBuf, ReadDir) = state.opendirs[index]
         .as_mut()
         .ok_or::<String>(format!("No open directory at {}", index))?;
-    let entry = dir.next();
+    let entry = dir.1.next();
 
     if let Some(entry) = entry
         && let Ok(unwrapped_entry) = entry
@@ -615,6 +616,26 @@ fn readdir(
             cmd: crate::cmds::DCLoadCmds::ReturnValue(),
         })
     }
+}
+
+fn rewinddir(
+    dirent: u32,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let index = dirent
+        .checked_sub(DIR_OFFSET)
+        .ok_or("Invalid dirent value")? as usize;
+    let dir: &mut (PathBuf, ReadDir) = state.opendirs[index]
+        .as_mut()
+        .ok_or::<String>(format!("No open directory at {}", index))?;
+
+    dir.1 = fs::read_dir(&dir.0)?;
+
+    Ok(DCLoadCmd {
+        address: 0,
+        size: 0,
+        cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+    })
 }
 
 fn filetype_to_int(filetype: FileType) -> u8 {
