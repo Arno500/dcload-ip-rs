@@ -166,7 +166,7 @@ pub enum DCLoadClientFSCmds {
     Stat(u32, u32, String),
     UTime(u32, u32, u32, String),
     OpenDir(String),
-    CloseDir(String),
+    CloseDir(u32),
     ReadDir(u32, u32, u32),
     RewindDir(u32),
 }
@@ -245,7 +245,7 @@ impl TryFrom<Vec<u8>> for DCLoadClientCmds {
                 Ok(DCLoadClientCmds::FSCommand(DCLoadClientFSCmds::OpenDir(param1)))
             }
             b"DC17" => {
-                let param1 = extract_1_string(&input[4..])?;
+                let param1 = extract_1_u32(&input[4..])?;
                 Ok(DCLoadClientCmds::FSCommand(DCLoadClientFSCmds::CloseDir(param1)))
             }
             b"DC18" => {

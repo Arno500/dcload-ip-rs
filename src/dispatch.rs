@@ -1,6 +1,6 @@
 use std::{
     io::{Error, ErrorKind},
-    path::{Path, PathBuf},
+    path::Path,
     thread::sleep,
     time::Duration,
 };
@@ -152,6 +152,7 @@ pub fn receive_syscalls(
     let mut fs_syscall_state = FSSyscallState {
         base_path: base_path.map(|p| p.to_path_buf()),
         emulated_current_dir: Path::new(".").to_path_buf(),
+        opendirs: vec![]
     };
     loop {
         match await_result(conn, None) {

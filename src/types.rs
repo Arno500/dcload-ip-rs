@@ -3,11 +3,23 @@ use std::{error, fmt};
 #[repr(C)]
 #[derive(Debug)]
 pub struct DCLoadDirEnt {
-    d_ino: u32,
-    d_off: u32,
-    d_reclen: u16,
-    d_type: u8,
-    d_name: [u8; 256],
+    pub d_ino: u32,
+    pub d_off: u32,
+    pub d_reclen: u16,
+    pub d_type: u8,
+    pub d_name: [u8; 256],
+}
+
+impl From<DCLoadDirEnt> for Vec<u8> {
+    fn from(dirent: DCLoadDirEnt) -> Self {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&dirent.d_ino.to_le_bytes());
+        bytes.extend_from_slice(&dirent.d_off.to_le_bytes());
+        bytes.extend_from_slice(&dirent.d_reclen.to_le_bytes());
+        bytes.extend_from_slice(&dirent.d_type.to_le_bytes());
+        bytes.extend_from_slice(dirent.d_name.as_ref());
+        bytes
+    }
 }
 
 #[repr(C)]

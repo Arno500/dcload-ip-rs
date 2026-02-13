@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, FileTimes, OpenOptions},
+    fs::{self, File, FileTimes, FileType, OpenOptions, ReadDir},
     io::{Read, Seek, SeekFrom, Write},
     mem::ManuallyDrop,
     path::{Path, PathBuf},
@@ -10,8 +10,11 @@ use crate::{
     cmds::{DCLoadClientFSCmds, DCLoadCmd},
     dispatch::{receive_data, send_data},
     io::ExternalDcIo,
-    types::{DCLoadStat, ExceptionStruct},
+    types::{DCLoadDirEnt, DCLoadStat, ExceptionStruct},
 };
+
+// It seems KOS struggles with dirent <= 100, so let's offset
+const DIR_OFFSET: u32 = 1337;
 
 // Cross-platform file descriptor abstraction
 #[cfg(target_family = "unix")]
@@ -193,6 +196,7 @@ fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
 pub struct FSSyscallState {
     pub base_path: Option<PathBuf>,
     pub emulated_current_dir: PathBuf,
+    pub opendirs: Vec<Option<ReadDir>>,
 }
 
 pub fn handle_fs_syscall(
@@ -225,9 +229,11 @@ pub fn handle_fs_syscall(
             DCLoadClientFSCmds::UTime(mode, access_time, modif_time, path) => {
                 utime(mode, access_time, modif_time, path, state)
             }
-            DCLoadClientFSCmds::OpenDir(_) => Err("OpenDir not implemented".into()),
-            DCLoadClientFSCmds::CloseDir(_) => Err("CloseDir not implemented".into()),
-            DCLoadClientFSCmds::ReadDir(_, _, _) => Err("ReadDir not implemented".into()),
+            DCLoadClientFSCmds::OpenDir(path) => opendir(path, state),
+            DCLoadClientFSCmds::CloseDir(dirent) => closedir(state, dirent),
+            DCLoadClientFSCmds::ReadDir(dirent, address, size) => {
+                readdir(conn, dirent, address, size, state)
+            }
             DCLoadClientFSCmds::RewindDir(_) => Err("RewindDir not implemented".into()),
         }
     }
@@ -523,6 +529,105 @@ fn utime(
         size: 0,
         cmd: crate::cmds::DCLoadCmds::ReturnValue(),
     })
+}
+
+fn opendir(
+    path: String,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let path = join_and_check_path(state, path)?;
+    let dir = fs::read_dir(path)?;
+
+    for (i, entry) in state.opendirs.iter().enumerate() {
+        if entry.is_none() {
+            state.opendirs[i] = Some(dir);
+            return Ok(DCLoadCmd {
+                address: i as u32 + DIR_OFFSET,
+                size: i as u32 + DIR_OFFSET,
+                cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+            });
+        }
+    }
+
+    Err("Too many open directories".into())
+}
+
+fn closedir(
+    state: &mut FSSyscallState,
+    dirent: u32,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let index = (dirent - DIR_OFFSET) as usize;
+    if state.opendirs[index].is_some() {
+        state.opendirs[index] = None;
+        return Ok(DCLoadCmd {
+            address: 0,
+            size: 0,
+            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+        });
+    }
+    Err(format!("No open directory at {}", index).into())
+}
+
+fn readdir(
+    conn: &mut impl ExternalDcIo,
+    dirent: u32,
+    address: u32,
+    _size: u32,
+    state: &mut FSSyscallState,
+) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
+    let index = (dirent - DIR_OFFSET) as usize;
+    let dir: &mut ReadDir = state.opendirs[index]
+        .as_mut()
+        .ok_or::<String>(format!("No open directory at {}", index))?;
+    let entry = dir.next();
+
+    if let Some(entry) = entry
+        && let Ok(unwrapped_entry) = entry
+    {
+        let out = DCLoadDirEnt {
+            d_name: unwrapped_entry
+                .file_name()
+                .into_string()
+                .map_err(|_e| -> String {
+                    format!(
+                        "Could not convert directory name: {:?}",
+                        unwrapped_entry.file_name()
+                    )
+                })?
+                .as_bytes()
+                .try_into()?,
+            // Have some doubts on this one if it should be required, hopefully not
+            d_ino: 0,
+            d_off: 0,
+            d_reclen: 0,
+            d_type: filetype_to_int(unwrapped_entry.file_type()?),
+        };
+        push_data_and_return(conn, out.into(), address)?;
+        Ok(DCLoadCmd {
+            address: 1,
+            size: 1,
+            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+        })
+    } else {
+        Ok(DCLoadCmd {
+            address: 0,
+            size: 0,
+            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
+        })
+    }
+}
+
+fn filetype_to_int(filetype: FileType) -> u8 {
+    if filetype.is_dir() {
+        return 4;
+    }
+    if filetype.is_file() {
+        return 8;
+    }
+    if filetype.is_symlink() {
+        return 10;
+    }
+    0
 }
 
 fn parse_file_flags(flags: u32, path: PathBuf) -> Result<OpenOptions, DCLoadCmd> {

@@ -1,10 +1,14 @@
 #[derive(Debug)]
 pub struct Track {
+    #[allow(unused)]
     pub(crate) track_number: u8,
     pub(crate) start_lba: u32,
+    #[allow(unused)]
     pub(crate) track_type: u8,
+    #[allow(unused)]
     pub(crate) sector_size: u8,
     pub(crate) track: String,
+    #[allow(unused)]
     pub(crate) offset: u32,
     pub(crate) file: Option<std::fs::File>,
 }
