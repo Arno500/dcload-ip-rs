@@ -1,8 +1,5 @@
 use std::{
-    fs::{self, File, FileTimes, FileType, OpenOptions, ReadDir},
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
-    time::{Duration, SystemTime},
+    fs::{self, File, FileTimes, FileType, Metadata, OpenOptions, ReadDir}, io::{Read, Seek, SeekFrom, Write}, path::{Component, Path, PathBuf}, time::{Duration, SystemTime}
 };
 
 use crate::{
@@ -49,7 +46,7 @@ fn metadata_to_stat(stat: std::fs::Metadata) -> DCLoadStat {
             }
             #[cfg(not(target_family = "unix"))]
             {
-                0
+                filemeta_to_int(&stat)
             }
         },
         st_size: stat.len() as i32,
@@ -197,7 +194,8 @@ fn read(
     // Not fully confident that it will respect the seek, and if it will properly fill the buffer (but it should as of today)
     let bytes_read = file.read(&mut buffer)? as u32;
     buffer.truncate(bytes_read as usize);
-    file.seek(SeekFrom::Current(size as i64))?;
+
+    debug!("Reading file: {:?}", file);
 
     push_data_and_return(conn, buffer, address, bytes_read)
 }
@@ -550,7 +548,7 @@ fn readdir(
             d_ino: 0,
             d_off: 0,
             d_reclen: 0,
-            d_type: filetype_to_int(unwrapped_entry.file_type()?),
+            d_type: dirent_filetype_to_int(unwrapped_entry.file_type()?),
         };
         push_data_and_return(conn, out.into(), address, 1)
     } else {
@@ -582,7 +580,7 @@ fn rewinddir(
     })
 }
 
-fn filetype_to_int(filetype: FileType) -> u8 {
+fn dirent_filetype_to_int(filetype: FileType) -> u8 {
     if filetype.is_dir() {
         return 4;
     }
@@ -591,6 +589,19 @@ fn filetype_to_int(filetype: FileType) -> u8 {
     }
     if filetype.is_symlink() {
         return 10;
+    }
+    0
+}
+
+fn filemeta_to_int(file_meta: &Metadata) -> i32 {
+    if file_meta.is_dir() {
+        return 0o040755;
+    }
+    if file_meta.is_file() {
+        return 0o100644;
+    }
+    if file_meta.is_symlink() {
+        return 0o120777;
     }
     0
 }

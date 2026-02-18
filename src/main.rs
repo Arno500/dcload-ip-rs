@@ -17,7 +17,8 @@ mod io;
 mod types;
 
 const PROTOCOL_VERSION: [u8; 3] = [2, 0, 3];
-const CHUNK_SIZE: usize = 1440;
+// const CHUNK_SIZE: usize = 1440;
+const CHUNK_SIZE: usize = 1024;
 
 // Simple program to greet a person
 #[derive(Parser, Debug)]

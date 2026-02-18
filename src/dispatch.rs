@@ -415,7 +415,7 @@ pub fn receive_data(
     size: usize,
     quiet: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let expected_chunks = size.div_ceil(1440);
+    let expected_chunks = size.div_ceil(CHUNK_SIZE);
     let mut data = vec![0u8; size];
     let mut chunk_map: Vec<bool> = vec![false; expected_chunks];
 
@@ -447,7 +447,7 @@ pub fn receive_data(
                     if let Some(inner_cmd) = cmd.cmd {
                         match inner_cmd.cmd {
                             DCLoadCmds::SendBinary(Some(chunk)) => {
-                                if inner_cmd.address - address >= (size as u32 + 1440) / 1440 {
+                                if inner_cmd.address - address >= (size as u32 + CHUNK_SIZE as u32) / CHUNK_SIZE as u32 {
                                     warn!("Bad packet received for DoneBinary, ignoring");
                                     continue;
                                 }
@@ -455,7 +455,7 @@ pub fn receive_data(
                                 let offset = (inner_cmd.address - address) as usize;
                                 data[offset..(offset + chunk.len()).min(size)]
                                     .copy_from_slice(&chunk[..chunk.len().min(size)]);
-                                chunk_map[(inner_cmd.address - address) as usize / 1440] = true;
+                                chunk_map[(inner_cmd.address - address) as usize / CHUNK_SIZE] = true;
                                 bar.inc(chunk.len() as u64);
                             }
                             DCLoadCmds::DoneBinary() => break,
@@ -478,11 +478,11 @@ pub fn receive_data(
                 debug!("Missing chunk {}", i);
                 conn.send_command(DCLoadCmd {
                     cmd: DCLoadCmds::SendBinaryQuiet(None),
-                    address: address + (i as u32 * 1440),
-                    size: if size.is_multiple_of(1440) {
-                        1440
+                    address: address + (i as u32 * CHUNK_SIZE as u32),
+                    size: if size.is_multiple_of(CHUNK_SIZE) {
+                        CHUNK_SIZE as u32
                     } else {
-                        size as u32 - (i as u32 * 1440)
+                        size as u32 - (i as u32 * CHUNK_SIZE as u32)
                     },
                 })?;
 
@@ -496,7 +496,7 @@ pub fn receive_data(
                                 match inner_cmd.cmd {
                                     DCLoadCmds::SendBinary(Some(chunk)) => {
                                         if inner_cmd.address - address
-                                            >= (size as u32 + 1440) / 1440
+                                            >= (size as u32 + CHUNK_SIZE as u32) / CHUNK_SIZE as u32
                                         {
                                             warn!("Bad packet received for DoneBinary, ignoring");
                                             continue;
@@ -505,7 +505,7 @@ pub fn receive_data(
                                         let offset = (inner_cmd.address - address) as usize;
                                         data[offset..offset + chunk.len()]
                                             .copy_from_slice(&chunk[..]);
-                                        chunk_map[(inner_cmd.address - address) as usize / 1440] =
+                                        chunk_map[(inner_cmd.address - address) as usize / CHUNK_SIZE] =
                                             true;
                                         bar.inc(chunk.len() as u64);
 
