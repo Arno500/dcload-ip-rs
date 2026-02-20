@@ -103,8 +103,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             .init(),
     }
     let legacy_mode = protocol_version()[0] < 2;
+    let remote_port = if legacy_mode { 31313 } else { args.port };
     let local_port = if legacy_mode { Some(31313) } else { None };
-    let mut udpsender = DcIoUDP::new(args.host.clone(), args.port, local_port)?;
+    let mut udpsender = DcIoUDP::new(args.host.clone(), remote_port, local_port)?;
     let version = match send_version(&mut udpsender) {
         Err(err) => {
             error!("Failed to contact the client: {}", err);
