@@ -17,10 +17,18 @@ mod dispatch;
 mod io;
 mod types;
 
-// const PROTOCOL_VERSION: [u8; 3] = [2, 0, 3];
-const PROTOCOL_VERSION: [u8; 3] = [0, 0, 0];
-// const CHUNK_SIZE: usize = 1440;
+const PROTOCOL_VERSION_LEGACY: [u8; 3] = [0, 0, 0];
+const PROTOCOL_VERSION_MODERN: [u8; 3] = [2, 0, 4];
+// Keep this easy to toggle. 1024 => legacy mode, 1440 => modern mode.
 const CHUNK_SIZE: usize = 1024;
+
+pub(crate) fn protocol_version() -> [u8; 3] {
+    if CHUNK_SIZE <= 1024 {
+        PROTOCOL_VERSION_LEGACY
+    } else {
+        PROTOCOL_VERSION_MODERN
+    }
+}
 
 // Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -94,7 +102,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             .filter_level(log::LevelFilter::Trace)
             .init(),
     }
-    let mut udpsender = DcIoUDP::new(args.host.clone(), args.port)?;
+    let legacy_mode = protocol_version()[0] < 2;
+    let local_port = if legacy_mode { Some(31313) } else { None };
+    let mut udpsender = DcIoUDP::new(args.host.clone(), args.port, local_port)?;
     let version = match send_version(&mut udpsender) {
         Err(err) => {
             error!("Failed to contact the client: {}", err);

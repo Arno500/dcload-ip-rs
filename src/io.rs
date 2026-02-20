@@ -18,8 +18,12 @@ pub struct DcIoUDP {
 }
 
 impl DcIoUDP {
-    pub fn new(host: String, port: u16) -> Result<Self, std::io::Error> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
+    pub fn new(host: String, port: u16, local_port: Option<u16>) -> Result<Self, std::io::Error> {
+        let bind_addr = match local_port {
+            Some(p) => format!("0.0.0.0:{p}"),
+            None => "0.0.0.0:0".to_string(),
+        };
+        let socket = UdpSocket::bind(bind_addr)?;
         socket.connect(format!("{host}:{port}"))?;
         socket.set_nonblocking(true)?;
         let key = 6867; // Arbitrary key identifying the socket.

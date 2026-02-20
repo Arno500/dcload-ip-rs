@@ -9,7 +9,7 @@ use elf::{ElfBytes, endian::AnyEndian, section::SectionHeader};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::{
-    CHUNK_SIZE, PROTOCOL_VERSION,
+    CHUNK_SIZE,
     cd::build_dc_toc,
     cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
     disc_formats::{
@@ -19,6 +19,7 @@ use crate::{
     },
     fs::{self, FSSyscallState},
     io::ExternalDcIo,
+    protocol_version,
 };
 
 pub fn upload(
@@ -233,13 +234,14 @@ pub fn receive_syscalls(
 pub fn send_version(
     conn: &mut impl ExternalDcIo,
 ) -> std::result::Result<Vec<DCReturnCmd>, std::boxed::Box<dyn std::error::Error>> {
+    let protocol_version = protocol_version();
     call_command(
         conn,
         DCLoadCmd {
             cmd: DCLoadCmds::Version(None),
-            address: ((PROTOCOL_VERSION[0] as u32) << 16)
-                | ((PROTOCOL_VERSION[1] as u32) << 8)
-                | PROTOCOL_VERSION[2] as u32,
+            address: ((protocol_version[0] as u32) << 16)
+                | ((protocol_version[1] as u32) << 8)
+                | protocol_version[2] as u32,
             size: 0,
         },
     )
@@ -310,19 +312,9 @@ pub fn send_data(
 
     bar.finish_with_message("Initial upload complete, verifying...");
 
-    if let Ok(cmds) = call_command(
-        conn,
-        DCLoadCmd {
-            cmd: DCLoadCmds::DoneBinary(),
-            address: 0,
-            size: 0,
-        },
-    ) && let Some(ret_cmd) = cmds.first()
-        && let Some(cmd) = ret_cmd.cmd.clone()
-        && cmd.cmd == DCLoadCmds::DoneBinary()
-        && cmd.size > 0
-    {
-        let mut last_cmd = cmd;
+    let first_donebin = request_donebin(conn)?;
+    if first_donebin.size > 0 {
+        let mut last_cmd = first_donebin;
         warn!("There was an error while uploading the binary, resending missing parts...");
 
         // Basically loop on the parts send and check, as long as we do not validate a DoneBinary
@@ -356,25 +348,16 @@ pub fn send_data(
                     ),
                 )));
             }
-            if let Ok(cmds) = call_command(
-                conn,
-                DCLoadCmd {
-                    cmd: DCLoadCmds::DoneBinary(),
-                    address: 0,
-                    size: 0,
-                },
-            ) && let Some(ret_cmd) = cmds.first()
-                && let Some(cmd) = ret_cmd.cmd.clone()
-                && cmd.size > 0
-            {
-                last_cmd = cmd;
+            let donebin = request_donebin(conn)?;
+            if donebin.size > 0 {
+                last_cmd = donebin;
                 warn!("There are still some errors, continuing to send failed parts");
             } else {
                 // And seems we're finally good!
                 break;
             }
         }
-    };
+    }
     if let Some(progress_bar) = progress_bar {
         progress_bar.remove(&bar);
     }
@@ -404,6 +387,41 @@ fn call_command(
             "No response after {} tries for command {:?}",
             tries, command
         ),
+    )))
+}
+
+fn extract_donebin(cmds: &[DCReturnCmd]) -> Option<DCLoadCmd> {
+    cmds.iter().find_map(|ret| {
+        ret.cmd.as_ref().and_then(|cmd| {
+            if cmd.cmd == DCLoadCmds::DoneBinary() {
+                Some(cmd.clone())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn request_donebin(
+    conn: &mut impl ExternalDcIo,
+) -> std::result::Result<DCLoadCmd, std::boxed::Box<dyn std::error::Error>> {
+    let cmd = DCLoadCmd {
+        cmd: DCLoadCmds::DoneBinary(),
+        address: 0,
+        size: 0,
+    };
+
+    for _ in 0..10 {
+        let cmds = call_command(conn, cmd.clone())?;
+        if let Some(donebin) = extract_donebin(&cmds) {
+            return Ok(donebin);
+        }
+        debug!("Received non-DBIN packets while waiting for DoneBinary response");
+    }
+
+    Err(Box::new(std::io::Error::new(
+        ErrorKind::TimedOut,
+        "No DoneBinary response received",
     )))
 }
 
