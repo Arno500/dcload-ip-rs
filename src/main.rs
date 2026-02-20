@@ -16,7 +16,8 @@ mod dispatch;
 mod io;
 mod types;
 
-const PROTOCOL_VERSION: [u8; 3] = [2, 0, 3];
+// const PROTOCOL_VERSION: [u8; 3] = [2, 0, 3];
+const PROTOCOL_VERSION: [u8; 3] = [0, 0, 0];
 // const CHUNK_SIZE: usize = 1440;
 const CHUNK_SIZE: usize = 1024;
 

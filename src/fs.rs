@@ -1,5 +1,8 @@
 use std::{
-    fs::{self, File, FileTimes, FileType, Metadata, OpenOptions, ReadDir}, io::{Read, Seek, SeekFrom, Write}, path::{Component, Path, PathBuf}, time::{Duration, SystemTime}
+    fs::{self, File, FileTimes, FileType, Metadata, OpenOptions, ReadDir},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{self, Component, Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use crate::{
@@ -84,37 +87,29 @@ pub fn handle_fs_syscall(
     cmd: DCLoadClientFSCmds,
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    if state.base_path.is_none() {
-        Ok(DCLoadCmd {
-            cmd: crate::cmds::DCLoadCmds::ReturnValue(),
-            address: u32::MAX,
-            size: u32::MAX,
-        })
-    } else {
-        match cmd {
-            DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size, state),
-            DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size, state),
-            DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size, state),
-            DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, state, false),
-            DCLoadClientFSCmds::Close(fd) => close(fd, state),
-            DCLoadClientFSCmds::Create(flags, path) => create(flags, path, state),
-            DCLoadClientFSCmds::Link(path) => link(path, state),
-            DCLoadClientFSCmds::Unlink(path) => unlink(path, state),
-            DCLoadClientFSCmds::ChDir(path) => chdir(path, state),
-            DCLoadClientFSCmds::ChMod(mode, path) => chmod(mode, path, state),
-            DCLoadClientFSCmds::LSeek(fd, offset, whence) => lseek(fd, offset, whence, state),
-            DCLoadClientFSCmds::Time() => time(),
-            DCLoadClientFSCmds::Stat(address, size, path) => stat(conn, address, size, path, state),
-            DCLoadClientFSCmds::UTime(mode, access_time, modif_time, path) => {
-                utime(mode, access_time, modif_time, path, state)
-            }
-            DCLoadClientFSCmds::OpenDir(path) => wrapped_opendir(path, state),
-            DCLoadClientFSCmds::CloseDir(dirent) => closedir(state, dirent),
-            DCLoadClientFSCmds::ReadDir(dirent, address, size) => {
-                readdir(conn, dirent, address, size, state)
-            }
-            DCLoadClientFSCmds::RewindDir(dirent) => rewinddir(dirent, state),
+    match cmd {
+        DCLoadClientFSCmds::FStat(fd, address, size) => fstat(conn, fd, address, size, state),
+        DCLoadClientFSCmds::Write(fd, address, size) => write(conn, fd, address, size, state),
+        DCLoadClientFSCmds::Read(fd, address, size) => read(conn, fd, address, size, state),
+        DCLoadClientFSCmds::Open(flags, mode, path) => open(flags, mode, path, state, false),
+        DCLoadClientFSCmds::Close(fd) => close(fd, state),
+        DCLoadClientFSCmds::Create(flags, path) => create(flags, path, state),
+        DCLoadClientFSCmds::Link(path) => link(path, state),
+        DCLoadClientFSCmds::Unlink(path) => unlink(path, state),
+        DCLoadClientFSCmds::ChDir(path) => chdir(path, state),
+        DCLoadClientFSCmds::ChMod(mode, path) => chmod(mode, path, state),
+        DCLoadClientFSCmds::LSeek(fd, offset, whence) => lseek(fd, offset, whence, state),
+        DCLoadClientFSCmds::Time() => time(),
+        DCLoadClientFSCmds::Stat(address, size, path) => stat(conn, address, size, path, state),
+        DCLoadClientFSCmds::UTime(mode, access_time, modif_time, path) => {
+            utime(mode, access_time, modif_time, path, state)
         }
+        DCLoadClientFSCmds::OpenDir(path) => wrapped_opendir(path, state),
+        DCLoadClientFSCmds::CloseDir(dirent) => closedir(state, dirent),
+        DCLoadClientFSCmds::ReadDir(dirent, address, size) => {
+            readdir(conn, dirent, address, size, state)
+        }
+        DCLoadClientFSCmds::RewindDir(dirent) => rewinddir(dirent, state),
     }
 }
 
@@ -147,8 +142,8 @@ fn write(
         let data = download_data(conn, address, size)?;
 
         match fd {
-            1 => info!("{}", String::from_utf8(data)?),
-            2 => error!("{}", String::from_utf8(data)?),
+            1 => info!("{}", String::from_utf8(data)?.trim_end_matches("\n")),
+            2 => error!("{}", String::from_utf8(data)?.trim_end_matches("\n")),
             _ => return Err("Invalid FD".into()),
         }
 
@@ -207,7 +202,7 @@ fn open(
     state: &mut FSSyscallState,
     create: bool,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let safe_path = join_and_check_path(state, path)?;
+    let safe_path = join_and_check_path(state, path, true)?;
     let mut file_options = match parse_file_flags(flags, safe_path.clone()) {
         Ok(file_options) => file_options,
         Err(e) => return Ok(e),
@@ -278,16 +273,16 @@ fn link(path: String, state: &FSSyscallState) -> Result<DCLoadCmd, Box<dyn std::
     }
     #[cfg(target_family = "windows")]
     {
-        let source_relative = join_and_check_path(state, source.to_string())?;
+        let source_relative = join_and_check_path(state, source.to_string(), false)?;
         match if source_relative.is_file() {
             std::os::windows::fs::symlink_file(
                 source_relative,
-                join_and_check_path(state, target.to_string())?,
+                join_and_check_path(state, target.to_string(), false)?,
             )
         } else {
             std::os::windows::fs::symlink_dir(
                 source_relative,
-                join_and_check_path(state, target.to_string())?,
+                join_and_check_path(state, target.to_string(), false)?,
             )
         } {
             Ok(_) => Ok(DCLoadCmd {
@@ -305,8 +300,8 @@ fn link(path: String, state: &FSSyscallState) -> Result<DCLoadCmd, Box<dyn std::
     #[cfg(target_family = "unix")]
     {
         match std::os::unix::fs::symlink(
-            join_and_check_path(state, source.to_string())?,
-            join_and_check_path(state, target.to_string())?,
+            join_and_check_path(state, source.to_string(), false)?,
+            join_and_check_path(state, target.to_string(), false)?,
         ) {
             Ok(_) => Ok(DCLoadCmd {
                 address: 0,
@@ -323,7 +318,7 @@ fn link(path: String, state: &FSSyscallState) -> Result<DCLoadCmd, Box<dyn std::
 }
 
 fn unlink(path: String, state: &FSSyscallState) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    match std::fs::remove_file(join_and_check_path(state, path)?) {
+    match std::fs::remove_file(join_and_check_path(state, path, false)?) {
         Ok(_) => Ok(DCLoadCmd {
             address: 0,
             size: 0,
@@ -341,7 +336,7 @@ fn chdir(
     path: String,
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let new_path = join_and_check_path(state, path.clone())?;
+    let new_path = join_and_check_path(state, path.clone(), false)?;
     if new_path.is_dir() {
         state.emulated_current_dir = Path::new(&path).to_path_buf();
         Ok(DCLoadCmd {
@@ -365,7 +360,7 @@ fn chmod(
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     #[cfg(target_family = "unix")]
     {
-        let path = join_and_check_path(_state, _path);
+        let path = join_and_check_path(_state, _path, false);
         let mut perms = fs::metadata(path)?.permissions();
         perms.set_mode(_mode);
         fs::set_permissions(path, perms)?;
@@ -421,7 +416,7 @@ fn stat(
     path: String,
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let file = join_and_check_path(state, path)?;
+    let file = join_and_check_path(state, path, false)?;
     let stat = file.metadata()?;
 
     let stat_data = metadata_to_stat(stat);
@@ -435,7 +430,7 @@ fn utime(
     path: String,
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let file = join_and_check_path(state, path)?;
+    let file = join_and_check_path(state, path, false)?;
     let file = File::open(file)?;
     let times = match mode {
         0 => FileTimes::new()
@@ -476,7 +471,7 @@ fn opendir(
     path: String,
     state: &mut FSSyscallState,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
-    let path = join_and_check_path(state, path)?;
+    let path = join_and_check_path(state, path, false)?;
     let dir = fs::read_dir(&path)?;
 
     for (i, entry) in state.opendirs.iter().enumerate() {
@@ -528,14 +523,14 @@ fn readdir(
         && let Ok(unwrapped_entry) = entry
     {
         let filename = unwrapped_entry
-                .file_name()
-                .into_string()
-                .map_err(|_e| -> String {
-                    format!(
-                        "Could not convert directory name: {:?}",
-                        unwrapped_entry.file_name()
-                    )
-                })?;
+            .file_name()
+            .into_string()
+            .map_err(|_e| -> String {
+                format!(
+                    "Could not convert directory name: {:?}",
+                    unwrapped_entry.file_name()
+                )
+            })?;
         if filename.len() > 255 {
             return Err("Invalid filename".into());
         }
@@ -650,6 +645,7 @@ fn sanitize_relative(path: &Path) -> PathBuf {
 fn join_and_check_path(
     state: &FSSyscallState,
     relative: String,
+    allow_non_existent: bool,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let base = state
         .base_path
@@ -663,7 +659,11 @@ fn join_and_check_path(
         .join(&state.emulated_current_dir)
         .join(sanitized);
 
-    let canonical_full = full_path.canonicalize()?;
+    let canonical_full = if allow_non_existent {
+        path::absolute(&full_path)?
+    } else {
+        full_path.canonicalize()?
+    };
     let canonical_base = base.canonicalize()?;
 
     if !canonical_full.starts_with(&canonical_base) {
@@ -677,7 +677,7 @@ fn push_data_and_return(
     conn: &mut impl ExternalDcIo,
     data: Vec<u8>,
     address: u32,
-    return_code: u32
+    return_code: u32,
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     send_data(conn, data.as_slice(), address, None)?;
 
@@ -703,8 +703,8 @@ fn download_data(
 
     if data.len() >= 4 && &data[0..4] == b"EXPT" {
         let exception_frame: ExceptionStruct = unsafe {
-            std::mem::transmute::<[u8; 2176 / 8], ExceptionStruct>(*<&[u8; 2176 / 8]>::try_from(
-                &data[..2176],
+            std::mem::transmute::<[u8; 272], ExceptionStruct>(*<&[u8; 272]>::try_from(
+                &data[..272],
             )?)
         };
         let error_string = exception_code_to_string(exception_frame.expt_code);
