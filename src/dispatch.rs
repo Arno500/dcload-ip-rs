@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{Error, ErrorKind},
     path::Path,
     thread::sleep,
@@ -171,6 +172,8 @@ pub fn receive_syscalls(
     };
     fs_syscall_state.opendirs.resize_with(256, || None);
     fs_syscall_state.openfiles.resize_with(256, || None);
+    let mut logged_lbas: HashSet<u32> = HashSet::new();
+    let pvd_lba = disc.start_sector().saturating_add(16);
     loop {
         match await_result(conn, None) {
             Err(e) => warn!("Error waiting for syscall: {}", e),
@@ -192,6 +195,22 @@ pub fn receive_syscalls(
                                 }
                                 let num_sectors = size / 2048;
                                 let buf = disc.read_sector(start, num_sectors)?;
+                                if logged_lbas.insert(start) && buf.len() >= 8 {
+                                    debug!(
+                                        "ReadSector LBA=0x{start:08x} first8={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                                        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
+                                    );
+                                }
+                                if start == pvd_lba && buf.len() >= 6 {
+                                    if &buf[1..6] == b"CD001" {
+                                        info!("PVD signature is valid at LBA 0x{start:08x}");
+                                    } else {
+                                        warn!(
+                                            "PVD signature mismatch at LBA 0x{start:08x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                                            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]
+                                        );
+                                    }
+                                }
                                 send_data(conn, &buf, dc_address, None)?;
                                 conn.send_command(DCLoadCmd {
                                     cmd: DCLoadCmds::ReturnValue(),

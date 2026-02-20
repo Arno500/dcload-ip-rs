@@ -63,43 +63,47 @@ impl DiscFormat for Gdi {
         num_sectors: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut tracks = self.tracks.borrow_mut();
-        let len = tracks.len();
-        for track_num in 0..len {
-            if lba >= tracks[track_num].start_lba
-                && (track_num + 1 >= len || tracks[track_num + 1].start_lba > lba)
-            {
-                let current_track = &mut tracks[track_num];
-                let mut buffer = vec![0_u8; (num_sectors * 2048).try_into()?];
-                if current_track.file.is_none() {
-                    current_track.file = Some(File::open(current_track.track.clone())?);
-                }
+        let data_track_index = tracks
+            .iter()
+            .position(|t| t.track_type == 4)
+            .ok_or("No data track found in GDI")?;
 
-                let file = current_track.file.as_mut().unwrap();
-                let in_track_lba = lba - current_track.start_lba;
-                file.seek(SeekFrom::Start(
-                    (current_track.offset as u64)
-                        + (in_track_lba as u64) * (current_track.sector_size as u64),
-                ))?;
+        let current_track = &mut tracks[data_track_index];
+        let in_track_lba = lba
+            .checked_sub(current_track.start_lba)
+            .ok_or_else(|| format!("Requested LBA 0x{lba:08x} is before data track"))?;
 
-                if current_track.sector_size == 2048 {
-                    file.read_exact(&mut buffer)?;
-                } else if current_track.sector_size >= 2064 {
-                    let mut raw_sector = vec![0_u8; current_track.sector_size as usize];
-                    for chunk in buffer.chunks_mut(2048) {
-                        file.read_exact(&mut raw_sector)?;
-                        chunk.copy_from_slice(&raw_sector[16..16 + 2048]);
-                    }
-                } else {
-                    return Err(format!(
-                        "Unsupported GDI sector size: {}",
-                        current_track.sector_size
-                    )
-                    .into());
-                }
-                return Ok(buffer);
-            }
+        let mut buffer = vec![0_u8; (num_sectors * 2048).try_into()?];
+        if current_track.file.is_none() {
+            current_track.file = Some(File::open(current_track.track.clone())?);
         }
-        Err(format!("Could not find track file for LBA 0x{:08x}", lba).into())
+
+        let file = current_track.file.as_mut().unwrap();
+        file.seek(SeekFrom::Start(
+            (current_track.offset as u64)
+                + (in_track_lba as u64) * (current_track.sector_size as u64),
+        ))?;
+
+        if current_track.sector_size == 2048 {
+            file.read_exact(&mut buffer)?;
+        } else if current_track.sector_size >= 2064 {
+            let mut raw_sector = vec![0_u8; current_track.sector_size as usize];
+            for chunk in buffer.chunks_mut(2048) {
+                file.read_exact(&mut raw_sector)?;
+                // Raw sectors may be Mode 1 (2048-byte payload at +16) or
+                // Mode 2 (payload typically at +24). Pick based on mode byte.
+                let mode = raw_sector.get(15).copied().unwrap_or(1);
+                let payload_offset = if mode == 2 { 24 } else { 16 };
+                let payload_end = payload_offset + 2048;
+                if payload_end > raw_sector.len() {
+                    return Err(format!("Raw sector too small: {} bytes", raw_sector.len()).into());
+                }
+                chunk.copy_from_slice(&raw_sector[payload_offset..payload_end]);
+            }
+        } else {
+            return Err(format!("Unsupported GDI sector size: {}", current_track.sector_size).into());
+        }
+        Ok(buffer)
     }
 
     fn start_sector(&self) -> u32 {
