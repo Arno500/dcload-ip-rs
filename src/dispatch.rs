@@ -10,9 +10,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::{
     CHUNK_SIZE, PROTOCOL_VERSION,
+    cd::build_dc_toc,
     cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
     disc_formats::{
-        self,
+        gdi::Gdi,
+        iso::Iso,
         types::{StubDisc, get_disc_format},
     },
     fs::{self, FSSyscallState},
@@ -138,10 +140,16 @@ pub fn receive_syscalls(
     mount: Option<String>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     let mut disc = get_disc_format(StubDisc {});
-    if let Some(cd_path) = cd_path
-        && let Ok(gdi) = disc_formats::gdi::Gdi::new(cd_path)
-    {
-        disc = get_disc_format(gdi);
+    if let Some(cd_path) = cd_path {
+        if cd_path.to_ascii_lowercase().ends_with(".gdi") {
+            if let Ok(gdi) = Gdi::new(cd_path) {
+                disc = get_disc_format(gdi);
+            }
+        } else if let Ok(iso) = Iso::new(cd_path) {
+            disc = get_disc_format(iso);
+        } else {
+            warn!("Could not parse disc image, CDFS redirection disabled");
+        }
     }
     let base_path = mount.as_ref().map(Path::new);
     if let Some(base_path) = base_path
@@ -170,8 +178,24 @@ pub fn receive_syscalls(
                                     "Received ReadSector syscall: start=0x{:08x}, dc_address=0x{:08x}, size={}",
                                     start, dc_address, size
                                 );
-                                let buf = disc.read_sector(start, size)?;
+                                if size % 2048 != 0 {
+                                    return Err(Box::new(Error::new(
+                                        ErrorKind::InvalidData,
+                                        format!("ReadSector size is not a multiple of 2048: {}", size),
+                                    )));
+                                }
+                                let num_sectors = size / 2048;
+                                let buf = disc.read_sector(start, num_sectors)?;
                                 send_data(conn, &buf, dc_address, None)?;
+                                conn.send_command(DCLoadCmd {
+                                    cmd: DCLoadCmds::ReturnValue(),
+                                    address: 0,
+                                    size: 0,
+                                })?;
+                            }
+                            DCLoadClientCmds::ReadToc(_session, dc_address, _unused) => {
+                                let toc = build_dc_toc(disc.start_sector(), disc.num_sectors());
+                                send_data(conn, &toc, dc_address, None)?;
                                 conn.send_command(DCLoadCmd {
                                     cmd: DCLoadCmds::ReturnValue(),
                                     address: 0,

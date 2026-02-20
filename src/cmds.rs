@@ -187,6 +187,7 @@ pub enum DCLoadClientFSCmds {
 pub enum DCLoadClientCmds {
     Exit,
     ReadSector(u32, u32, u32),
+    ReadToc(u32, u32, u32),
     FSCommand(DCLoadClientFSCmds),
 }
 
@@ -267,6 +268,10 @@ impl TryFrom<Vec<u8>> for DCLoadClientCmds {
             b"DC19" => {
                 let (param1, param2, param3) = extract_3_u32(&input[4..])?;
                 Ok(DCLoadClientCmds::ReadSector(param1, param2, param3))
+            }
+            b"DC22" => {
+                let (param1, param2, param3) = extract_3_u32(&input[4..])?;
+                Ok(DCLoadClientCmds::ReadToc(param1, param2, param3))
             }
             b"DC21" => {
                 let param1 = extract_1_u32(&input[4..])?;

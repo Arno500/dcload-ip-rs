@@ -6,7 +6,7 @@ pub struct Track {
     #[allow(unused)]
     pub(crate) track_type: u8,
     #[allow(unused)]
-    pub(crate) sector_size: u8,
+    pub(crate) sector_size: u32,
     pub(crate) track: String,
     #[allow(unused)]
     pub(crate) offset: u32,
@@ -19,6 +19,14 @@ pub trait DiscFormat {
         lba: u32,
         num_sectors: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>>;
+
+    fn start_sector(&self) -> u32 {
+        150
+    }
+
+    fn num_sectors(&self) -> u32 {
+        0
+    }
 }
 
 pub struct StubDisc {}

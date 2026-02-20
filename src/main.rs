@@ -10,6 +10,7 @@ use pretty_env_logger::formatted_timed_builder;
 extern crate log;
 
 mod cmds;
+mod cd;
 mod fs;
 mod disc_formats;
 mod dispatch;
