@@ -77,7 +77,8 @@ impl DiscFormat for Gdi {
                 let file = current_track.file.as_mut().unwrap();
                 let in_track_lba = lba - current_track.start_lba;
                 file.seek(SeekFrom::Start(
-                    (in_track_lba as u64) * (current_track.sector_size as u64),
+                    (current_track.offset as u64)
+                        + (in_track_lba as u64) * (current_track.sector_size as u64),
                 ))?;
 
                 if current_track.sector_size == 2048 {
@@ -129,7 +130,8 @@ impl DiscFormat for Gdi {
         if let Some(f) = t.file.as_ref()
             && let Ok(meta) = f.metadata()
         {
-            return (meta.len() / (t.sector_size as u64)) as u32;
+            let track_data_len = meta.len().saturating_sub(t.offset as u64);
+            return (track_data_len / (t.sector_size as u64)) as u32;
         }
         0
     }

@@ -152,6 +152,11 @@ pub fn receive_syscalls(
             warn!("Could not parse disc image, CDFS redirection disabled");
         }
     }
+    debug!(
+        "CDFS source: start_sector={} num_sectors={}",
+        disc.start_sector(),
+        disc.num_sectors()
+    );
     let base_path = mount.as_ref().map(Path::new);
     if let Some(base_path) = base_path
         && !base_path.exists()
