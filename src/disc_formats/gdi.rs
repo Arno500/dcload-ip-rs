@@ -63,14 +63,22 @@ impl DiscFormat for Gdi {
         num_sectors: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut tracks = self.tracks.borrow_mut();
-        let data_track_index = tracks
+        let fallback_data_track_index = tracks
             .iter()
             .position(|t| t.track_type == 4)
             .ok_or("No data track found in GDI")?;
+        let data_track_index = tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.track_type == 4 && t.start_lba.saturating_add(150) <= lba)
+            .max_by_key(|(_, t)| t.start_lba)
+            .map(|(i, _)| i)
+            .unwrap_or(fallback_data_track_index);
 
         let current_track = &mut tracks[data_track_index];
+        let logical_track_start = current_track.start_lba.saturating_add(150);
         let in_track_lba = lba
-            .checked_sub(current_track.start_lba)
+            .checked_sub(logical_track_start)
             .ok_or_else(|| format!("Requested LBA 0x{lba:08x} is before data track"))?;
 
         let mut buffer = vec![0_u8; (num_sectors * 2048).try_into()?];
@@ -112,8 +120,9 @@ impl DiscFormat for Gdi {
             .iter()
             .filter(|t| t.track_type == 4)
             .map(|t| t.start_lba)
-            .min()
-            .unwrap_or(150)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(150)
     }
 
     fn num_sectors(&self) -> u32 {
@@ -121,6 +130,14 @@ impl DiscFormat for Gdi {
         let data_track_index = tracks
             .iter()
             .position(|t| t.track_type == 4)
+            .and_then(|_| {
+                tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.track_type == 4)
+                    .max_by_key(|(_, t)| t.start_lba)
+                    .map(|(i, _)| i)
+            })
             .unwrap_or(0);
         if tracks.is_empty() {
             return 0;

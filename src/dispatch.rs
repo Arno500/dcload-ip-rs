@@ -220,8 +220,16 @@ pub fn receive_syscalls(
                             }
                             DCLoadClientCmds::ReadToc(_session, dc_address, _unused) => {
                                 let toc = build_dc_toc(disc.start_sector(), disc.num_sectors());
-                                send_data(conn, &toc, dc_address, None)?;
-                                conn.send_command(DCLoadCmd {
+                                if let Err(e) = send_data(conn, &toc, dc_address, None) {
+                                    warn!("Failed to send CDFS TOC data: {}", e);
+                                    let _ = conn.send_command(DCLoadCmd {
+                                        cmd: DCLoadCmds::ReturnValue(),
+                                        address: u32::MAX,
+                                        size: u32::MAX,
+                                    });
+                                    continue;
+                                }
+                                let _ = conn.send_command(DCLoadCmd {
                                     cmd: DCLoadCmds::ReturnValue(),
                                     address: 0,
                                     size: 0,
@@ -305,8 +313,7 @@ pub fn send_data(
         };
     }
 
-    // Rust have some chunking utilities, let's use them to split in 1440 bytes packets automatically
-    let mut chunked = data.chunks(CHUNK_SIZE);
+    // Rust have some chunking utilities, let's use them to split packets automatically
     let bar = if data.len() < 1000 {
         ProgressBar::hidden()
     } else {
@@ -319,8 +326,10 @@ pub fn send_data(
         progress_bar.add(bar.clone());
     }
 
-    // Send each of the chunk using the PartBinary command
-    chunked.try_for_each(|chunk| -> Result<(), Box<dyn std::error::Error>> {
+    // Send each chunk using PartBinary with light pacing to avoid overrunning
+    // Dreamcast RX FIFO during runtime CDFS transfers.
+    let mut packet_count: u32 = 0;
+    for chunk in data.chunks(CHUNK_SIZE) {
         let mut padded_chunk = [0u8; CHUNK_SIZE];
         padded_chunk[..chunk.len()].copy_from_slice(chunk);
         conn.send_command(DCLoadCmd {
@@ -330,9 +339,14 @@ pub fn send_data(
         })?;
         bar.inc(chunk.len() as u64);
         incr_address += chunk.len() as u32;
-        sleep(Duration::from_nanos(1));
-        Ok(())
-    })?;
+        packet_count = packet_count.saturating_add(1);
+        if packet_count.is_multiple_of(15) {
+            sleep(Duration::from_millis(2));
+        }
+    }
+
+    // Give in-flight UDP packets a chance to arrive before DoneBinary.
+    sleep(Duration::from_millis(25));
 
     bar.finish_with_message("Initial upload complete, verifying...");
 
@@ -435,12 +449,30 @@ fn request_donebin(
         size: 0,
     };
 
-    for _ in 0..10 {
-        let cmds = call_command(conn, cmd.clone())?;
+    // For large runtime CDFS transfers, responses can be delayed by queued PBIN packets.
+    // Send DBIN, then keep polling for a while before retrying.
+    for _retry in 0..5 {
+        debug!("Sending command: {:?}", cmd);
+        conn.send_command(cmd.clone())?;
+
+        for _poll_try in 0..20 {
+            match await_result(conn, Some(Duration::from_millis(200))) {
+                Ok(cmds) => {
         if let Some(donebin) = extract_donebin(&cmds) {
             return Ok(donebin);
         }
         debug!("Received non-DBIN packets while waiting for DoneBinary response");
+                }
+                Err(e) => {
+                    if let Some(ioe) = e.downcast_ref::<std::io::Error>()
+                        && ioe.kind() == ErrorKind::TimedOut
+                    {
+                        continue;
+                    }
+                    warn!("Error waiting for DoneBinary response: {}", e);
+                }
+            }
+        }
     }
 
     Err(Box::new(std::io::Error::new(
