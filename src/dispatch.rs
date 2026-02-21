@@ -314,7 +314,7 @@ pub fn send_data(
     }
 
     // Rust have some chunking utilities, let's use them to split packets automatically
-    let bar = if data.len() < 1000 {
+    let bar = if data.len() < 10000 {
         ProgressBar::hidden()
     } else {
         ProgressBar::new(data.len().try_into()?).with_style(ProgressStyle::with_template(
@@ -326,8 +326,15 @@ pub fn send_data(
         progress_bar.add(bar.clone());
     }
 
-    // Send each chunk using PartBinary with light pacing to avoid overrunning
+    // Send each chunk using PartBinary with pacing to avoid overrunning
     // Dreamcast RX FIFO during runtime CDFS transfers.
+    // Keep upload pacing close to existing behavior, but use dc-tool-like
+    // conservative pacing for runtime syscall transfers.
+    let (burst_packets, burst_delay) = if progress_bar.is_none() {
+        (10_u32, Duration::from_micros(1800))
+    } else {
+        (15_u32, Duration::from_millis(2))
+    };
     let mut packet_count: u32 = 0;
     for chunk in data.chunks(CHUNK_SIZE) {
         let mut padded_chunk = [0u8; CHUNK_SIZE];
@@ -340,8 +347,9 @@ pub fn send_data(
         bar.inc(chunk.len() as u64);
         incr_address += chunk.len() as u32;
         packet_count = packet_count.saturating_add(1);
-        if packet_count.is_multiple_of(15) {
-            sleep(Duration::from_millis(2));
+        sleep(Duration::from_nanos(1));
+        if packet_count.is_multiple_of(burst_packets) {
+            sleep(burst_delay);
         }
     }
 
@@ -527,7 +535,7 @@ pub fn receive_data(
         size: size as u32,
     })?;
 
-    let bar = if size < 1000 {
+    let bar = if size < 10000 {
         ProgressBar::hidden()
     } else {
         ProgressBar::new(size as u64).with_style(ProgressStyle::with_template(
