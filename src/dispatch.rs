@@ -14,9 +14,7 @@ use crate::{
     cd::build_dc_toc,
     cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
     disc_formats::{
-        gdi::Gdi,
-        iso::Iso,
-        types::{StubDisc, get_disc_format},
+        cdi::Cdi, gdi::Gdi, iso::Iso, types::{StubDisc, get_disc_format}
     },
     fs::{self, FSSyscallState},
     io::ExternalDcIo,
@@ -147,7 +145,12 @@ pub fn receive_syscalls(
             if let Ok(gdi) = Gdi::new(cd_path) {
                 disc = get_disc_format(gdi);
             }
-        } else if let Ok(iso) = Iso::new(cd_path) {
+        } else if cd_path.to_ascii_lowercase().ends_with(".cdi") {
+            if let Ok(cdi) = Cdi::new(cd_path) {
+                disc = get_disc_format(cdi);
+            }
+        }
+         else if let Ok(iso) = Iso::new(cd_path) {
             disc = get_disc_format(iso);
         } else {
             warn!("Could not parse disc image, CDFS redirection disabled");
