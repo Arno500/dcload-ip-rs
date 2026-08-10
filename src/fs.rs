@@ -5,6 +5,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::{
     cmds::{DCLoadClientFSCmds, DCLoadCmd},
     dispatch::{receive_data, send_data},
@@ -313,7 +316,7 @@ fn link(path: String, state: &FSSyscallState) -> Result<DCLoadCmd, Box<dyn std::
                 size: u32::MAX,
                 cmd: crate::cmds::DCLoadCmds::ReturnValue(),
             }),
-        };
+        }
     }
 }
 
@@ -360,10 +363,10 @@ fn chmod(
 ) -> Result<DCLoadCmd, Box<dyn std::error::Error>> {
     #[cfg(target_family = "unix")]
     {
-        let path = join_and_check_path(_state, _path, false);
-        let mut perms = fs::metadata(path)?.permissions();
+        let path = join_and_check_path(_state, _path, false)?;
+        let mut perms = fs::metadata(&path)?.permissions();
         perms.set_mode(_mode);
-        fs::set_permissions(path, perms)?;
+        fs::set_permissions(&path, perms)?;
     }
     Ok(DCLoadCmd {
         address: 0,

@@ -1,0 +1,147 @@
+[
+  {
+    "label": "Launch Sonic Adventure",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
+      "-d",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Sonic Adventure International",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\USA\\1ST_READ.BIN",
+      "-d",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\USA\\Sonic Adventure International v1.003 (1999)(Sega)(NTSC)(JP)(M5)[!].gdi",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Sonic Adventure CDI",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\1ST_READ_CDI.BIN",
+      "-d",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure (USA)(Limited Edition).cdi",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Crazy Taxi",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\1ST_READ.BIN",
+      "-d",
+      "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!].gdi",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Run updated dc-load-ip",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "u-exec",
+      "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Run Dreamshell",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "u-exec",
+      "C:\\Users\\arnod\\Documents\\Dreamcast\\DS.elf",
+      "-m",
+      "test",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+    },
+    "sourceLanguages": ["rust"],
+  },
+]
