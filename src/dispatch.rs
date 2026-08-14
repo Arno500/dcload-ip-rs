@@ -3,7 +3,7 @@ use std::{
     io::{Error, ErrorKind},
     path::Path,
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use elf::{ElfBytes, endian::AnyEndian, section::SectionHeader};
@@ -412,6 +412,28 @@ pub fn send_version(
  */
 const MAX_XFER: usize = 256 * CHUNK_SIZE;
 
+/// Busy-wait for `d`, the way dc-tool paces its bursts.
+///
+/// thread::sleep is the wrong tool for sub-millisecond pacing on Windows: it
+/// rounds up to the system timer tick, so a 1800 us pause is billed as 2 ms and
+/// a 1 ns "yield" is billed as a full tick. On the runtime CDFS path that error
+/// is not an inefficiency -- the Dreamcast blocks the running title for the
+/// whole transfer, so every microsecond overspent here is a microsecond the
+/// game is not rendering. Spin instead, and the pacing means what it says.
+///
+/// The cost is real CPU on the host, which is exactly the trade dc-tool makes
+/// (`while ((time_in_usec() - start) < rx_fifo_delay);`). At the default 1800 us
+/// per 12-packet chunk it is a few percent of one core.
+fn spin_for(d: Duration) {
+    if d.is_zero() {
+        return;
+    }
+    let start = Instant::now();
+    while start.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
 /// Split anything larger than the DC's packet map into successive transfers.
 pub fn send_data(
     conn: &mut impl ExternalDcIo,
@@ -561,26 +583,165 @@ fn send_data_one(
         // one loss per ~7 wraps is what that drift would look like.
         (8_u32, Duration::from_millis(2))
     };
+    // THE INITIAL UPLOAD PACES ITSELF AGAINST THE DC, NOT AGAINST A CLOCK.
+    //
+    // Timed pacing here was OPEN LOOP: 256 parts went out back to back with a
+    // 2 ms pause every 8, roughly 4000 packets/s, and nothing on the way ever
+    // asked whether the DC had drained any of them. DoneBinary only came at the
+    // end of the whole 368 KB transfer. When the Dreamcast drains slower than
+    // that -- which under an interpreted SH4 it always does -- the shortfall
+    // accumulates until the 16 KB RX ring overflows and the CHIP starts
+    // discarding frames.
+    //
+    // That is now measured rather than inferred. dcload reads RT_RXMISSED, the
+    // RTL8139's own tally of frames it threw away for want of ring space:
+    // g_rx_missed = 887 across one upload, while every CPU-side counter stayed
+    // clean (g_rx_status_drop 0, g_rx_hdr_defer 0, g_udp_cksum_bad 0,
+    // g_pbin_rejected 0) and flycast's bridge reported dropped=0. The loss was
+    // congestion all along; it looked structural because dcload's overflow
+    // counter was being cleared by its own per-frame interrupt acknowledge, so
+    // the one instrument that could have shown it read zero.
+    //
+    // This also explains why bursts of 8 and of 4 left the same number of holes:
+    // only the burst changed, the 2 ms delay did not, so the average rate --
+    // the thing that actually overruns the ring -- was nearly identical.
+    //
+    // So close the loop with the mechanism the protocol already has. DoneBinary
+    // is a BARRIER: dcload processes datagrams in arrival order, so a reply
+    // proves every PartBinary sent before it has been handled, and its payload
+    // is the first part still missing -- exactly where to resume. A window that
+    // fits the ring can therefore never be exceeded, whatever the DC's speed.
+    //
+    // RUNTIME CDFS TRANSFERS ARE DELIBERATELY LEFT ALONE. A 16 KB sector read is
+    // only 12 parts, so probing per window would add a round trip to a path
+    // whose timing a running title is sensitive to, to fix a problem that only
+    // shows up over hundreds of consecutive parts.
     let mut packet_count: u32 = 0;
-    for chunk in data.chunks(CHUNK_SIZE) {
-        let mut padded_chunk = [0u8; CHUNK_SIZE];
-        padded_chunk[..chunk.len()].copy_from_slice(chunk);
-        conn.send_command(DCLoadCmd {
-            cmd: DCLoadCmds::PartBinary(Box::new(padded_chunk)),
-            address: incr_address,
-            size: chunk.len() as u32,
-        })?;
-        bar.inc(chunk.len() as u64);
-        incr_address += chunk.len() as u32;
-        packet_count = packet_count.saturating_add(1);
-        sleep(Duration::from_nanos(1));
-        if packet_count.is_multiple_of(burst_packets) {
-            sleep(burst_delay);
-        }
-    }
+    if progress_bar.is_some() {
+        let window = burst_packets.max(1) as usize;
+        let mut pos: usize = 0;
+        let mut last_missing: Option<usize> = None;
+        let mut stalled: u32 = 0;
 
-    // Give in-flight UDP packets a chance to arrive before DoneBinary.
-    sleep(Duration::from_millis(25));
+        loop {
+            let mut in_window = 0usize;
+            while pos < data.len() && in_window < window {
+                let end = (pos + CHUNK_SIZE).min(data.len());
+                let chunk = &data[pos..end];
+                let mut padded_chunk = [0u8; CHUNK_SIZE];
+                padded_chunk[..chunk.len()].copy_from_slice(chunk);
+                conn.send_command(DCLoadCmd {
+                    cmd: DCLoadCmds::PartBinary(Box::new(padded_chunk)),
+                    address: address + pos as u32,
+                    size: chunk.len() as u32,
+                })?;
+                pos = end;
+                in_window += 1;
+                packet_count = packet_count.saturating_add(1);
+                sleep(Duration::from_nanos(1));
+            }
+
+            let probe = request_donebin(conn)?;
+            if probe.size == 0 {
+                // Nothing missing anywhere in this LoadBinary window: done.
+                bar.set_position(data.len() as u64);
+                break;
+            }
+
+            let missing = probe.address.wrapping_sub(address) as usize;
+            if missing >= data.len() {
+                // Cannot happen for a non-zero size, and acting on it would
+                // index out of bounds. Treat as complete and let the existing
+                // recovery loop below have the final word.
+                break;
+            }
+            bar.set_position(missing as u64);
+
+            if missing < pos {
+                // A hole inside what we already sent. Rewind exactly to it --
+                // the parts after it are re-sent too, which costs nothing since
+                // the DC simply overwrites them with identical bytes.
+                if last_missing == Some(missing) {
+                    stalled += 1;
+                    // Refusing the same part over and over means something other
+                    // than loss is wrong (a window the DC never installed, say).
+                    // Bail rather than spin forever.
+                    if stalled > 16 {
+                        return Err(Box::new(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            format!(
+                                "The Dreamcast kept asking for 0x{:08x} after {} attempts",
+                                probe.address, stalled
+                            ),
+                        )));
+                    }
+                } else {
+                    stalled = 0;
+                }
+                last_missing = Some(missing);
+                pos = missing;
+            }
+        }
+    } else {
+        // RUNTIME CDFS TRANSFERS: THE TITLE IS FROZEN FOR EVERY MICROSECOND
+        // SPENT IN HERE.
+        //
+        // dcload answers a disc read synchronously -- it sits in bb->loop()
+        // until the last PartBinary lands -- so this loop does not merely pace
+        // a transfer, it decides how long the game stops rendering. Measured on
+        // Sonic Adventure before this change: 45.6 ms per 16 KB chunk, 3.7
+        // chunks per read, so ~168 ms of frozen game per disc read, and dcload
+        // holding 35.6% of the machine. That is the stutter, and almost none of
+        // it was the network: 16 KB at 100 Mbit is 1.3 ms of wire time.
+        //
+        // It was thread::sleep. On Windows that rounds up to the system timer
+        // tick, so the three sleeps below cost, per chunk:
+        //   12 x sleep(1 ns)  -> ~12 ms   (a yield that was never free)
+        //    1 x sleep(1800us)-> ~2 ms    (asked for 1.8, billed 2)
+        //    1 x sleep(25 ms) -> 25 ms
+        // ~39 ms of the 45.6 measured, all of it deliberate waiting.
+        //
+        // dc-tool, the reference host, does not sleep for this. It spins:
+        //   while ((time_in_usec() - start) < rx_fifo_delay);
+        // which is why 1800 us there means 1800 us. Do the same, and drop the
+        // two waits that buy nothing.
+        for chunk in data.chunks(CHUNK_SIZE) {
+            let mut padded_chunk = [0u8; CHUNK_SIZE];
+            padded_chunk[..chunk.len()].copy_from_slice(chunk);
+            conn.send_command(DCLoadCmd {
+                cmd: DCLoadCmds::PartBinary(Box::new(padded_chunk)),
+                address: incr_address,
+                size: chunk.len() as u32,
+            })?;
+            bar.inc(chunk.len() as u64);
+            incr_address += chunk.len() as u32;
+            packet_count = packet_count.saturating_add(1);
+            // The per-packet sleep(1 ns) that used to be here is gone. It read
+            // as "yield briefly"; on Windows it is a full timer tick, and it
+            // was the single largest cost in this loop.
+            if packet_count.is_multiple_of(burst_packets) {
+                // KEPT, BUT MADE PRECISE. The burst still has to fit the DC's
+                // 16 KB RX ring -- 12 packets is ~18 KB, so pausing once
+                // partway through is what stops the tail being dropped. Only
+                // the mechanism changes, not the pacing the DC sees.
+                spin_for(burst_delay);
+            }
+        }
+
+        // NO BLIND WAIT BEFORE DoneBinary.
+        //
+        // This was sleep(25 ms), "give in-flight UDP packets a chance to
+        // arrive". The protocol already guarantees that, by the same argument
+        // this file makes for the upload path above: dcload processes
+        // datagrams in arrival order, so DoneBinary is a BARRIER -- its reply
+        // proves every PartBinary sent before it has been handled, and names
+        // the first part still missing. Waiting first cannot make that answer
+        // more true; it only adds 25 ms of frozen game to every 16 KB read.
+        //
+        // If this is ever wrong, the symptom is specific and measurable: the
+        // DC starts reporting holes it would have filled in, so watch
+        // g_cdfs_read_retries and the "resending missing parts" warning.
+    }
 
     bar.finish_with_message("Initial upload complete, verifying...");
 
