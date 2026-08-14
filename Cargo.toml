@@ -12,6 +12,9 @@ lto = "fat"
 [dependencies]
 clap = { version = "4.5.58", features = ["derive"] }
 clap-num = "1.2.0"
+# Already in the tree as indicatif's own terminal backend; declared here so the
+# progress display can ask how wide the terminal is before it picks a layout.
+console = "0.16.2"
 elf = "0.8.0"
 indicatif = "0.18.3"
 log = "0.4.29"

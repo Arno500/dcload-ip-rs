@@ -7,7 +7,7 @@ use std::{
 };
 
 use elf::{ElfBytes, endian::AnyEndian, section::SectionHeader};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar};
 
 use crate::{
     CHUNK_SIZE,
@@ -18,7 +18,7 @@ use crate::{
     },
     fs::{self, FSSyscallState},
     io::ExternalDcIo,
-    protocol_version,
+    protocol_version, ui,
 };
 
 pub fn upload(
@@ -44,11 +44,16 @@ pub fn upload(
     let file_buffer = std::fs::read(path)?;
     debug!("Read file {} ({} bytes)", file, file_size);
 
-    let progress = MultiProgress::new();
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.clone());
+
     let mut elf_parts: Vec<SectionHeader> = vec![];
 
     // Analyze the ELF file
     let elf = ElfBytes::<AnyEndian>::minimal_parse(file_buffer.as_slice());
+    let started = Instant::now();
     if let Ok(elf) = elf {
         // Let's keep the entrypoint somewhere, it may be handy 👀
         address = elf.ehdr.e_entry as u32;
@@ -64,14 +69,28 @@ pub fn upload(
             });
         });
 
-        let parts_progress =
-            ProgressBar::new(elf_parts.len().try_into()?).with_style(ProgressStyle::with_template(
-                "[{elapsed_precise}] [{bar:40.cyan/blue}] {human_pos}/{human_len} ({eta})",
-            )?);
-        progress.add(parts_progress.clone());
+        // ONE BAR FOR THE WHOLE FILE, SIZED IN BYTES.
+        //
+        // There used to be a bar per section AND a fresh bar inside every
+        // 360 KiB LoadBinary window, so a 6.4 MB upload drew nineteen separate
+        // bars, each of which filled up and vanished. Every one of them
+        // restarted the rate estimate from nothing -- which is why the rate
+        // swung between 470 KiB/s and 2.24 MiB/s on a link whose real
+        // throughput never moved -- and every one of them reported "ETA 0s",
+        // because the end of a window is not the end of the job.
+        //
+        // Counting the bytes of the whole file up front costs one pass over
+        // the section table and makes the rate and the ETA mean what a human
+        // reads them to mean.
+        let strtab = elf.section_headers_with_strtab().ok().and_then(|(_, s)| s);
+        let total: u64 = elf_parts
+            .iter()
+            .filter_map(|sh| elf.section_data(sh).ok())
+            .map(|(data, _)| data.len() as u64)
+            .sum();
+        let bar = ui::bytes_bar(total, label);
 
         for sh in elf_parts.iter() {
-            parts_progress.inc(1);
             if let Ok(section_data) = elf.section_data(sh) {
                 if section_data.0.is_empty() {
                     trace!(
@@ -80,31 +99,61 @@ pub fn upload(
                     );
                     continue;
                 }
+                let name = strtab
+                    .and_then(|st| st.get(sh.sh_name as usize).ok())
+                    .filter(|n| !n.is_empty())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| format!("0x{:08x}", sh.sh_addr));
+                bar.set_message(name);
                 debug!(
                     "Uploading section at address 0x{:08x} ({} bytes)",
                     sh.sh_addr + sh.sh_offset,
                     section_data.0.len()
                 );
-                if let Err(e) = send_data(conn, section_data.0, sh.sh_addr as u32, Some(&progress))
-                {
+                if let Err(e) = send_data(conn, section_data.0, sh.sh_addr as u32, Some(&bar)) {
                     error!("Error uploading section: {}", e);
                     return Err(e);
                 }
             } else {
-                let _ = progress.clear();
                 return Err(Box::new(Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Failed to get section data",
                 )));
             }
         }
-        parts_progress.finish_with_message("All sections uploaded");
-        let _ = progress.clear();
-    } else if let Err(e) = send_data(conn, file_buffer.as_slice(), address, Some(&progress)) {
-        error!("Error uploading binary: {}", e);
-        return Err(e);
+        drop(bar);
+        report_upload(total, started.elapsed());
+    } else {
+        let bar = ui::bytes_bar(file_buffer.len() as u64, label);
+        let result = send_data(conn, file_buffer.as_slice(), address, Some(&bar));
+        drop(bar);
+        if let Err(e) = result {
+            error!("Error uploading binary: {}", e);
+            return Err(e);
+        }
+        report_upload(file_buffer.len() as u64, started.elapsed());
     }
     Ok((address, 0))
+}
+
+/// The one line that survives the transfer, for the terminal and for the log.
+///
+/// The bar itself is erased when it is done -- a finished bar is a stale bar --
+/// so the numbers a human actually wants to keep (how much, how long, how fast)
+/// are stated once, as a log record, where they also end up in a redirected
+/// log with no escape sequences around them.
+fn report_upload(bytes: u64, elapsed: Duration) {
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        (bytes as f64 / elapsed.as_secs_f64()) as u64
+    } else {
+        0
+    };
+    info!(
+        "Uploaded {} in {:.2} s ({}/s)",
+        HumanBytes(bytes),
+        elapsed.as_secs_f64(),
+        HumanBytes(rate)
+    );
 }
 
 pub fn execute(
@@ -129,7 +178,7 @@ pub fn reboot(
         address: 0,
         size: 0,
     };
-    debug!("Sending command: {:?}", command);
+    log_command(&command);
     conn.send_command(command)?;
     Ok(0)
 }
@@ -177,9 +226,24 @@ pub fn receive_syscalls(
     fs_syscall_state.openfiles.resize_with(256, || None);
     let mut logged_lbas: HashSet<u32> = HashSet::new();
     let pvd_lba = disc.start_sector().saturating_add(16);
+    // Aggregates the title's disc reads into "loading" bursts (see `ui`). It
+    // also decides how long we wait for the next packet: forever when nothing
+    // is loading, which is exactly what this loop did before, and briefly while
+    // a burst is open so the bar can be taken down when the loading stops.
+    let mut load = ui::LoadMonitor::new();
     loop {
-        match await_result(conn, None) {
-            Err(e) => warn!("Error waiting for syscall: {}", e),
+        match await_result(conn, load.poll_timeout()) {
+            Err(e) => {
+                // A timeout is not a fault here: it is the burst having gone
+                // quiet, and the only reason we asked for one.
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|ioe| ioe.kind() == ErrorKind::TimedOut)
+                {
+                    load.settle();
+                } else {
+                    warn!("Error waiting for syscall: {}", e);
+                }
+            }
             Ok(cmds) => {
                 for cmd in cmds {
                     if let Some(inner_cmd) = cmd.request {
@@ -331,6 +395,13 @@ pub fn receive_syscalls(
                                             address: 0,
                                             size: 0,
                                         })?;
+                                        // AFTER the ReturnValue, deliberately.
+                                        // Until it is sent the title is still
+                                        // parked in bb->loop() waiting for this
+                                        // read, so anything done before it --
+                                        // including redrawing a bar -- is time
+                                        // the game spends frozen.
+                                        load.record(buf.len(), start);
                                     }
                                     Err(e) => {
                                         warn!(
@@ -380,6 +451,11 @@ pub fn receive_syscalls(
                         }
                     }
                 }
+                // A batch that carried no disc read still tells us time has
+                // passed. Without this, a title that goes on chatting -- console
+                // output, a file syscall -- after it stops loading would keep
+                // the poll returning promptly and leave the bar up.
+                load.settle();
             }
         }
     }
@@ -435,11 +511,19 @@ fn spin_for(d: Duration) {
 }
 
 /// Split anything larger than the DC's packet map into successive transfers.
+///
+/// `progress_bar` is TWO THINGS AT ONCE, and both matter. It is where the
+/// caller wants the bytes counted, and it is the flag that says "this is the
+/// initial upload, not a runtime CDFS transfer" -- the two paths pace
+/// differently, probe differently, and have completely different tolerance for
+/// host-side delay (a runtime transfer freezes the running title for its whole
+/// duration). Passing `None` from the upload path, or `Some` from the syscall
+/// path, would silently swap those behaviours.
 pub fn send_data(
     conn: &mut impl ExternalDcIo,
     data: &[u8],
     address: u32,
-    progress_bar: Option<&MultiProgress>,
+    progress_bar: Option<&ProgressBar>,
 ) -> std::result::Result<usize, std::boxed::Box<dyn std::error::Error>> {
     if data.len() > MAX_XFER {
         let mut sent = 0usize;
@@ -461,7 +545,7 @@ fn send_data_one(
     conn: &mut impl ExternalDcIo,
     data: &[u8],
     address: u32,
-    progress_bar: Option<&MultiProgress>,
+    progress_bar: Option<&ProgressBar>,
 ) -> std::result::Result<usize, std::boxed::Box<dyn std::error::Error>> {
     let mut incr_address = address;
 
@@ -517,18 +601,9 @@ fn send_data_one(
         )));
     }
 
-    // Rust have some chunking utilities, let's use them to split packets automatically
-    let bar = if data.len() < 10000 {
-        ProgressBar::hidden()
-    } else {
-        ProgressBar::new(data.len().try_into()?).with_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-    )?)
-    };
-
-    if let Some(progress_bar) = progress_bar {
-        progress_bar.add(bar.clone());
-    }
+    // How much of THIS transfer the DC has confirmed. The bar it feeds spans
+    // the whole file, so this is the local half of the bookkeeping.
+    let mut confirmed = 0usize;
 
     // Send each chunk using PartBinary with pacing to avoid overrunning
     // Dreamcast RX FIFO during runtime CDFS transfers.
@@ -644,7 +719,7 @@ fn send_data_one(
             let probe = request_donebin(conn)?;
             if probe.size == 0 {
                 // Nothing missing anywhere in this LoadBinary window: done.
-                bar.set_position(data.len() as u64);
+                credit(progress_bar, &mut confirmed, data.len());
                 break;
             }
 
@@ -655,7 +730,10 @@ fn send_data_one(
                 // recovery loop below have the final word.
                 break;
             }
-            bar.set_position(missing as u64);
+            // DoneBinary names the FIRST part still missing, so everything
+            // below it is confirmed received -- that, and nothing else, is
+            // what the bar advances on.
+            credit(progress_bar, &mut confirmed, missing);
 
             if missing < pos {
                 // A hole inside what we already sent. Rewind exactly to it --
@@ -713,7 +791,6 @@ fn send_data_one(
                 address: incr_address,
                 size: chunk.len() as u32,
             })?;
-            bar.inc(chunk.len() as u64);
             incr_address += chunk.len() as u32;
             packet_count = packet_count.saturating_add(1);
             // The per-packet sleep(1 ns) that used to be here is gone. It read
@@ -743,11 +820,13 @@ fn send_data_one(
         // g_cdfs_read_retries and the "resending missing parts" warning.
     }
 
-    bar.finish_with_message("Initial upload complete, verifying...");
-
     let first_donebin = request_donebin(conn)?;
     if first_donebin.size > 0 {
         let mut last_cmd = first_donebin;
+        // What the bar was saying before the repair started -- the section
+        // being uploaded, usually. Put it back afterwards instead of blanking
+        // it, so a repair does not cost the caller its label.
+        let previous_message = progress_bar.map(|bar| bar.message());
         warn!("There was an error while uploading the binary, resending missing parts...");
 
         // RESEND A RUN, NOT A SINGLE PACKET.
@@ -790,9 +869,6 @@ fn send_data_one(
                 )));
             }
             if last_cmd.size as usize > CHUNK_SIZE {
-                if let Some(progress_bar) = progress_bar {
-                    progress_bar.remove(&bar);
-                }
                 // Just for safety, should never happens
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -801,6 +877,13 @@ fn send_data_one(
                         CHUNK_SIZE
                     ),
                 )));
+            }
+
+            // Say so on the bar. A repair is the one time an upload legitimately
+            // stops making forward progress, and without a word for it the
+            // display just looks stuck.
+            if let Some(bar) = progress_bar {
+                bar.set_message(format!("repairing +{resent_total}"));
             }
 
             let mut start = (last_cmd.address - address) as usize;
@@ -840,12 +923,34 @@ fn send_data_one(
             }
         }
         warn!("Recovered after resending {resent_total} part(s)");
+        if let (Some(bar), Some(message)) = (progress_bar, previous_message) {
+            bar.set_message(message);
+        }
     }
-    if let Some(progress_bar) = progress_bar {
-        progress_bar.remove(&bar);
+    if let Some(bar) = progress_bar {
+        // The whole window is acknowledged by now; make the bar say so, since
+        // the credit above only ever advanced to the first *missing* part.
+        credit(Some(bar), &mut confirmed, data.len());
     }
 
     Ok(0)
+}
+
+/// Advance a bar to `reached` bytes of the current transfer, never backwards.
+///
+/// DoneBinary reports the first part still missing, which MOVES BACKWARDS every
+/// time a hole is found and re-sent. Feeding that straight to `set_position`
+/// makes the bar jump about and poisons the rate estimate with negative
+/// progress; crediting the high-water mark instead means the bar shows what the
+/// Dreamcast has actually acknowledged, which is the number worth an ETA.
+fn credit(bar: Option<&ProgressBar>, confirmed: &mut usize, reached: usize) {
+    if reached <= *confirmed {
+        return;
+    }
+    if let Some(bar) = bar {
+        bar.inc((reached - *confirmed) as u64);
+    }
+    *confirmed = reached;
 }
 
 fn call_command(
@@ -854,11 +959,11 @@ fn call_command(
 ) -> std::result::Result<Vec<DCReturnCmd>, std::boxed::Box<dyn std::error::Error>> {
     let tries = 5;
     for _ in 0..tries {
-        debug!("Sending command: {:?}", command);
+        log_command(&command);
         conn.send_command(command.clone())?;
         match await_result(conn, Some(Duration::from_millis(500))) {
             Err(e) => warn!(
-                "Error waiting for response after command {:?}: {}, retrying... That might indicate packet loss",
+                "Error waiting for response after command {}: {}, retrying... That might indicate packet loss",
                 command, e
             ),
             Ok(cmds) => return Ok(cmds),
@@ -866,11 +971,23 @@ fn call_command(
     }
     Err(Box::new(std::io::Error::new(
         ErrorKind::TimedOut,
-        format!(
-            "No response after {} tries for command {:?}",
-            tries, command
-        ),
+        format!("No response after {} tries for command {}", tries, command),
     )))
+}
+
+/// Log an outgoing command at the level its FREQUENCY deserves.
+///
+/// DoneBinary is not one command per transfer, it is one per eight-packet
+/// window: an upload probes with it continuously, so at debug level it alone
+/// produced hundreds of identical lines per second -- the noise that made the
+/// display unreadable in the first place. It is still there under `-vv`, where
+/// somebody asking for trace has asked for exactly that.
+fn log_command(command: &DCLoadCmd) {
+    if matches!(command.cmd, DCLoadCmds::DoneBinary()) {
+        trace!("Sending command: {}", command);
+    } else {
+        debug!("Sending command: {}", command);
+    }
 }
 
 fn extract_donebin(cmds: &[DCReturnCmd]) -> Option<DCLoadCmd> {
@@ -902,7 +1019,7 @@ fn request_donebin(
     // listening, so the DC's own timeout and retry cannot be served. Giving up
     // sooner is what makes the retry path on the DC side reachable at all.
     for _retry in 0..2 {
-        debug!("Sending command: {:?}", cmd);
+        log_command(&cmd);
         conn.send_command(cmd.clone())?;
 
         for _poll_try in 0..10 {
@@ -977,13 +1094,9 @@ pub fn receive_data(
         size: size as u32,
     })?;
 
-    let bar = if size < 10000 {
-        ProgressBar::hidden()
-    } else {
-        ProgressBar::new(size as u64).with_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-    )?)
-    };
+    // Same display as an upload, and registered with the same MultiProgress so
+    // the read-back verification path cannot draw over the log either.
+    let bar = ui::bytes_bar(size as u64, "read-back");
 
     for _ in 0..expected_chunks {
         match await_result(conn, timeout) {
@@ -1117,7 +1230,7 @@ pub fn receive_data(
         }
     }
 
-    bar.finish_with_message("Data reception complete");
+    drop(bar);
 
     Ok(data)
 }

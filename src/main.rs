@@ -4,7 +4,6 @@ use crate::{dispatch::send_version, io::DcIoUDP};
 
 use clap::{Parser, Subcommand};
 use clap_num::maybe_hex;
-use pretty_env_logger::formatted_timed_builder;
 
 #[macro_use]
 extern crate log;
@@ -16,6 +15,7 @@ mod disc_formats;
 mod dispatch;
 mod io;
 mod types;
+mod ui;
 
 const PROTOCOL_VERSION_LEGACY: [u8; 3] = [0, 0, 0];
 const PROTOCOL_VERSION_MODERN: [u8; 3] = [2, 0, 3];
@@ -85,23 +85,9 @@ enum Commands {
 
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
-    match args.verbose {
-        Some(0) | None => {
-            if ::std::env::var("RUST_LOG").is_ok() {
-                pretty_env_logger::init_timed();
-            } else {
-                formatted_timed_builder()
-                    .filter_level(log::LevelFilter::Info)
-                    .init();
-            }
-        }
-        Some(1) => formatted_timed_builder()
-            .filter_level(log::LevelFilter::Debug)
-            .init(),
-        Some(_) => formatted_timed_builder()
-            .filter_level(log::LevelFilter::Trace)
-            .init(),
-    }
+    // Logging goes through the progress display (see `ui`), so that a log
+    // record never lands on top of a bar that is being drawn.
+    ui::init_logging(args.verbose);
     let legacy_mode = protocol_version()[0] < 2;
     let remote_port = if legacy_mode { 31313 } else { args.port };
     let local_port = if legacy_mode { Some(31313) } else { None };

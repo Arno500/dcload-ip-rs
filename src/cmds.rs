@@ -22,6 +22,44 @@ pub struct DCLoadCmd {
     pub size: u32,
 }
 
+impl DCLoadCmds {
+    /// The four-character code as it goes on the wire.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DCLoadCmds::Execute() => "EXEC",
+            DCLoadCmds::LoadBinary() => "LBIN",
+            DCLoadCmds::PartBinary(_) => "PBIN",
+            DCLoadCmds::DoneBinary() => "DBIN",
+            DCLoadCmds::SendBinary(_) => "SBIN",
+            DCLoadCmds::SendBinaryQuiet(_) => "SBIQ",
+            DCLoadCmds::Version(_) => "VERS",
+            DCLoadCmds::ReturnValue() => "RETV",
+            DCLoadCmds::Reboot() => "RBOT",
+            DCLoadCmds::Mapl() => "MAPL",
+            DCLoadCmds::PerformanceCounter() => "PMCR",
+        }
+    }
+}
+
+/// One command, one short line -- for logs meant to be read.
+///
+/// `{:?}` is the wrong tool here twice over. It prints `address` in decimal,
+/// so `LoadBinary { address: 201392128 }` has to be converted by hand before it
+/// can be compared with anything else in this codebase, all of which speaks
+/// hex; and for `PartBinary` it walks the payload, which is a `[u8; CHUNK_SIZE]`
+/// -- 1440 numbers per line, per packet.
+impl std::fmt::Display for DCLoadCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} 0x{:08x} +{}",
+            self.cmd.name(),
+            self.address,
+            self.size
+        )
+    }
+}
+
 impl From<DCLoadCmd> for Vec<u8> {
     fn from(val: DCLoadCmd) -> Self {
         let mut data: Vec<u8> = Vec::new();

@@ -10,7 +10,9 @@ to a DC happens through this binary.
 Single binary crate (`name = "dcload-ip-rs"`), edition 2024, v0.1.0. No
 library output, no `lib.rs`, no integration tests. Edition 2024 needs a
 recent stable Rust toolchain (≥ 1.85); the lockfile assumes current crates.io
-versions of `clap`, `elf`, `polling`, `indicatif`, `pretty_env_logger`.
+versions of `clap`, `elf`, `polling`, `indicatif`, `console`,
+`pretty_env_logger`. (`console` is indicatif's own terminal backend; it is
+declared directly so `src/ui.rs` can ask how wide the terminal is.)
 
 ## What a run actually looks like
 
@@ -127,8 +129,18 @@ The crate is small enough that one diagram isn't really needed; the
 short version is "main wires a CLI to a UDP transport and an upload/syscalls
 dispatcher". The longer version, module by module:
 
+- **`src/ui.rs`** — everything that touches the terminal. Owns the one
+  `MultiProgress` for the process, installs the logger through it
+  (`init_logging`), and hands out progress bars (`bytes_bar`, which
+  returns a `Bar` that removes itself on drop). The point of the module
+  is that a log record and a progress bar can no longer write over each
+  other: records are printed from inside `MultiProgress::suspend`. If you
+  create a `ProgressBar` anywhere else, it is outside that arrangement
+  and will be shredded by the next log line. It also holds `LoadMonitor`,
+  which aggregates a running title's disc reads into "loading" bursts.
+
 - **`src/main.rs`** — entry point. Defines the `Args`/`Commands` clap
-  structs, sets up logging (`pretty_env_logger`, `-v`/`-vv` for
+  structs, sets up logging (`ui::init_logging`, `-v`/`-vv` for
   debug/trace, otherwise honors `RUST_LOG`), chooses legacy vs. modern
   mode from `CHUNK_SIZE`, opens the `DcIoUDP` socket, sends the initial
   `Version`, and dispatches to the right `dispatch::*` function for the
@@ -248,9 +260,52 @@ does in this version — the name implies it traces slow receive loops).
 The binary is otherwise a normal command-line tool: `RUST_LOG=trace`
 plus `-vv` is the deepest verbosity, and `dispatch::send_data` /
 `dispatch::receive_syscalls` are the most useful `tracing!` targets.
-The progress bars (`indicatif`) and the pretty_env_logger output
-co-exist; the bar suppresses itself under 10 KB to keep the logs
-readable.
+
+**The display and the log share the terminal on purpose** — see
+`src/ui.rs`. Everything a reader needs to know about it:
+
+- One bar per upload, sized in bytes over the WHOLE file, so the rate and
+  the ETA are stable. It advances on bytes the DC has ACKNOWLEDGED (the
+  address `DoneBinary` reports), never on bytes merely sent, and it never
+  moves backwards even though `DoneBinary` does.
+- Log records are printed from inside `MultiProgress::suspend`, so they
+  land above the bar instead of through it. That only works for bars
+  created via `ui::bytes_bar`.
+- Nothing draws when stderr is not a terminal: `dcload-ip-rs … 2> log`
+  gets plain text with no escape sequences.
+- `DoneBinary` is logged at TRACE, not DEBUG. It is sent once per
+  eight-packet window, so at debug level it alone was hundreds of
+  identical lines per second. Everything else is unchanged.
+- Commands log through `Display` (`LBIN 0x0c010000 +368640`), not
+  `{:?}`. `{:?}` printed addresses in decimal and would have dumped the
+  whole 1440-byte payload of a `PartBinary`.
+- Transfers under 10 KB get no bar at all (`ui::BAR_MIN_BYTES`).
+
+**In-game loading has its own bar** (`ui::LoadMonitor`), and its shape is
+dictated by the protocol:
+
+- **The unit is the burst, not the request.** dcload fetches at most
+  `GD_EMU_ASYNC` = 8 sectors (16 KiB) per `ReadSector`, so a level load is
+  a hundred small requests back to back. The monitor accumulates
+  consecutive reads and shows one bar for the burst.
+- **There is no percentage or ETA, on purpose.** The GD command knows how
+  many sectors it wants (`_GDS.param[1]` on the DC), but the wire carries
+  only the chunk being fetched. The host cannot know the total, so the
+  bar shows bytes read, elapsed time and the burst's average rate — no
+  invented progress. Making it a real percentage would mean sending the
+  command's total sector count from the DC, which is a protocol change.
+- **The bar is only updated after the ReturnValue goes out.** Until then
+  the title is parked in `bb->loop()` waiting for its data; anything done
+  before that — a redraw included — is time the game spends frozen.
+- Thresholds, both overridable: `DCLOAD_LOAD_BAR_KB` (default 256, the
+  burst size that earns a bar; **0 disables the feature entirely**) and
+  `DCLOAD_LOAD_IDLE_MS` (default 250, the silence that ends a burst).
+- `receive_syscalls` now polls with a timeout **only while a burst is
+  open** (`LoadMonitor::poll_timeout`), so the bar can be taken down when
+  the loading stops. With no burst in flight — the normal state of a
+  running title, and always when the feature is disabled — it blocks
+  forever exactly as it did before. A `TimedOut` from that poll is not an
+  error and must not be logged as one.
 
 If you have no Dreamcast and no emulator that speaks the dcload
 protocol, the only thing you can do is `cargo build` and read the
