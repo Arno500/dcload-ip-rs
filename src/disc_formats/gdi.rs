@@ -138,6 +138,19 @@ impl DiscFormat for Gdi {
             .saturating_add(150)
     }
 
+    /// The HIGHEST-LBA data track, i.e. the high-density area -- the mirror of
+    /// `start_sector()`'s `min`. See the trait for why the two differ.
+    fn boot_sector(&self) -> u32 {
+        let tracks = self.tracks.borrow();
+        tracks
+            .iter()
+            .filter(|t| t.track_type == 4)
+            .map(|t| t.start_lba)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(150)
+    }
+
     fn num_sectors(&self) -> u32 {
         let mut tracks = self.tracks.borrow_mut();
         let data_track_indices: Vec<usize> = tracks
@@ -181,5 +194,71 @@ impl DiscFormat for Gdi {
         }
 
         leadout.saturating_sub(first_start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disc_formats::types::DiscFormat;
+
+    /// The Sonic Adventure GDI that ships in `test/`. Skipped, not failed, if
+    /// it is not there: the rest of the suite must stay runnable on a machine
+    /// without the dumps.
+    fn sa_gdi() -> Option<Gdi> {
+        let p = "test/Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi";
+        std::path::Path::new(p).exists().then(|| Gdi::new(p.to_string()).expect("parse gdi"))
+    }
+
+    /// THE BUG THIS LOCKS DOWN. `start_sector()` is the LOWEST data track and
+    /// `boot_sector()` the HIGHEST, and on a GD-ROM they are different tracks
+    /// with the same valid header. Getting them the same way round again would
+    /// make `--boot-ipbin` execute 32 KB of zeroes, silently.
+    #[test]
+    fn boot_sector_is_the_high_density_area() {
+        let Some(gdi) = sa_gdi() else { return };
+        assert_eq!(gdi.start_sector(), 150, "low-density data track");
+        assert_eq!(gdi.boot_sector(), 45150, "high-density data track");
+    }
+
+    /// Both areas open with a valid Dreamcast header for the same title --
+    /// which is exactly why the header alone cannot tell them apart -- but only
+    /// the high-density one carries bootstrap code at +0x6000.
+    #[test]
+    fn only_the_high_density_ip_bin_has_a_bootstrap() {
+        let Some(gdi) = sa_gdi() else { return };
+        let low = gdi.read_sector(gdi.start_sector(), 16).expect("low read");
+        let high = gdi.read_sector(gdi.boot_sector(), 16).expect("high read");
+
+        for (what, img) in [("low", &low), ("high", &high)] {
+            assert!(img.starts_with(b"SEGA SEGAKATANA"), "{what} area header");
+        }
+
+        // Bootstrap 1 is the clean discriminator: empty in the low-density
+        // area, ~200/256 bytes of code in the high-density one, measured the
+        // same way on SA, SA2 and Crazy Taxi. (+0x6000 is NOT -- the
+        // low-density area has padding there and looks populated.)
+        let live = |img: &[u8]| img[0x300..0x400].iter().filter(|b| **b != 0).count();
+        assert_eq!(live(&low), 0, "low-density area must have no bootstrap 1");
+        assert!(live(&high) > 128, "high-density bootstrap 1 must carry code");
+
+        // And the guard load_ip_bin() actually uses.
+        assert_eq!(&low[0x0cb0..0x0cb4], &[0, 0, 0, 0], "low: no patch site");
+        assert_eq!(&high[0x0cb0..0x0cb4], &[0x03, 0x63, 0x00, 0x40], "high: stock");
+    }
+
+    /// isoldr's `Load_IPBin()` patch offsets, worked out from its pointer
+    /// arithmetic. They are fixed positions in Sega's stock bootstrap, so the
+    /// bytes there are the same on every retail disc -- which is what makes it
+    /// safe to write them blind. If a dump ever disagrees, the arithmetic is
+    /// what to re-check.
+    #[test]
+    fn isoldr_patch_sites_hold_the_stock_bootstrap_bytes() {
+        let Some(gdi) = sa_gdi() else { return };
+        let ip = gdi.read_sector(gdi.boot_sector(), 16).expect("read");
+        assert_eq!(&ip[0x0cb0..0x0cb4], &[0x03, 0x63, 0x00, 0x40]);
+        assert_eq!(&ip[0x21b0..0x21b2], &[0x6e, 0x3a]);
+        assert_eq!(&ip[0x2814..0x2816], &[0x04, 0x06]);
+        assert_eq!(&ip[0x2818..0x281a], &[0x8f, 0x04]);
     }
 }

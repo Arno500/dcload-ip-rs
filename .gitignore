@@ -1,2 +1,8 @@
 /target
 test
+/loaders
+/game-presets.tsv
+
+# A faulting guest writes these in the CWD
+dc_exception_dump-*.bin
+scripts/*.jpg

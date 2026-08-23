@@ -14,17 +14,71 @@ use crate::{
     cd::build_dc_toc,
     cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
     disc_formats::{
-        cdi::Cdi, gdi::Gdi, iso::Iso, types::{StubDisc, get_disc_format}
+        cdi::Cdi,
+        gdi::Gdi,
+        iso::Iso,
+        types::{StubDisc, get_disc_format},
     },
     fs::{self, FSSyscallState},
     io::ExternalDcIo,
     protocol_version, ui,
 };
 
+/// REFUSE AN UPLOAD THAT LANDS ON THE LOADER DOING THE UPLOADING.
+///
+/// A chainload is an ordinary transfer: the running loader receives the parts
+/// and writes them where they are addressed. Address them at itself and it
+/// overwrites its own `cmd_partbin` mid-transfer -- the console goes straight
+/// back to the BIOS, and all the host sees is a DoneBinary that never comes.
+/// Measured 2026-08-15 uploading dcload-0x8c004000.elf to a loader already at
+/// 0x8c004000: LBIN accepted, then nothing, and the machine was gone.
+///
+/// `running` is what the loader reported. When it reports nothing -- every
+/// build before the base was added to the VERS payload -- the stock base is
+/// assumed, because that is where such a build necessarily is: relocation is
+/// the feature those builds do not have.
+fn refuse_self_overwrite(
+    running: Option<u32>,
+    at: u32,
+    len: usize,
+) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
+    let base = running.unwrap_or(crate::loaders::DEFAULT_BASE);
+    let image = (at, at.saturating_add(len as u32));
+    let Some(hit) = crate::loaders::overlapping_range(base, image) else {
+        return Ok(());
+    };
+    // Said in full through the logger, where it is readable and lands in a
+    // redirected log; the returned error stays short, because a `Box<dyn
+    // Error>` reaching main is printed with its Debug formatting.
+    error!(
+        "refusing to upload {} bytes at 0x{:08x}: that runs through \
+         0x{:08x}..0x{:08x}, which the loader running at 0x{:08x} is using{}. \
+         It would overwrite itself while receiving, and the console would drop \
+         to the BIOS with no error anywhere. To replace a loader in place, move \
+         out of the way first: `uexec loaders/dcload-0x{:08x}.elf`, then upload \
+         the one you want -- from up there the low bases are untouched ground.",
+        len,
+        at,
+        hit.0,
+        hit.1,
+        base,
+        if running.is_none() {
+            " (it does not report its address, so the stock base is assumed)"
+        } else {
+            ""
+        },
+        crate::loaders::SCRATCH_BASE
+    );
+    Err(Box::new(Error::other(format!(
+        "upload to 0x{at:08x} would overwrite the loader running at 0x{base:08x}"
+    ))))
+}
+
 pub fn upload(
     conn: &mut impl ExternalDcIo,
     file: String,
     mut address: u32,
+    running_base: Option<u32>,
 ) -> std::result::Result<(u32, usize), std::boxed::Box<dyn std::error::Error>> {
     let path = Path::new(&file);
     let metadata = std::fs::metadata(path)?;
@@ -59,13 +113,32 @@ pub fn upload(
         address = elf.ehdr.e_entry as u32;
         trace!("ELF entry point at 0x{:08x}", address);
 
+        // ONLY SECTIONS THAT OCCUPY MEMORY AT RUN TIME.
+        //
+        // This used to test SHT_PROGBITS, log "skipping", and then push the
+        // section anyway -- the `if` had no `continue` -- so every ELF was
+        // uploaded in full, symbol table included. `.symtab`, `.strtab`,
+        // `.shstrtab` and `.comment` are all PROGBITS-or-similar with contents
+        // and all sit at sh_addr 0, so those bytes were sent to address
+        // 0x00000000, at the bottom of the Dreamcast's address map. It went
+        // unnoticed because the common case is a raw 1ST_READ.BIN, which never
+        // reaches this branch at all.
+        //
+        // SHF_ALLOC is the flag that actually means "this occupies memory when
+        // the program runs"; a zero sh_addr means the section was never given
+        // one. See loaders::is_uploadable, which is also what the loader-set
+        // code measures an image's extent with, so the two cannot disagree
+        // about what gets sent.
         elf.section_headers().iter().for_each(|table| {
             table.iter().for_each(|sh| {
-                // Only keep interesting and uploadable sections
-                if sh.sh_type != elf::abi::SHT_PROGBITS {
-                    trace!("Skipping section without address or outside of the program");
+                if crate::loaders::is_uploadable(&sh) {
+                    elf_parts.push(sh);
+                } else {
+                    trace!(
+                        "Skipping non-allocated section at 0x{:08x} ({} bytes)",
+                        sh.sh_addr, sh.sh_size
+                    );
                 }
-                elf_parts.push(sh);
             });
         });
 
@@ -88,6 +161,15 @@ pub fn upload(
             .filter_map(|sh| elf.section_data(sh).ok())
             .map(|(data, _)| data.len() as u64)
             .sum();
+        // CHECK EVERY SECTION BEFORE SENDING ANY OF THEM. Refusing halfway
+        // through has already destroyed the loader with the sections that did
+        // go out; the point is to send nothing at all.
+        for sh in elf_parts.iter() {
+            if let Ok((data, _)) = elf.section_data(sh) {
+                refuse_self_overwrite(running_base, sh.sh_addr as u32, data.len())?;
+            }
+        }
+
         let bar = ui::bytes_bar(total, label);
 
         for sh in elf_parts.iter() {
@@ -107,7 +189,7 @@ pub fn upload(
                 bar.set_message(name);
                 debug!(
                     "Uploading section at address 0x{:08x} ({} bytes)",
-                    sh.sh_addr + sh.sh_offset,
+                    sh.sh_addr, // where it goes, not where it is in the file
                     section_data.0.len()
                 );
                 if let Err(e) = send_data(conn, section_data.0, sh.sh_addr as u32, Some(&bar)) {
@@ -124,6 +206,7 @@ pub fn upload(
         drop(bar);
         report_upload(total, started.elapsed());
     } else {
+        refuse_self_overwrite(running_base, address, file_buffer.len())?;
         let bar = ui::bytes_bar(file_buffer.len() as u64, label);
         let result = send_data(conn, file_buffer.as_slice(), address, Some(&bar));
         drop(bar);
@@ -170,6 +253,729 @@ pub fn execute(
     .map(|_| ())
 }
 
+/// Ask the running loader who and where it is.
+///
+/// Returns the version string and, from a loader new enough to append it, the
+/// address it was linked at. `None` for the address is a normal answer from an
+/// older build and must not be treated as a failure -- it only means the host
+/// has no basis on which to move anything.
+pub fn query_loader(
+    conn: &mut impl ExternalDcIo,
+) -> std::result::Result<(String, Option<u32>), std::boxed::Box<dyn std::error::Error>> {
+    let replies = send_version(conn)?;
+    for reply in replies {
+        if let Some(cmd) = reply.cmd
+            && let DCLoadCmds::Version(Some(data)) = cmd.cmd
+        {
+            return Ok(crate::loaders::parse_version_payload(
+                data.as_ref(),
+                cmd.size as usize,
+            ));
+        }
+    }
+    Err(Box::new(Error::new(
+        ErrorKind::InvalidData,
+        "no VERS reply from the Dreamcast",
+    )))
+}
+
+/// Poll for a loader at `expect` after a chainload.
+///
+/// Deliberately not `call_command`'s five 500 ms tries: what is being waited
+/// for here is not a lost packet but a whole loader coming up, which re-detects
+/// the network adapter on the way. On real hardware a cold RTL8139 init drops
+/// the link and restarts auto-negotiation, and that alone costs seconds.
+fn wait_for_loader(
+    conn: &mut impl ExternalDcIo,
+    expect: u32,
+    timeout: Duration,
+) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match query_loader(conn) {
+            Ok((version, Some(base))) if base == expect => {
+                debug!("loader at 0x{:08x} answered: {}", base, version);
+                return Ok(());
+            }
+            Ok((version, Some(base))) => {
+                last = format!("a loader at 0x{base:08x} answered instead ({version})");
+            }
+            Ok((version, None)) => {
+                last = format!("loader did not report its base ({version})");
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(Box::new(Error::new(
+        ErrorKind::TimedOut,
+        format!("no loader at 0x{expect:08x} after {timeout:?}: {last}"),
+    )))
+}
+
+/// Put a loader linked for `want` in control, chainloading through an
+/// intermediate base if going there directly would write over the running one.
+///
+/// Returns the base actually in control afterwards. A missing ELF, or a move
+/// that cannot be made safely, is reported and the CURRENT loader is kept: a
+/// title that runs badly at the stock address is a better outcome than one
+/// launched into a loader that was half overwritten.
+pub fn ensure_loader_base(
+    conn: &mut impl ExternalDcIo,
+    loaders: &crate::loaders::LoaderSet,
+    running: u32,
+    want: u32,
+) -> u32 {
+    if running == want {
+        info!("loader is already at 0x{:08x}, no chainload needed", want);
+        return running;
+    }
+    // A base that is known not to work is refused BEFORE the missing-ELF path,
+    // so the message says why instead of inviting someone to build it.
+    if let Some(reason) = crate::loaders::known_unsupported(want) {
+        warn!(
+            "this title's preset asks for the loader at 0x{want:08x}, which is not \
+             supported: {reason}. Staying at 0x{running:08x}; the title may still run."
+        );
+        return running;
+    }
+    if !loaders.has(want) {
+        let available: Vec<String> = loaders
+            .available()
+            .iter()
+            .map(|b| format!("0x{b:08x}"))
+            .collect();
+        warn!(
+            "this title wants the loader at 0x{:08x} but {} has no dcload-0x{:08x}.elf \
+             (available: {}); staying at 0x{:08x}. Build the set with \
+             `make -C target-src/dcload loaders` and put it in a `loaders` \
+             directory at this project's root. Looked in: {}.",
+            want,
+            loaders.dir().display(),
+            want,
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            },
+            running,
+            loaders.searched()
+        );
+        return running;
+    }
+
+    let want_image = match crate::loaders::image_extent(&loaders.path_for(want)) {
+        Ok(extent) => extent,
+        Err(e) => {
+            warn!("cannot read the loader for 0x{want:08x}: {e}; staying at 0x{running:08x}");
+            return running;
+        }
+    };
+    let scratch_image =
+        crate::loaders::image_extent(&loaders.path_for(crate::loaders::SCRATCH_BASE))
+            .unwrap_or((u32::MAX, u32::MAX));
+
+    let hops = crate::loaders::plan(running, want, want_image, scratch_image);
+    if hops.is_empty() {
+        warn!(
+            "cannot move the loader from 0x{running:08x} to 0x{want:08x} without writing \
+             over the running image, and no clear intermediate base is available; \
+             staying at 0x{running:08x}"
+        );
+        return running;
+    }
+    if hops.len() > 1 {
+        debug!(
+            "0x{:08x} -> 0x{:08x} overlaps the running loader; going via 0x{:08x}",
+            running, want, hops[0]
+        );
+    }
+
+    let mut current = running;
+    for hop in hops {
+        if !loaders.has(hop) {
+            warn!(
+                "intermediate loader dcload-0x{hop:08x}.elf is missing; staying at 0x{current:08x}"
+            );
+            return current;
+        }
+        let path = loaders.path_for(hop).to_string_lossy().into_owned();
+        info!("chainloading dcload to 0x{:08x}", hop);
+        let entry = match upload(conn, path, hop, Some(current)) {
+            Ok((entry, _)) => entry,
+            Err(e) => {
+                warn!(
+                    "uploading the loader for 0x{hop:08x} failed: {e}; staying at 0x{current:08x}"
+                );
+                return current;
+            }
+        };
+        // No console and no CDFS redirection: what is being started is another
+        // loader, and it must come up in the same idle state the CD image
+        // leaves it in, not with a file server attached to a title that does
+        // not exist yet.
+        if let Err(e) = execute(conn, entry, false, false) {
+            warn!("EXEC of the loader at 0x{hop:08x} failed: {e}; staying at 0x{current:08x}");
+            return current;
+        }
+        if let Err(e) = wait_for_loader(conn, hop, Duration::from_secs(20)) {
+            warn!("{e}");
+            return current;
+        }
+        current = hop;
+    }
+    info!("loader is now at 0x{:08x}", current);
+    current
+}
+
+/// Copy the disc's IP.BIN header sector to 0x8c008000, the way isoldr does.
+///
+/// isoldr's `Load_IPBin()` reads exactly ONE sector in BOOT_MODE_DIRECT --
+/// `if (header_only) { cnt = 1; }` in loader/utils.c -- from the boot track to
+/// IP_BIN_ADDR, and direct boot is the only mode this host has. Nothing on our
+/// path has ever populated that region: the real bootstrap never runs, so a
+/// title that reads its own disc header back out of RAM gets whatever the
+/// previous session left there. On a console that is three chainloaded loaders'
+/// worth of debris; under an emulator it is zeroes, which is why this could
+/// only ever fail on hardware.
+///
+/// SKIPPED WHEN THE LOADER IS IN LOW RAM. At the stock base the loader's image
+/// starts at 0x8c004000 and runs straight through 0x8c008000, so there is
+/// nowhere to put this and writing it would shoot the loader serving the
+/// upload. That is one more reason DreamShell moves such titles to a high base
+/// (AGENTS.md 4.11), and the caller is told rather than left guessing.
+pub fn load_ip_bin(
+    conn: &mut impl ExternalDcIo,
+    disc_path: &str,
+    running_base: Option<u32>,
+    full: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    const IP_BIN_ADDR: u32 = 0x0c008000;
+
+    match running_base {
+        Some(base) if base < 0x8c010000 => {
+            warn!(
+                "loader at 0x{base:08x} occupies the IP.BIN region; \
+                 not loading IP.BIN for this title"
+            );
+            return Ok(false);
+        }
+        None => {
+            warn!("the loader does not report where it is; not loading IP.BIN");
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    let disc = open_disc(disc_path).map_err(std::io::Error::other)?;
+
+    if !full {
+        let sector = crate::disc_formats::types::find_ip_bin(disc.as_ref()).ok_or_else(|| {
+            std::io::Error::other(format!("{disc_path}: no IP.BIN header to load"))
+        })?;
+
+        info!(
+            "IP.BIN header -> 0x{IP_BIN_ADDR:08x} ({} bytes), as isoldr does on a direct boot",
+            sector.len()
+        );
+        send_data(conn, &sector, IP_BIN_ADDR, None)?;
+        return Ok(true);
+    }
+
+    // The full sixteen sectors, contiguous from the start of the boot track.
+    // find_ip_bin()'s fallback (IP.BIN as an ISO9660 FILE) is deliberately NOT
+    // used here: it can hand back a header that is nowhere near the bootstrap
+    // code, and the whole point of this mode is to run that code in place.
+    let base = disc.boot_sector();
+    let mut image = disc.read_sector(base, IP_BIN_SECTORS)?;
+    if !image.starts_with(b"SEGA SEGAKATANA") {
+        return Err(std::io::Error::other(format!(
+            "{disc_path}: sector {base} is not a Dreamcast boot sector, so there \
+             is no IP.BIN bootstrap to enter; use the header-only mode"
+        ))
+        .into());
+    }
+    let want = IP_BIN_SECTORS as usize * 2048;
+    if image.len() < want {
+        return Err(std::io::Error::other(format!(
+            "{disc_path}: only {} of {want} IP.BIN bytes readable",
+            image.len()
+        ))
+        .into());
+    }
+    image.truncate(want);
+
+    // PROVE THIS IS THE BOOTSTRAP, because the wrong track looks right.
+    //
+    // Both data tracks of a GDI open with the same valid `SEGA SEGAKATANA`
+    // header for the same title; only the high-density one carries code.
+    // Measured on Sonic Adventure, Sonic Adventure 2 and Crazy Taxi, all PAL:
+    // the low-density copy has 0/256 non-zero bytes at bootstrap 1 (+0x300)
+    // against 207/256 for the high-density one -- and 32768 bytes of it are
+    // ZEROES where the code should be. Entering 0x8c00e000 after loading that
+    // one jumps into nothing, with no error reported at either end.
+    //
+    // The check is the patch site itself. Sega's bootstrap is stock across
+    // retail discs, so +0x0cb0 reads 0x40006303 on every high-density area
+    // measured and 0x00000000 on every low-density one. Verifying the word we
+    // are about to overwrite proves BOTH that we picked the right track and
+    // that the layout isoldr's offsets assume is the layout in front of us --
+    // one test, and it fails loudly instead of silently writing into padding.
+    const PATCH_SITE: usize = 0x0cb0;
+    const PATCH_SITE_STOCK: u32 = 0x4000_6303;
+    let found = u32::from_le_bytes(image[PATCH_SITE..PATCH_SITE + 4].try_into()?);
+    if found != PATCH_SITE_STOCK {
+        return Err(std::io::Error::other(format!(
+            "{disc_path}: the IP.BIN at sector {base} does not look like a stock \
+             Sega bootstrap (+0x{PATCH_SITE:04x} reads 0x{found:08x}, expected \
+             0x{PATCH_SITE_STOCK:08x}) -- refusing to patch and enter it"
+        ))
+        .into());
+    }
+
+    // isoldr's four patches, Load_IPBin() in loader/utils.c, transcribed with
+    // its pointer arithmetic worked out. They are applied HERE, in the buffer,
+    // rather than poked afterwards: a poke is a four-byte write that fits
+    // inside one cache line and is exactly the case `apply_patches` had to grow
+    // a read-back check for. Bytes that travel with the upload cannot go
+    // missing that way.
+    //
+    //   +0x0cb0  (uint32*)ip + 0x032c = 0x8c00e000  -- bootstrap 1 jumps to 2
+    //   +0x21b0  (uint16*)ip + 0x10d8 = 0x5113
+    //   +0x2814  (uint16*)ip + 0x140a = 0x000b      -- rts
+    //   +0x2818  (uint16*)ip + 0x140c = 0x0009      -- nop
+    //
+    // The last pair neuters a routine outright; that is what lets the bootstrap
+    // run without a drive under it. What isoldr also does at this point and we
+    // do NOT is setup_region(), which needs the console's own flashrom region
+    // byte -- we are on the wrong side of the wire to read it.
+    image[0x0cb0..0x0cb4].copy_from_slice(&IP_BIN_BOOTSTRAP_2.to_le_bytes());
+    image[0x21b0..0x21b2].copy_from_slice(&0x5113u16.to_le_bytes());
+    image[0x2814..0x2816].copy_from_slice(&0x000bu16.to_le_bytes());
+    image[0x2818..0x281a].copy_from_slice(&0x0009u16.to_le_bytes());
+
+    // DO NOT WRITE OVER THE GUEST VBR. IP.BIN's 32 KB run from 0x8c008000 to
+    // 0x8c010000, and 0x8c00f400 -- DCLOAD_GUEST_VBR -- is inside that. The
+    // loader ELF carries exception.bin as a `.guestvbr` section and the
+    // chainload has just placed it there; sending the whole image afterwards
+    // replaces the title's vector table with what IP.BIN holds at +0x7400.
+    //
+    // Which is 3072 bytes of ZEROES, measured on both the Sonic Adventure and
+    // the Sonic Adventure 2 PAL dumps. So nothing is lost by stopping short --
+    // and what was lost by not stopping short is the exception dump, i.e. the
+    // one report a crashed title could still have made. Measured 2026-08-19:
+    // a --boot-ipbin run was therefore testing two changes at once.
+    //
+    // The tail is checked rather than assumed. A disc that does put something
+    // there is a disc this rule is wrong for, and it should say so.
+    const VBR_OFF: usize = 0x8c00_f400usize - 0x8c00_8000usize;
+    let tail_live = image[VBR_OFF..].iter().filter(|b| **b != 0).count();
+    if tail_live != 0 {
+        warn!(
+            "IP.BIN carries {tail_live} non-zero bytes at +0x{VBR_OFF:04x}, where the \
+             guest vector table lives; they are NOT being sent. If this title needs \
+             them, the loader's .guestvbr section is what stands in their way."
+        );
+    }
+    image.truncate(VBR_OFF);
+
+    info!(
+        "IP.BIN -> 0x{IP_BIN_ADDR:08x} ({} sectors, {} bytes -- stopping at the guest \
+         VBR); entry will be the bootstrap at 0x{IP_BIN_BOOTSTRAP_2:08x}, isoldr's 4 \
+         patches applied",
+        IP_BIN_SECTORS,
+        image.len()
+    );
+    send_data(conn, &image, IP_BIN_ADDR, None)?;
+    Ok(true)
+}
+
+/// Sectors isoldr reads for a full IP.BIN load (`cnt = 16`, `Load_IPBin()`).
+pub const IP_BIN_SECTORS: u32 = 16;
+
+/// isoldr's `IP_BIN_BOOTSTRAP_2_ADDR`, the entry point for a non-direct boot.
+/// Cached window, because that is the literal the bootstrap patch stores and
+/// the one the code there expects to see.
+pub const IP_BIN_BOOTSTRAP_2: u32 = 0x8c00e000;
+
+/// The same address in the window `EXEC` wants: dcload ORs 0xa0000000 onto
+/// whatever it is handed (`go(ntohl(command->address) | 0xa0000000)`), so the
+/// host sends the physical form exactly as it does for a title at 0x0c010000.
+pub const IP_BIN_BOOTSTRAP_2_EXEC: u32 = 0x0c00e000;
+
+/// Prove -- or disprove -- that reading memory back off the console works,
+/// before any conclusion is drawn from a read-back.
+///
+/// WHY THIS EXISTS. Two probe runs on 2026-08-19/20 reported "read-back
+/// MISMATCH". In the first the probe then executed and reported normally, so
+/// the check was wrong. In the second the bytes that came back were the TAIL OF
+/// dcload's OWN VERSION STRING starting at its 8th character -- i.e. the reply
+/// carried 8 bytes of real data and then whatever the previous VERS reply had
+/// left in `pkt_buf`. That is a defect in the read path itself, and until its
+/// shape is known every read-back is worthless and every probe result is
+/// ambiguous: "the probe never ran" and "the probe could not be verified" look
+/// identical.
+///
+/// So this writes known patterns into free RAM and reads them straight back,
+/// across the sizes and misalignments the probe path actually uses. It needs no
+/// title, no disc and no chainload -- just a loader answering. What it reports
+/// is which combinations are trustworthy.
+///
+/// 0x0c200000 is chosen because a 1.5 MB title at 0x0c010000 ends well below
+/// it and every loader base is far above it, so nothing here can shoot either.
+pub fn selftest_readback(conn: &mut impl ExternalDcIo) -> Result<bool, Box<dyn std::error::Error>> {
+    const SCRATCH: u32 = 0x0c20_0000;
+
+    // THE WINDOW IS A VARIABLE, and it is the one thing the probe path does
+    // that nothing else does: apply_probes() normalises to P2 (0xa0000000)
+    // while every other transfer here uses the physical 0x0c window. dcload
+    // reads a SendBinQ with SH4_aligned_memcpy(to_p1(response->data), cmd_addr,
+    // n) -- so a P2 source is mixed with a P1 destination inside hand-written
+    // fast paths that switch strategy on the low bits of `src | dest`. That is
+    // exactly the kind of thing that works for a 1440-byte aligned read and not
+    // for a 30-byte one, which is the pattern the two probe runs showed.
+    let windows: [(&str, u32); 2] = [("phys 0x0c", SCRATCH), ("P2   0xac", SCRATCH | 0xa000_0000)];
+    let (mut phys_ok, mut p2_ok, mut phys_cases) = (true, true, 0usize);
+
+    info!("read-back self-test at 0x{SCRATCH:08x} -- no title is uploaded by this");
+    for (wname, wbase) in windows {
+        for &len in &[4usize, 28, 30, 64, 1439, 1440, 1441, 3000] {
+            for &skew in &[0u32, 1, 2, 3] {
+                let addr = wbase + skew;
+                // A pattern where every byte says where it belongs, so a shifted or
+                // truncated reply is readable at a glance instead of just "differs".
+                let want: Vec<u8> = (0..len)
+                    .map(|i| (i as u32).wrapping_mul(31).wrapping_add(skew) as u8)
+                    .collect();
+
+                let is_phys = wbase == SCRATCH;
+                if is_phys {
+                    phys_cases += 1;
+                }
+                if let Err(e) = send_data(conn, &want, addr, None) {
+                    error!("  {wname} len {len:5} skew {skew}: WRITE failed: {e}");
+                    if is_phys { phys_ok = false } else { p2_ok = false }
+                    continue;
+                }
+                match receive_data(conn, Some(Duration::from_millis(1500)), addr, len, true) {
+                    Err(e) => {
+                        error!("  {wname} len {len:5} skew {skew}: READ failed: {e}");
+                        if is_phys { phys_ok = false } else { p2_ok = false }
+                    }
+                    Ok(got) if got == want => info!("  {wname} len {len:5} skew {skew}: ok"),
+                    Ok(got) => {
+                        if is_phys { phys_ok = false } else { p2_ok = false }
+                        let first = got
+                            .iter()
+                            .zip(&want)
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(want.len().min(got.len()));
+                        let hex = |v: &[u8], from: usize| {
+                            v.iter()
+                                .skip(from)
+                                .take(12)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
+                        error!(
+                            "  {wname} len {len:5} skew {skew}: MISMATCH, {} bytes back, \
+                         first bad byte at {first}",
+                            got.len()
+                        );
+                        error!("      want[{first}..]: {}", hex(&want, first));
+                        error!("      got [{first}..]: {}", hex(&got, first));
+                    }
+                }
+            }
+        }
+    }
+    // WHICH SIDE DROPS THE BYTES. Everything above writes and reads through the
+    // SAME window, so "the write only placed 8 bytes" and "the read returned a
+    // stale buffer" give an identical symptom: the previous test's pattern from
+    // byte 8 on (verified -- len 28 skew 1 came back as the skew 0 pattern, len
+    // 30 skew 0 as the skew 3 one). Crossing the windows separates them, now
+    // that the physical window is known good in all 32 cases.
+    //
+    //   write P2,   read phys -> a mismatch means the WRITE dropped them
+    //   write phys, read P2   -> a mismatch means the READ dropped them
+    //
+    // Both misaligned and 64 bytes long, i.e. squarely inside the broken range.
+    let phys = SCRATCH + 0x1000;
+    let p2 = phys | 0xa000_0000;
+    for (label, waddr, raddr) in [
+        ("write P2   / read phys", p2, phys),
+        ("write phys / read P2  ", phys, p2),
+    ] {
+        // Filler first, through the window each case trusts, so a byte that was
+        // never written is recognisable instead of being mistaken for the
+        // previous pattern.
+        let filler = vec![0x55u8; 96];
+        if let Err(e) = send_data(conn, &filler, phys, None) {
+            error!("  {label}: could not lay down filler: {e}");
+            phys_ok = false;
+            continue;
+        }
+        let want: Vec<u8> = (0..64u32)
+            .map(|i| i.wrapping_mul(31).wrapping_add(7) as u8)
+            .collect();
+        if let Err(e) = send_data(conn, &want, waddr + 1, None) {
+            error!("  {label}: WRITE failed: {e}");
+            phys_ok = false;
+            continue;
+        }
+        match receive_data(conn, Some(Duration::from_millis(1500)), raddr + 1, 64, true) {
+            Ok(got) if got == want => info!("  {label}: ok (64 bytes, misaligned)"),
+            Ok(got) => {
+                phys_ok = false;
+                let n = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(64);
+                let filler_here = got.get(n).copied() == Some(0x55);
+                error!(
+                    "  {label}: MISMATCH at byte {n}{}",
+                    if filler_here {
+                        " -- and it is the 0x55 filler, so those bytes were NEVER WRITTEN"
+                    } else {
+                        " -- and it is not the filler, so the bytes were written and misread"
+                    }
+                );
+            }
+            Err(e) => {
+                phys_ok = false;
+                error!("  {label}: READ failed: {e}");
+            }
+        }
+    }
+
+    // A GLOBAL "FAILED" WOULD OVERSTATE IT. Measured 2026-08-20: the physical
+    // window passes all 32 cases while P2 fails most of them, and everything
+    // this host does now goes through the physical window. Saying only "FAILED"
+    // would read as "no read-back can be trusted", which is the opposite of
+    // what was measured and would throw away good runs -- the exact mistake
+    // the bare "DID NOT LAND" caused a day earlier. So report per window.
+    if phys_ok {
+        info!(
+            "read-back through the PHYSICAL window (0x0c...) is sound: {} cases, \
+             no mismatch. Probe verification can be believed.",
+            phys_cases
+        );
+    } else {
+        error!(
+            "read-back through the PHYSICAL window FAILED -- this is the window \
+             probes, patches and uploads all use. Believe nothing until it is fixed."
+        );
+    }
+    if !p2_ok {
+        warn!(
+            "read-back through P2 (0xac...) is NOT sound. It is not used by this \
+             host any more; the defect is in dcload's cmd_partbin/cmd_sendbinq \
+             path and is still there. Do not aim anything at 0xac... by hand."
+        );
+    }
+    Ok(phys_ok)
+}
+
+/// Poke 32-bit words into the title's image after it is uploaded and before it
+/// runs -- DreamShell's `pa1`/`pv1` mechanism, driven from the command line.
+///
+/// WHY THIS EXISTS, because it is a loaded gun otherwise. A title that hangs
+/// before its first disc read leaves nothing to measure: dcload only executes
+/// from a GD syscall, so no counter can be read back, no packet is sent, and
+/// the screen belongs to the title. The only instrument left is to change the
+/// title and see what changes -- neutralise a routine, cut out a give-up path,
+/// redirect a call. That is exactly what DreamShell's per-game patch fields
+/// are for, and the preset table already carries them (`presets.rs`).
+///
+/// The word is written little-endian, so a pair of SH4 instructions reads in
+/// the order it executes: `rts; nop` is 0x0009000b.
+///
+/// The address may be given in any window (0x8c…, 0x0c…, 0xac…); it is
+/// normalised to **P2, the uncached window**, for both the write and the check.
+/// That is not cosmetic. dcload writes an upload with CPU stores, and `go()`
+/// leaves with `CCR = 0x0808` -- an *invalidate*, not a purge, so any line
+/// still dirty at that moment is DISCARDED. A multi-megabyte title evicts
+/// itself long before then and never notices; a single four-byte poke fits
+/// entirely inside one line and is exactly the case that would vanish, with
+/// the transfer reporting success at both ends.
+///
+/// EVERY PATCH IS READ BACK AND COMPARED, and the word that was there before
+/// is printed. An instrument that cannot prove it landed reports fiction with
+/// full confidence (AGENTS.md 11, 14.19), and here that fiction would be
+/// "changing the title changed nothing" -- the single most misleading result
+/// this mechanism can produce.
+/// The four G2 slot windows a Katana title probes for an expansion device.
+const GAPS_SLOT_WINDOWS: [u32; 4] = [0xa100_0400, 0xa100_0800, 0xa100_1400, 0xa100_1800];
+/// `"GAPS"` read back as a little-endian word -- the signature the probe compares against.
+const GAPS_SIGNATURE: u32 = 0x5350_4147;
+/// How far from the signature a slot-window literal may sit and still count as
+/// corroboration. In Sonic Adventure 2 the two pools are 0x248 apart.
+const GAPS_CORROBORATION_SPAN: usize = 4096;
+
+/// Stop a title from switching the Broadband Adapter off, rather than
+/// recovering afterwards.
+///
+/// Sonic Adventure 2 probes all four G2 slot windows during `main`, and parks
+/// every expansion device it finds by writing the two words dcload itself uses
+/// to power the GAPS bridge down. The loader then goes deaf with nothing logged
+/// at either end -- see AGENTS.md 4.12. dcload can recover, but recovery costs
+/// a full cold bring-up including auto-negotiation, seconds during which the
+/// title is blocked; not being switched off in the first place is strictly
+/// better.
+///
+/// The probe reads four bytes from a slot window and compares them against
+/// `"GAPS"`. That comparison constant is the single choke point for all four
+/// slots, so ONE word makes every probe fail and nothing gets parked -- and the
+/// path it takes then is the ordinary one for a console with an empty expansion
+/// port, which every such title must already support.
+///
+/// Found by content, so it needs no per-title knowledge and no disassembly. The
+/// bare four bytes are not enough on their own -- `"GAPS"` could be ASCII in
+/// data -- so a slot-window literal must corroborate it nearby. In Sonic
+/// Adventure's 6.7 MB there is neither; in Sonic Adventure 2's 1.5 MB there is
+/// exactly one of each.
+pub fn gaps_probe_patches(file: &str, address: u32) -> Vec<(u32, u32)> {
+    let Ok(buf) = std::fs::read(Path::new(file)) else {
+        return vec![];
+    };
+
+    // Raw binaries land whole at `address`; an ELF's sections land at their own.
+    let mut spans: Vec<(u32, &[u8])> = vec![];
+    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf.as_slice()) {
+        if let Some(headers) = elf.section_headers() {
+            for sh in headers.iter() {
+                if crate::loaders::is_uploadable(&sh)
+                    && let Ok((data, _)) = elf.section_data(&sh)
+                {
+                    spans.push((sh.sh_addr as u32, data));
+                }
+            }
+        }
+    } else {
+        spans.push((address, buf.as_slice()));
+    }
+
+    let mut out = vec![];
+    for (base, data) in spans {
+        let word = |i: usize| u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        let slots: Vec<usize> = (0..data.len().saturating_sub(3))
+            .step_by(4)
+            .filter(|&i| GAPS_SLOT_WINDOWS.contains(&word(i)))
+            .collect();
+        if slots.is_empty() {
+            continue;
+        }
+        for i in (0..data.len().saturating_sub(3)).step_by(4) {
+            if word(i) != GAPS_SIGNATURE {
+                continue;
+            }
+            if !slots
+                .iter()
+                .any(|&s| s.abs_diff(i) <= GAPS_CORROBORATION_SPAN)
+            {
+                continue;
+            }
+            let at = (base & 0x1fff_ffff) | 0x8c00_0000;
+            let at = at + i as u32;
+            info!(
+                "this title probes the expansion port for the GAPS bridge \
+                 (signature at 0x{at:08x}); neutralising it so it cannot switch \
+                 the adapter off -- AGENTS.md 4.12"
+            );
+            out.push((at, 0xffff_ffff));
+        }
+    }
+    out
+}
+
+pub fn apply_patches(
+    conn: &mut impl ExternalDcIo,
+    patches: &[(u32, u32)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for &(addr, value) in patches {
+        // Physical, never P2: the P2 window drops bytes past the 8th and hands
+        // back the previous transfer's, so both the write and its read-back
+        // would be suspect. See the read-back self-test.
+        let addr = (addr & 0x1fff_ffff) | 0x0c00_0000;
+        let before = read_word(conn, addr);
+        send_data(conn, &value.to_le_bytes(), addr, None)?;
+        let after = read_word(conn, addr);
+
+        match (before, after) {
+            (_, Some(got)) if got == value => info!(
+                "patch: 0x{addr:08x} = 0x{value:08x}, verified (was {})",
+                before.map_or("unreadable".to_string(), |b| format!("0x{b:08x}"))
+            ),
+            (_, Some(got)) => error!(
+                "PATCH DID NOT LAND: 0x{addr:08x} reads 0x{got:08x}, wanted 0x{value:08x}. \
+                 Anything you conclude from this run is about an unpatched title."
+            ),
+            (_, None) => error!(
+                "PATCH UNVERIFIABLE: 0x{addr:08x} could not be read back. \
+                 Do not conclude anything from this run."
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// One 32-bit word out of the console's memory, or `None` if it could not be
+/// read. Used only to check a patch, so a failure is reported by the caller
+/// rather than aborting the run.
+fn read_word(conn: &mut impl ExternalDcIo, addr: u32) -> Option<u32> {
+    match receive_data(conn, Some(Duration::from_millis(500)), addr, 4, true) {
+        Ok(b) if b.len() == 4 => Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        _ => None,
+    }
+}
+
+/// Read a disc image's boot sector and work out what game it is.
+///
+/// The sector is the first one of the boot data track, i.e. IP.BIN sector 0 --
+/// the same sector DreamShell hashes to name its presets.
+///
+/// Returns the reason on failure rather than a bare `None`. THAT MATTERS: the
+/// three ways this fails -- the path does not exist, the file is not a format
+/// we can read, and the file reads fine but holds no Dreamcast header -- call
+/// for completely different things from whoever is looking at the log, and
+/// reporting all three as "no readable IP.BIN in <path>" sent one debugging
+/// session after a disc reader when the file simply was not there.
+pub fn identify_disc(path: &str) -> Result<crate::presets::DiscIdentity, String> {
+    let disc = open_disc(path)?;
+    let sector = crate::disc_formats::types::find_ip_bin(disc.as_ref()).ok_or_else(|| {
+        format!(
+            "{path} opened, but neither its boot sector nor an IP.BIN file in its \
+             root directory carries a Dreamcast header"
+        )
+    })?;
+    crate::presets::DiscIdentity::from_boot_sector(&sector)
+        .ok_or_else(|| format!("{path}: IP.BIN found but could not be parsed"))
+}
+
+/// One place that turns a path into a reader, so the extension rules cannot
+/// drift between the identification pass and the syscall loop.
+///
+/// Every failure is returned, none is swallowed. The previous version fell
+/// through to `StubDisc` whenever a `.gdi` or `.cdi` failed to open and only
+/// warned on the `.iso` branch, so a typo in a path, or an image in a format
+/// the reader does not understand, produced a session with CDFS silently dead
+/// and nothing in the log to say so.
+fn open_disc(cd_path: &str) -> Result<Box<dyn crate::disc_formats::types::DiscFormat>, String> {
+    if !std::path::Path::new(cd_path).is_file() {
+        return Err(format!("no such disc image: {cd_path}"));
+    }
+    let lower = cd_path.to_ascii_lowercase();
+    if lower.ends_with(".gdi") {
+        Gdi::new(cd_path.to_string())
+            .map(get_disc_format)
+            .map_err(|e| format!("cannot read the GDI {cd_path}: {e}"))
+    } else if lower.ends_with(".cdi") {
+        Cdi::new(cd_path.to_string()).map(get_disc_format)
+    } else {
+        Iso::new(cd_path.to_string())
+            .map(get_disc_format)
+            .map_err(|e| format!("cannot read {cd_path} as a plain ISO: {e}"))
+    }
+}
+
 pub fn reboot(
     conn: &mut impl ExternalDcIo,
 ) -> std::result::Result<usize, std::boxed::Box<dyn std::error::Error>> {
@@ -188,23 +994,21 @@ pub fn receive_syscalls(
     cd_path: Option<String>,
     mount: Option<String>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
-    let mut disc = get_disc_format(StubDisc {});
-    if let Some(cd_path) = cd_path {
-        if cd_path.to_ascii_lowercase().ends_with(".gdi") {
-            if let Ok(gdi) = Gdi::new(cd_path) {
-                disc = get_disc_format(gdi);
+    // A disc that cannot be opened must not be a silent no-op here: the title
+    // is about to be started with CDFS redirection ON, so it will ask for
+    // sectors and get errors for the rest of the session. Say so once, loudly,
+    // with the reason.
+    let disc = match cd_path {
+        None => get_disc_format(StubDisc {}),
+        Some(path) => match open_disc(&path) {
+            Ok(disc) => disc,
+            Err(e) => {
+                error!("CDFS redirection DISABLED: {e}");
+                error!("the title will be started anyway, and every disc read it makes will fail");
+                get_disc_format(StubDisc {})
             }
-        } else if cd_path.to_ascii_lowercase().ends_with(".cdi") {
-            if let Ok(cdi) = Cdi::new(cd_path) {
-                disc = get_disc_format(cdi);
-            }
-        }
-         else if let Ok(iso) = Iso::new(cd_path) {
-            disc = get_disc_format(iso);
-        } else {
-            warn!("Could not parse disc image, CDFS redirection disabled");
-        }
-    }
+        },
+    };
     debug!(
         "CDFS source: start_sector={} num_sectors={}",
         disc.start_sector(),
@@ -257,7 +1061,10 @@ pub fn receive_syscalls(
                                 if size % 2048 != 0 {
                                     return Err(Box::new(Error::new(
                                         ErrorKind::InvalidData,
-                                        format!("ReadSector size is not a multiple of 2048: {}", size),
+                                        format!(
+                                            "ReadSector size is not a multiple of 2048: {}",
+                                            size
+                                        ),
                                     )));
                                 }
                                 let num_sectors = size / 2048;
@@ -272,9 +1079,10 @@ pub fn receive_syscalls(
                                 // exactly like this. If zeros get through, the
                                 // data is what breaks the transfer.
                                 //   DCLOAD_ZERO_LBA  hex LBA to blank
-                                if let Some(z) = std::env::var("DCLOAD_ZERO_LBA")
-                                    .ok()
-                                    .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                                if let Some(z) =
+                                    std::env::var("DCLOAD_ZERO_LBA").ok().and_then(|v| {
+                                        u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+                                    })
                                     && start == z
                                 {
                                     warn!("ZEROING (diagnostic): LBA 0x{start:08x}");
@@ -299,7 +1107,10 @@ pub fn receive_syscalls(
                                             u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()
                                         })
                                     };
-                                    match (parse("DCLOAD_REDIRECT_ABOVE"), parse("DCLOAD_REDIRECT_TO")) {
+                                    match (
+                                        parse("DCLOAD_REDIRECT_ABOVE"),
+                                        parse("DCLOAD_REDIRECT_TO"),
+                                    ) {
                                         (Some(above), Some(to)) if dc_address >= above => {
                                             warn!(
                                                 "REDIRECT (diagnostic): 0x{dc_address:08x} -> 0x{to:08x}"
@@ -312,7 +1123,14 @@ pub fn receive_syscalls(
                                 if logged_lbas.insert(start) && buf.len() >= 8 {
                                     debug!(
                                         "ReadSector LBA=0x{start:08x} first8={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                                        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
+                                        buf[0],
+                                        buf[1],
+                                        buf[2],
+                                        buf[3],
+                                        buf[4],
+                                        buf[5],
+                                        buf[6],
+                                        buf[7]
                                     );
                                 }
                                 if start == pvd_lba && buf.len() >= 6 {
@@ -440,11 +1258,14 @@ pub fn receive_syscalls(
                                     }
                                     Err(e) => {
                                         warn!("Failed to handle FS syscall: {}", e);
-                                        call_command(conn, DCLoadCmd {
-                                            cmd: DCLoadCmds::ReturnValue(),
-                                            address: u32::MAX,
-                                            size: u32::MAX,
-                                        })?;
+                                        call_command(
+                                            conn,
+                                            DCLoadCmd {
+                                                cmd: DCLoadCmds::ReturnValue(),
+                                                address: u32::MAX,
+                                                size: u32::MAX,
+                                            },
+                                        )?;
                                     }
                                 }
                             }
@@ -528,12 +1349,7 @@ pub fn send_data(
     if data.len() > MAX_XFER {
         let mut sent = 0usize;
         for (i, part) in data.chunks(MAX_XFER).enumerate() {
-            send_data_one(
-                conn,
-                part,
-                address + (i * MAX_XFER) as u32,
-                progress_bar,
-            )?;
+            send_data_one(conn, part, address + (i * MAX_XFER) as u32, progress_bar)?;
             sent += part.len();
         }
         return Ok(sent);
@@ -1025,10 +1841,10 @@ fn request_donebin(
         for _poll_try in 0..10 {
             match await_result(conn, Some(Duration::from_millis(200))) {
                 Ok(cmds) => {
-        if let Some(donebin) = extract_donebin(&cmds) {
-            return Ok(donebin);
-        }
-        debug!("Received non-DBIN packets while waiting for DoneBinary response");
+                    if let Some(donebin) = extract_donebin(&cmds) {
+                        return Ok(donebin);
+                    }
+                    debug!("Received non-DBIN packets while waiting for DoneBinary response");
                 }
                 Err(e) => {
                     if let Some(ioe) = e.downcast_ref::<std::io::Error>()
@@ -1233,4 +2049,302 @@ pub fn receive_data(
     drop(bar);
 
     Ok(data)
+}
+
+/// Assemble a 28-byte "phone home" probe and place it at `addr`.
+///
+/// WHY NOT `trapa`. A `trapa` probe reports through the exception vectors, and
+/// a title takes those over during its own start-up: from that moment "the
+/// probe fired" and "the probe was never reached" both look like a dead
+/// console, and the only difference is whatever the title's own handler
+/// happens to do. That ambiguity cost several console cycles on Sonic
+/// Adventure 2. This probe reports through dcload's syscall trampoline
+/// instead, which belongs to us, needs no vector table, and lands in the host
+/// log as a line nothing else produces.
+///
+/// The probe id travels in the **length** of the write, so one log line names
+/// which probe fired:
+///
+/// ```text
+/// Received FSCommand syscall: Write(1, 0x8c110c00, 37)   <- probe 37
+/// ```
+///
+/// The stub parks in a two-instruction loop afterwards, so the machine stops
+/// where it is instead of running on through the code the stub overwrote. It
+/// clobbers r0 and r4-r7 and never returns: a probe site is destroyed by
+/// definition, and the question it answers is only "is this reached".
+///
+///   mov.l @(4,PC),r0   ; r0 = &dcload syscall pointer  (loader base + 8)
+///   mov.l @r0,r0       ; r0 = dcload syscall entry
+///   mov   #1,r4        ; pcwritenr
+///   mov   #1,r5        ; fd = 1
+///   mov.l @(3,PC),r6   ; buf (points at the stub's own literal pool)
+///   mov   #id,r7       ; len = probe id
+///   jsr   @r0
+///   nop
+/// spin: bra spin
+///   nop
+///   .long loader_base + 8
+///   .long buf
+fn probe_stub(addr: u32, syscall_ptr: u32, id: u8, peek: Option<u32>) -> Vec<u8> {
+    // The two literals must be 4-aligned, the code need only be 2-aligned, and
+    // half the interesting probe sites in a real title are at 2 mod 4. So the
+    // pool goes at the first aligned slot past the code and the displacements
+    // are computed, not baked: a `mov.l @(disp,PC)` reads from
+    // (PC & ~3) + 4 + disp*4, and PC is the instruction's own address.
+    let pool = (addr + 0x14 + 3) & !3;
+    // Where the reported bytes come from: the stub's own pool by default (the
+    // report is then only "I got here"), or an address the caller named, which
+    // makes the same stub a one-shot memory read at a chosen instruction.
+    let buf = peek.unwrap_or(pool);
+    let disp0 = (pool - ((addr & !3) + 4)) / 4;
+    let disp1 = ((pool + 4) - (((addr + 8) & !3) + 4)) / 4;
+
+    let mut s = vec![0u8; (pool + 8 - addr) as usize];
+    {
+        let mut put = |off: u32, op: u16| {
+            let off = off as usize;
+            s[off] = op as u8;
+            s[off + 1] = (op >> 8) as u8;
+        };
+        put(0x00, 0xd000 | disp0 as u16); // mov.l @(disp0,PC),r0  -> &syscall ptr
+        put(0x02, 0x6002); //               mov.l @r0,r0          -> syscall entry
+        put(0x04, 0xe401); //               mov   #1,r4            pcwritenr
+        put(0x06, 0xe501); //               mov   #1,r5            fd = 1
+        put(0x08, 0xd600 | disp1 as u16); // mov.l @(disp1,PC),r6  -> buf
+        put(0x0a, 0xe700 | id as u16); //   mov   #id,r7           len = probe id
+        put(0x0c, 0x400b); //               jsr   @r0
+        put(0x0e, 0x0009); //               nop
+        put(0x10, 0xaffe); //             spin: bra spin
+        put(0x12, 0x0009); //               nop
+    }
+    let o = (pool - addr) as usize;
+    s[o..o + 4].copy_from_slice(&syscall_ptr.to_le_bytes());
+    s[o + 4..o + 8].copy_from_slice(&buf.to_le_bytes());
+    s
+}
+
+/// Place one or more probes (see [`probe_stub`]) and verify each landed.
+///
+/// The syscall pointer is `running_base + 8`, the fixed jump table dcload
+/// keeps at its own base (`dcload-crt0.s`) -- so this follows the loader
+/// wherever the per-game base put it, and refuses to guess when the loader
+/// does not say where it is.
+pub fn apply_probes(
+    conn: &mut impl ExternalDcIo,
+    probes: &[(u32, u8, Option<u32>)],
+    running_base: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(base) = running_base else {
+        error!("the loader does not report where it is; cannot place a probe");
+        return Ok(());
+    };
+    let syscall_ptr = (base & 0x1fff_ffff) | 0x8c00_0000;
+    let syscall_ptr = syscall_ptr + 8;
+
+    for &(addr, id, peek) in probes {
+        // THE PHYSICAL WINDOW, NOT P2. This used to normalise to 0xa0000000 as
+        // cache-coherency belt-and-braces. Measured 2026-08-20 with
+        // `selftest-readback` on the console: through 0x0c... all 32 size/skew
+        // combinations round-trip intact; through 0xac... anything longer than
+        // 8 bytes comes back carrying the PREVIOUS transfer's bytes from offset
+        // 8 on, except a few 32-byte-aligned cases. A probe stub is 28 or 30
+        // bytes, so every probe placed through P2 was suspect -- including the
+        // one that did report, which was therefore believed for the wrong
+        // reason.
+        //
+        // Nothing is given up: dcload has run with caches off since 1st_read,
+        // go() ends with a CCR write that invalidates, and the whole title is
+        // already uploaded through this same window.
+        let addr = (addr & 0x1fff_ffff) | 0x0c00_0000;
+        if addr % 2 != 0 {
+            error!("probe address 0x{addr:08x} is odd -- not an instruction; skipped");
+            continue;
+        }
+        // The peek address goes into the stub as the buffer the title hands to
+        // write(), and it is the HOST that then reads it back with SendBinQ --
+        // so it lands in the same window trap as the stub itself. Normalise it
+        // the same way. Harmless for the 4-byte reads this is normally used
+        // for (length 4 survived even P2), decisive for anything longer.
+        let peek = peek.map(|a| (a & 0x1fff_ffff) | 0x0c00_0000);
+        // What the report will actually name: the peek address when there is
+        // one, the stub's own pool otherwise. Printing the pool unconditionally
+        // made a working peek look like a failed one for a whole analysis pass.
+        let reported = peek.unwrap_or((addr + 0x14 + 3) & !3);
+        let stub = probe_stub(addr, syscall_ptr, id, peek);
+        send_data(conn, &stub, addr, None)?;
+        match receive_data(
+            conn,
+            Some(Duration::from_millis(500)),
+            addr,
+            stub.len(),
+            true,
+        ) {
+            Ok(got) if got == stub => info!(
+                "probe {id} at 0x{addr:08x}, verified -- it will report as \
+                 `Write(1, 0x{reported:08x}, {id})` if it is reached"
+            ),
+            // SAY WHAT DIFFERED. Measured 2026-08-19: this branch fired on a
+            // probe that then went on to execute and report normally, and the
+            // bare "DID NOT LAND" was very nearly taken at face value -- which
+            // would have thrown away the run that proved Sonic Adventure 2
+            // reaches its entry point at all. A mismatch is worth reporting,
+            // but only the bytes can say whether the write missed, the read
+            // came back from somewhere else, or the two simply disagree about
+            // the address window.
+            Ok(got) => {
+                let hex = |v: &[u8]| {
+                    v.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                error!(
+                    "PROBE {id} at 0x{addr:08x}: read-back MISMATCH ({} bytes back, \
+                     {} expected).",
+                    got.len(),
+                    stub.len()
+                );
+                error!("  wrote: {}", hex(&stub));
+                error!("  read : {}", hex(&got));
+                error!(
+                    "  Treat the run as suspect, but NOT as proof the probe is absent: \
+                     watch for `Write(1, 0x{reported:08x}, {id})` anyway -- if it arrives, the \
+                     probe landed and this check is what is wrong."
+                );
+            }
+            Err(e) => error!(
+                "PROBE {id} at 0x{addr:08x} could not be read back ({e}). \
+                 Watch for `Write(1, 0x{reported:08x}, {id})` regardless."
+            ),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probe_stub;
+
+    /// The two PC-relative displacements are computed, not baked, and half the
+    /// interesting probe sites are at 2 mod 4. A wrong displacement produces a
+    /// stub that assembles, lands, verifies -- and reports from the wrong
+    /// address. So check the literals land where the loads point.
+    fn pool_of(addr: u32) -> u32 {
+        (addr + 0x14 + 3) & !3
+    }
+
+    fn literals(addr: u32, s: &[u8]) -> (u32, u32) {
+        let o = (pool_of(addr) - addr) as usize;
+        (
+            u32::from_le_bytes(s[o..o + 4].try_into().unwrap()),
+            u32::from_le_bytes(s[o + 4..o + 8].try_into().unwrap()),
+        )
+    }
+
+    /// `mov.l @(disp,PC),Rn` reads from (PC & !3) + 4 + disp*4, PC being the
+    /// instruction's own address. Recompute that from the encoded opcode.
+    fn load_target(addr: u32, s: &[u8], off: u32) -> u32 {
+        let op = u16::from_le_bytes([s[off as usize], s[off as usize + 1]]);
+        let disp = (op & 0xff) as u32;
+        (((addr + off) & !3) + 4) + disp * 4
+    }
+
+    #[test]
+    fn without_peek_the_buffer_is_the_stubs_own_pool() {
+        for addr in [0xac01_0000u32, 0xac01_0002] {
+            let s = probe_stub(addr, 0x8cfe_8008, 7, None);
+            let (sysc, buf) = literals(addr, &s);
+            assert_eq!(sysc, 0x8cfe_8008);
+            assert_eq!(buf, pool_of(addr), "addr 0x{addr:08x}");
+            assert_eq!(load_target(addr, &s, 0x00), pool_of(addr));
+            assert_eq!(load_target(addr, &s, 0x08), pool_of(addr) + 4);
+        }
+    }
+
+    #[test]
+    fn with_peek_the_buffer_is_the_named_address() {
+        for addr in [0xac01_0000u32, 0xac01_0002] {
+            let s = probe_stub(addr, 0x8cfe_8008, 4, Some(0x8c00_00bc));
+            let (_, buf) = literals(addr, &s);
+            assert_eq!(buf, 0x8c00_00bc, "addr 0x{addr:08x}");
+            // r7 = the length, i.e. how many bytes come back.
+            assert_eq!(u16::from_le_bytes([s[0x0a], s[0x0b]]), 0xe704);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A raw image with `image[at..at+4]` set to `word`, zero elsewhere.
+    fn raw(len: usize, words: &[(usize, u32)]) -> std::path::PathBuf {
+        let mut b = vec![0u8; len];
+        for &(at, w) in words {
+            b[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "gaps-probe-{}-{}.bin",
+            std::process::id(),
+            words.len() * 1000 + len
+        ));
+        std::fs::File::create(&p).unwrap().write_all(&b).unwrap();
+        p
+    }
+
+    #[test]
+    fn signature_with_a_nearby_slot_window_is_neutralised() {
+        // The shape Sonic Adventure 2 has: one "GAPS" comparison constant and
+        // the slot literals in a pool a few hundred bytes away.
+        let p = raw(0x1000, &[(0x100, 0xa100_1400), (0x348, GAPS_SIGNATURE)]);
+        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
+        std::fs::remove_file(&p).ok();
+        assert_eq!(got, vec![(0x8c01_0000 + 0x348, 0xffff_ffff)]);
+    }
+
+    #[test]
+    fn the_four_bytes_alone_are_not_enough() {
+        // "GAPS" as ASCII in data, with no slot window anywhere: a title that
+        // never touches the expansion port must come back untouched.
+        let p = raw(0x1000, &[(0x348, GAPS_SIGNATURE)]);
+        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
+        std::fs::remove_file(&p).ok();
+        assert!(got.is_empty(), "patched on the signature alone: {got:?}");
+    }
+
+    #[test]
+    fn corroboration_must_be_near() {
+        // Same two constants, but far enough apart that they cannot be one
+        // routine's literal pools.
+        let p = raw(
+            0x8000,
+            &[(0x100, 0xa100_1400), (0x100 + GAPS_CORROBORATION_SPAN + 4, GAPS_SIGNATURE)],
+        );
+        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
+        std::fs::remove_file(&p).ok();
+        assert!(got.is_empty(), "corroborated across {GAPS_CORROBORATION_SPAN}+ bytes: {got:?}");
+    }
+
+    #[test]
+    fn a_slot_window_without_the_signature_is_left_alone() {
+        // Sonic Adventure's shape: nothing to neutralise, and nothing to warn
+        // about either.
+        let p = raw(0x1000, &[(0x100, 0xa100_1400)]);
+        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
+        std::fs::remove_file(&p).ok();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn the_signature_must_be_aligned() {
+        // A literal pool entry is always 4-aligned; ASCII in the middle of a
+        // string is not, and is the likeliest false positive.
+        let p = raw(0x1000, &[(0x100, 0xa100_1400), (0x34a, GAPS_SIGNATURE)]);
+        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
+        std::fs::remove_file(&p).ok();
+        assert!(got.is_empty(), "matched an unaligned occurrence: {got:?}");
+    }
 }

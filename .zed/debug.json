@@ -10,7 +10,11 @@
     },
     "args": [
       "--host",
-      "192.168.1.130",
+      "192.168.1.64",
+      // "--loader-dir",
+      // "$ZED_WORKTREE_ROOT/loaders-noregs",
+      "--loader-base",
+      "0x8cfe8000",
       "u-exec",
       "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
       "-d",
@@ -25,7 +29,7 @@
     "sourceLanguages": ["rust"],
   },
   {
-    "label": "Launch Sonic Adventure International",
+    "label": "Selftest",
     "adapter": "CodeLLDB",
     "request": "launch",
     "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
@@ -36,10 +40,94 @@
     "args": [
       "--host",
       "192.168.1.64",
+      "selftest-readback",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Test GAPS",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "--loader-base",
+      "0x8c004000",
+      "--loader-dir",
+      "loaders-gapstrace",
       "u-exec",
-      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\USA\\1ST_READ.BIN",
+      "$ZED_WORKTREE_ROOT\\gaps-kill.bin",
+      "-c"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Sonic Adventure 2",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      // "--patch",
+      // "0x8c138388=0xe000000b",
+      // "--boot-ipbin",c
+      // "--loader-dir",
+      // "$ZED_WORKTREE_ROOT/loaders-noheap",
+      // "--loader-base",
+      // "0x8c004000",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
       "-d",
-      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\USA\\Sonic Adventure International v1.003 (1999)(Sega)(NTSC)(JP)(M5)[!].gdi",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].gdi",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Sonic Adventure (Flycast)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "--loader-dir",
+      "$ZED_WORKTREE_ROOT/loaders-static",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
+      "-d",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -75,6 +163,33 @@
     "sourceLanguages": ["rust"],
   },
   {
+    "label": "Launch Sonic Adventure 2 (Flycast)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "--loader-dir",
+      "$ZED_WORKTREE_ROOT/loaders-static",
+      "u-exec",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
+      "-d",
+      "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].gdi",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      "DCLOAD_IP_RS_TRACE_STALL": "1",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
     "label": "Launch Crazy Taxi",
     "adapter": "CodeLLDB",
     "request": "launch",
@@ -85,7 +200,7 @@
     },
     "args": [
       "--host",
-      "192.168.1.64",
+      "192.168.1.130",
       "u-exec",
       "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\1ST_READ.BIN",
       "-d",
@@ -111,7 +226,31 @@
       "--host",
       "192.168.1.64",
       "u-exec",
-      "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
+      "$ZED_WORKTREE_ROOT/loaders/dcload-0x8ce00000.elf"
+      // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Run updated dc-load-ip (flycast)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "u-exec",
+      "$ZED_WORKTREE_ROOT/loaders-static/dcload-0x8ce00000.elf"
+      // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {

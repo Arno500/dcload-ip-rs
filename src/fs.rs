@@ -144,9 +144,17 @@ fn write(
     if fd < FILE_OFFSET {
         let data = download_data(conn, address, size)?;
 
+        // RENDER BYTES THAT ARE NOT TEXT AS HEX, and never fail on them.
+        // This used to be String::from_utf8(..)?, so a title (or a probe)
+        // writing binary either logged an empty line or aborted the handler.
+        // Measured 2026-08-19: a probe reporting a single non-printable byte
+        // printed nothing at all, which is indistinguishable from not having
+        // reported. `--probe ADDR=N:PEEK` sends raw memory through here on
+        // purpose, so this path has to be readable.
+        let rendered = render_console_bytes(&data);
         match fd {
-            1 => info!("{}", String::from_utf8(data)?.trim_end_matches("\n")),
-            2 => error!("{}", String::from_utf8(data)?.trim_end_matches("\n")),
+            1 => info!("{}", rendered),
+            2 => error!("{}", rendered),
             _ => return Err("Invalid FD".into()),
         }
 
@@ -755,4 +763,29 @@ fn exception_code_to_string(code: u32) -> &'static str {
         0x160 => "Unconditional trap (TRAPA)",
         _ => "Unknown exception",
     }
+}
+
+
+/// Console output as text when it is text, as hex when it is not.
+///
+/// The test is "printable ASCII plus the usual whitespace"; anything else
+/// switches the whole buffer to hex, rather than mixing the two, so a
+/// four-byte pointer reads as a four-byte pointer instead of three dots and a
+/// letter. Both forms are shown when the bytes could be either.
+fn render_console_bytes(data: &[u8]) -> String {
+    let is_text = !data.is_empty()
+        && data
+            .iter()
+            .all(|b| matches!(b, 0x20..=0x7e | b'\n' | b'\r' | b'\t'));
+    if is_text {
+        return String::from_utf8_lossy(data).trim_end_matches('\n').to_string();
+    }
+    let hex: Vec<String> = data.iter().map(|b| format!("{b:02x}")).collect();
+    // A 4-byte buffer is almost always a little-endian word here (a syscall
+    // vector, a pointer, an opcode pair), so spell that out too.
+    if data.len() == 4 {
+        let w = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        return format!("{} (le32 0x{w:08x})", hex.join(" "));
+    }
+    hex.join(" ")
 }

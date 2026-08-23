@@ -30,11 +30,62 @@ A typical `u-exec` session, end-to-end, is roughly:
 2. Send a `Version` (`VERS`) command. The DC replies with its protocol
    version and (optionally) a build identifier string. We refuse to
    continue if the DC doesn't answer.
-3. **Upload phase** (`src/dispatch.rs::upload`):
-   - If the input is an ELF, parse it with the `elf` crate, walk
-     `SHT_PROGBITS` sections, and upload each section to the address
-     recorded in its section header. The CLI `--address` value is used
-     only as a fallback entry point for non-ELF blobs.
+3. **Loader placement** (`src/presets.rs`, `src/loaders.rs`, driven from
+   `main.rs::wanted_loader_base`). Only on `u-exec` with a disc image, and only
+   before anything else is uploaded.
+
+   The Dreamcast side is not a debugger attached to a title, it is a program
+   that stays resident in RAM while the title runs and answers its GD-ROM
+   syscalls. Retail titles decide for themselves which RAM is free, and several
+   of them treat the hole the loader sits in as exactly that. DreamShell's
+   isoldr answers this per title, in the `memory` field of its presets, and this
+   is the same answer applied the same way: read the disc's boot sector,
+   identify the game, look up the address, and chainload a dcload relinked for
+   it. Details are in the module docs; the four facts a reader needs:
+
+   - The Dreamcast tree builds one ELF per base (`make loaders` in
+     `target-src/dcload`), each self-contained — the guest vector table travels
+     with it as a `.guestvbr` section. They live in **`loaders/` at this
+     project's root**, with `game-presets.tsv` next to it — deliberately
+     outside `target/`, so `cargo clean` cannot take them and a debug build and
+     a release build read the same set. Override with `--loader-dir` /
+     `DCLOAD_LOADER_DIR` (and `--game-db` / `DCLOAD_GAME_DB`); a directory
+     beside the executable is still honoured, last, for a distributed copy.
+     **Never keep a second set under `target/`.** A stale one chainloads an old
+     loader that answers, runs, and reports its counters at addresses that have
+     since moved, so every value read back is believable and wrong — that cost
+     a full session on 2026-08-16. `LoaderSet::searched()` names every
+     directory considered whenever something is missing.
+   - Identification is exact (MD5 of IP.BIN sector 0, DreamShell's own key) with
+     a title fallback, because that MD5 identifies a *dump* and coverage is
+     partial — neither Sonic Adventure dump used in development is in the 1026
+     rows. A title match is reported as approximate, and a tie between addresses
+     breaks towards not moving.
+   - **Going from a low base to 0x8cfe8000 must not be done directly.** A low
+     loader keeps its packet buffers at 0x8cfe8000/0x8cfe9000, outside its
+     image, so the new loader would be written through the buffers the upload
+     is arriving in. It fails silently — success reported, new loader running
+     and deaf. The plan hops via 0x8ce00000.
+   - **Nor can a loader be uploaded over the address it is already running
+     from**, which is what "refresh the loader in place" means and what a user
+     naturally tries against an old CD build. It overwrites its own
+     `cmd_partbin` mid-transfer: the console drops to the BIOS and the host
+     sees only a DoneBinary that never arrives. `refuse_self_overwrite` in
+     dispatch.rs blocks it before a single part goes out, on every path
+     (`upload`, `uexec`, chainload), and names the remedy — hop to 0x8ce00000
+     first. It compares PHYSICAL addresses, because a title goes to
+     0x0c010000 while the loader sits at 0x8c004000 and those are the same RAM;
+     the alias is the whole reason the check is not a two-line one.
+   - `--no-relocate` runs whatever is on the console; `--loader-base 0x…` pins
+     one. Both exist so a relocation can be ruled in or out as the cause of a
+     title's behaviour in one run.
+
+4. **Upload phase** (`src/dispatch.rs::upload`):
+   - If the input is an ELF, parse it with the `elf` crate, walk the
+     sections that occupy memory at run time (`loaders::is_uploadable`:
+     `SHT_PROGBITS` **and** `SHF_ALLOC` **and** a non-zero address), and upload
+     each to the address in its section header. The CLI `--address` value is
+     used only as a fallback entry point for non-ELF blobs.
    - For every chunk, we send `LoadBinary` (`LBIN`) once, then a stream of
      `PartBinary` (`PBIN`) packets — each one a fixed-size, zero-padded
      slice — paced with a small sleep and a longer sleep every
@@ -44,12 +95,12 @@ A typical `u-exec` session, end-to-end, is roughly:
    - After `DoneBinary` (`DBIN`), the DC tells us about any missing
      bytes; we re-send those chunks and repeat `DBIN` until the DC is
      satisfied.
-4. **Execute phase** (`dispatch::execute`): send `Execute` (`EXEC`) with
+5. **Execute phase** (`dispatch::execute`): send `Execute` (`EXEC`) with
    the entry point and a flag byte. `cdfs_redirect` is bit 1, `console`
    is bit 0. Any of `-d` / `-m` / `-c` forces `console` to true; the
    code does not let the user run with CDFS or host-FS redirection but
    no console mirror.
-5. **Syscall phase** (`dispatch::receive_syscalls`): an infinite loop
+6. **Syscall phase** (`dispatch::receive_syscalls`): an infinite loop
    that answers `ReadSector` (sector data from a `.iso` / `.gdi` /
    `.cdi` image), `ReadToc` (the synthesized DC TOC, see `src/cd.rs`),
    and `FSCommand` (host file/dir syscalls routed through `src/fs.rs`).
@@ -57,7 +108,8 @@ A typical `u-exec` session, end-to-end, is roughly:
    goes silent it will spin in `await_result` until the next packet
    arrives.
 
-`upload` (no execute) does steps 1-3 only. `reboot` is a single `RBOT`
+`upload` (no execute) does steps 1, 2 and 4 only -- no loader placement, since
+without a disc there is nothing to identify. `reboot` is a single `RBOT`
 command — it only works if dcload is currently in control of the DC;
 it does not work against a normal game.
 
@@ -91,10 +143,11 @@ There is no `make`, no `xtask`, no installer. Everything happens through
 
 ## Tests
 
-There are **no Rust unit or integration tests** — `grep "#\[test\]" src/`
-returns nothing and the crate has no `[lib]` target where tests could
-hide. `cargo test` will build the test harness and find zero tests; that
-is not a bug, that is the project.
+There are unit tests in `src/presets.rs` and `src/loaders.rs` only -- the
+lookup rules and the chainload plan, which are pure functions over data and so
+are the only part of this crate that can be tested without a Dreamcast.
+Everything else still needs real hardware or an emulator. `cargo test` runs
+them; there is no `[lib]` target and no integration-test directory.
 
 The `test/` directory at the repo root is **Dreamcast-side runtime
 assets**: firmware (`test/DS/firmware/`), KLF modules (`test/DS/modules/`,
@@ -138,6 +191,17 @@ dispatcher". The longer version, module by module:
   create a `ProgressBar` anywhere else, it is outside that arrangement
   and will be shredded by the next log line. It also holds `LoadMonitor`,
   which aggregates a running title's disc reads into "loading" bursts.
+
+- **`src/presets.rs`** — the per-game settings table carried over from
+  DreamShell's isoldr presets, and the disc identity (IP.BIN fields plus the
+  boot-sector MD5) used to look a game up in it. Two-tier matching, and the
+  vocabulary for saying which tier answered. Unit-tested.
+
+- **`src/loaders.rs`** — everything about *where* the Dreamcast-side loader
+  lives: parsing the base out of the VERS reply, finding the ELF for a base,
+  the memory a running loader is using (`live_footprint`, which is a LIST of
+  ranges and the reason a direct chainload to 0x8cfe8000 is refused), and the
+  hop plan. Unit-tested.
 
 - **`src/main.rs`** — entry point. Defines the `Args`/`Commands` clap
   structs, sets up logging (`ui::init_logging`, `-v`/`-vv` for
@@ -205,12 +269,37 @@ dispatcher". The longer version, module by module:
 - **`src/disc_formats/`** — three format readers and a trait
   (`DiscFormat` in `types.rs`). `Iso` wraps a single `File` and does
   range seeks for `read_sector`; `Gdi` walks the `.gdi` track list and
-  jumps between track files at the right offsets; `Cdi` parses
-  DiscJuggler images. The dispatch in `receive_syscalls` chooses by
-  extension on the `-d` path: `.gdi` → `Gdi::new`, `.cdi` → `Cdi::new`,
-  anything else → `Iso::new` (which then warns and disables CDFS if
-  it can't find a PVD). `StubDisc` is the placeholder used when `-d`
-  wasn't passed — its `read_sector` returns an error.
+  jumps between track files at the right offsets; `Cdi` parses the
+  DiscJuggler descriptor block at the END of the file and maps LBAs
+  through the resulting track table. `open_disc` (in `dispatch.rs`)
+  chooses by extension on the `-d` path: `.gdi` → `Gdi::new`, `.cdi` →
+  `Cdi::new`, anything else → `Iso::new`. `StubDisc` is the placeholder
+  used when `-d` wasn't passed — its `read_sector` returns an error.
+
+  **`Cdi` used to be a stub and it mattered.** It sniffed the first sector,
+  picked a sector size, and treated the whole file as one flat run from LBA
+  150 — the `cdi2iso.c` heuristic, which is where it came from, so that file
+  is not a reference. All three real images available start with an *audio*
+  track, so the Dreamcast's first sector request was answered with audio
+  samples and no error was reported. Picking the boot track is the subtle
+  part: not the first, not the last, and **not** "the one whose first sector
+  says SEGA SEGAKATANA" — that picks a 302-sector stub session on the Sonic
+  Adventure conversion. The test that works is an ISO9660 PVD at track sector
+  16 whose root directory extent lies inside that same track. Module docs have
+  the arithmetic.
+
+  **Every open failure is reported now.** `open_disc` returns a `Result` and
+  the three cases — path does not exist, format not understood, opens but
+  holds no Dreamcast header — are distinguished. They used to collapse into
+  one `None` that `identify_disc` printed as "no readable IP.BIN in <path>",
+  and a `.gdi`/`.cdi` that failed to open fell through to `StubDisc` with
+  nothing logged, so a mistyped `-d` gave a whole session with CDFS silently
+  dead.
+
+  `types::find_ip_bin` is where identification reads the header: the boot
+  sector first, then `IP.BIN` as a FILE in the ISO9660 root, because one real
+  image starts its data track with sixteen blank sectors and carries IP.BIN
+  that way.
 
 - **`src/types.rs`** — wire-format structs. `DCLoadDirEnt` and
   `DCLoadStat` are `#[repr(C)]` mirrors of the DC's `struct dirent`
@@ -330,7 +419,14 @@ without writing one.
   policy, but do not add it to the build (`build.rs`, `[[bin]]`,
   `[features]`, etc.) without first checking the GPLv2 implications.
 
-- **ELF upload honours section addresses.** The CLI `--address` default
+- **ELF upload honours section addresses, and only allocated ones.**
+  `loaders::is_uploadable` gates on SHF_ALLOC and a non-zero `sh_addr`, not on
+  `SHT_PROGBITS` alone. The old filter logged "skipping" and then pushed the
+  section anyway, so `.symtab`, `.strtab`, `.shstrtab` and `.comment` -- all at
+  address 0 -- were uploaded to the bottom of the Dreamcast's address map on
+  every ELF. It went unnoticed because the usual input is a raw `1ST_READ.BIN`,
+  which takes the non-ELF path.
+ The CLI `--address` default
   is `0x0c010000` (a typical Dreamcast load address), but if the input
   is an ELF, `dispatch::upload` overrides it with `e_entry` from the
   ELF header. Pass `--address` only when uploading a raw `.bin` blob.
