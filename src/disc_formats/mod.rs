@@ -1,4 +1,10 @@
+pub mod boot;
 pub mod cdi;
+pub mod deflate;
 pub mod gdi;
 pub mod iso;
+pub mod iso9660;
+pub mod scramble;
+pub mod source;
 pub mod types;
+pub mod zip;

@@ -111,6 +111,22 @@ struct Args {
     #[arg(long, value_parser = parse_probe)]
     probe: Vec<(u32, u8, Option<u32>)>,
 
+    /// What to do about a SCRAMBLED boot binary.
+    ///
+    /// A binary meant to boot from a CD-R is stored with its 32-byte slices
+    /// permuted, and the disc's own bootstrap unpermutes it while loading. This
+    /// host never runs that bootstrap -- it enters the binary directly, as
+    /// isoldr does -- so a scrambled one has to be undone here or what runs is
+    /// noise. A `.gdi` dumped from a GD-ROM is never scrambled; a `.cdi`
+    /// self-boot conversion usually is.
+    ///
+    /// `auto` (the default) undoes it only when it can be PROVEN, which is
+    /// possible for homebrew and not for retail titles -- see
+    /// `disc_formats::scramble`. If a title uploads cleanly and then does
+    /// absolutely nothing, `--descramble always` is the next thing to try.
+    #[arg(long, value_enum, default_value_t = DescrambleArg::Auto)]
+    descramble: DescrambleArg,
+
     /// Enter the title through its own IP.BIN bootstrap instead of jumping
     /// straight into 1ST_READ.BIN -- what isoldr does for every preset with
     /// `fastboot = 0`, which includes Sonic Adventure 2.
@@ -130,6 +146,76 @@ struct Args {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DescrambleArg {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<DescrambleArg> for disc_formats::boot::Descramble {
+    fn from(a: DescrambleArg) -> Self {
+        match a {
+            DescrambleArg::Auto => Self::Auto,
+            DescrambleArg::Always => Self::Always,
+            DescrambleArg::Never => Self::Never,
+        }
+    }
+}
+
+/// The bytes to upload, and what to call them in the log and on the bar.
+///
+/// POINT AT THE IMAGE, NOT AT A FILE YOU EXTRACTED FROM IT. A disc already says
+/// which file it boots (IP.BIN names it) and where that file is, so extracting
+/// `1ST_READ.BIN` by hand and then passing two paths that have to agree is work
+/// nobody needs to do -- and one of the two being stale is a whole debugging
+/// session.
+/// `opened` is the image already open for the syscall loop, when the thing
+/// being run IS that image -- which is the usual case, and re-opening it here
+/// would re-read the zip directory and re-probe every track for nothing.
+fn resolve_payload(
+    args: &Args,
+    file: &str,
+    opened: Option<&dyn disc_formats::types::DiscFormat>,
+) -> Result<(Vec<u8>, String), String> {
+    let boot = match opened {
+        Some(disc) => Some(
+            disc_formats::boot::extract(disc, args.descramble.into())
+                .map_err(|e| format!("{file}: {e}"))?,
+        ),
+        None if dispatch::is_disc_image(file) => {
+            Some(dispatch::boot_binary(file, args.descramble.into())?)
+        }
+        None => None,
+    };
+    if let Some(boot) = boot {
+        info!(
+            "{file}: booting {} ({} bytes, LBA {})",
+            boot.name,
+            indicatif::HumanBytes(boot.bytes.len() as u64),
+            boot.lba
+        );
+        return Ok((boot.bytes, boot.name));
+    }
+    dispatch::payload_from_file(std::path::Path::new(file)).map_err(|e| format!("{file}: {e}"))
+}
+
+/// Which image serves the title's disc reads.
+///
+/// When the thing being run IS a disc image, it is also the disc -- that is the
+/// whole point of pointing at it. An explicit `-d` still wins, and `-m` (host
+/// filesystem instead of a disc) turns it off.
+fn effective_disc(file: &str, disc: &Option<String>, mount: &Option<String>) -> Option<String> {
+    if disc.is_some() {
+        return disc.clone();
+    }
+    if mount.is_some() {
+        return None;
+    }
+    dispatch::is_disc_image(file).then(|| file.to_string())
 }
 
 /// `ADDR=N[:PEEK]` for `--probe`. N is 1..=127.
@@ -185,7 +271,10 @@ fn parse_patch(s: &str) -> Result<(u32, u32), String> {
 /// Returns `None` when there is no reason to move: no disc, no database, no
 /// match. The caller keeps the running loader in that case, which is the stock
 /// 0x8c004000 and is what every title got before any of this existed.
-fn wanted_loader_base(args: &Args, disc: Option<&String>) -> Option<u32> {
+fn wanted_loader_base(
+    args: &Args,
+    disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
+) -> Option<u32> {
     if args.no_relocate {
         return None;
     }
@@ -193,9 +282,9 @@ fn wanted_loader_base(args: &Args, disc: Option<&String>) -> Option<u32> {
         info!("loader base 0x{base:08x} (from --loader-base)");
         return Some(base);
     }
-    let disc = disc?;
+    let (disc, disc_path) = disc?;
 
-    let identity = match dispatch::identify_disc(disc) {
+    let identity = match dispatch::identify(disc, disc_path) {
         Ok(id) => id,
         Err(reason) => {
             // A warning, not a debug line, and it carries the reason. This is
@@ -292,7 +381,11 @@ fn wanted_loader_base(args: &Args, disc: Option<&String>) -> Option<u32> {
 enum Commands {
     /// Upload a binary and execute it immediately
     UExec {
-        /// Path to file to upload and execute
+        /// What to run: a binary (1ST_READ.BIN, an ELF), or a DISC IMAGE.
+        ///
+        /// Given an image (.gdi / .cdi / .iso, or a .zip holding one), the boot
+        /// binary is read out of it and the same image serves the title's disc
+        /// reads -- no extracting anything, and no second path to keep in step.
         #[arg(value_hint = clap::ValueHint::FilePath)]
         file: String,
 
@@ -309,9 +402,25 @@ enum Commands {
     },
     /// Upload a binary
     Upload {
-        /// Path to file to upload
+        /// Path to file to upload. A disc image works here too: its boot binary
+        /// is what gets uploaded.
         #[arg(value_hint = clap::ValueHint::FilePath)]
         file: String,
+    },
+    /// Write a disc image's boot binary out to a file.
+    ///
+    /// Touches no network. Mostly a way to check what `uexec <image>` is going
+    /// to send before sending it -- and the only offline test there is that a
+    /// zipped image reads back byte for byte like the loose one.
+    Extract {
+        /// Disc image (.gdi / .cdi / .iso / .zip)
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        disc: String,
+
+        /// Where to write it. Default: the name the disc gives it, in the
+        /// current directory.
+        #[arg(short, long, value_hint = clap::ValueHint::FilePath)]
+        output: Option<String>,
     },
     /// Reboot the console (only works when dcload is in control)
     Reboot {},
@@ -325,7 +434,8 @@ enum Commands {
     /// title misbehaves, this separates "the image is not what you think" from
     /// "the console did something odd" in one command.
     Identify {
-        /// Disc image (.gdi / .cdi / .iso)
+        /// Disc image (.gdi / .cdi / .iso, or a .zip holding one -- add
+        /// `#member` to pick one out of an archive with several)
         #[arg(value_hint = clap::ValueHint::FilePath)]
         disc: String,
     },
@@ -333,7 +443,14 @@ enum Commands {
 
 /// `identify`: everything the loader-placement pass would work out, printed.
 fn identify_only(args: &Args, disc: &str) -> ExitCode {
-    let identity = match dispatch::identify_disc(disc) {
+    let reader = match dispatch::open_disc(disc) {
+        Ok(d) => d,
+        Err(reason) => {
+            error!("{reason}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let identity = match dispatch::identify(reader.as_ref(), disc) {
         Ok(id) => id,
         Err(reason) => {
             error!("{reason}");
@@ -344,6 +461,23 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     println!("product  : {} {}", identity.product, identity.version);
     println!("region   : {}", identity.region);
     println!("boot md5 : {}", identity.md5);
+    match disc_formats::boot::extract(reader.as_ref(), args.descramble.into()) {
+        Ok(b) => {
+            println!(
+                "boot bin : {} ({} bytes at LBA {}){}",
+                b.name,
+                b.bytes.len(),
+                b.lba,
+                match (b.scrambling, b.descrambled) {
+                    (_, true) => " -- unscrambled",
+                    (disc_formats::scramble::Scrambling::Plain, _) => " -- plain",
+                    _ => "",
+                }
+            );
+            println!("bin md5  : {:x}", md5::compute(&b.bytes));
+        }
+        Err(e) => println!("boot bin : NOT FOUND -- {e}"),
+    }
 
     let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
     let (db_path, db_searched) = game_db_path(args, &loaders);
@@ -397,6 +531,64 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A filename taken out of a disc image, made safe to use as a host path.
+///
+/// The bytes at IP.BIN +0x60 are whatever was mastered there: `iso9660::
+/// boot_file_name` stops at a NUL or a space and passes everything else
+/// through, separators and `..` included. Only the last component survives
+/// here, and only its plain-filename characters; anything else becomes `_`,
+/// and a name that is left empty or is `.`/`..` falls back to the usual one.
+fn safe_output_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\', ':']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // A leading dot is the last thing left that the image gets to decide and
+    // the user does not see: `.bashrc` lands in the working directory and does
+    // not show up in an `ls`. No boot binary is named that way.
+    let cleaned = cleaned.trim_start_matches('.');
+    if cleaned.trim_matches('.').is_empty() {
+        return "1ST_READ.BIN".to_string();
+    }
+    cleaned.to_string()
+}
+
+/// `extract`: the boot binary out of an image and onto disk.
+fn extract_only(args: &Args, disc: &str, output: Option<&str>) -> ExitCode {
+    let boot = match dispatch::boot_binary(disc, args.descramble.into()) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `-o` is a path the USER typed and is taken as it lies. The default is
+    // not: it comes out of IP.BIN's sixteen-byte filename field, byte for
+    // byte, and nothing in the image stops that field reading `../../.bashrc`.
+    // Writing it verbatim would let the image choose where the host writes.
+    let default = safe_output_name(&boot.name);
+    let out = output.unwrap_or(&default);
+    if let Err(e) = std::fs::write(out, &boot.bytes) {
+        error!("cannot write {out}: {e}");
+        return ExitCode::FAILURE;
+    }
+    info!(
+        "{} -> {out} ({} bytes, md5 {:x}){}",
+        boot.name,
+        boot.bytes.len(),
+        md5::compute(&boot.bytes),
+        if boot.descrambled { ", unscrambled" } else { "" }
+    );
+    ExitCode::SUCCESS
+}
+
 /// (the table to read, every path considered).
 ///
 /// Resolved exactly like the loader set: beside the loaders, then in the
@@ -433,9 +625,16 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Logging goes through the progress display (see `ui`), so that a log
     // record never lands on top of a bar that is being drawn.
     ui::init_logging(args.verbose);
-    // Before the socket: this one never talks to a Dreamcast.
+    // Before the socket: these never talk to a Dreamcast.
     if let Commands::Identify { ref disc } = args.command {
         return Ok(identify_only(&args, disc));
+    }
+    if let Commands::Extract {
+        ref disc,
+        ref output,
+    } = args.command
+    {
+        return Ok(extract_only(&args, disc, output.as_deref()));
     }
 
     let legacy_mode = protocol_version()[0] < 2;
@@ -462,12 +661,46 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         ),
     }
 
+    // Which image answers the title's disc reads. Worked out once, here,
+    // because it decides both where the loader goes and what the syscall loop
+    // is handed -- and those two disagreeing is a session with the right game
+    // running at the wrong address.
+    let redirect_disc: Option<String> = match &args.command {
+        Commands::UExec {
+            file, disc, mount, ..
+        } => effective_disc(file, disc, mount),
+        _ => None,
+    };
+
+    // Opened ONCE, here, and handed to everything that needs it: the identity
+    // pass, the boot binary, IP.BIN and the syscall loop. Each `open_disc`
+    // re-reads a zip's central directory, re-probes every CDI track for a PVD
+    // and re-opens every GDI track file -- only the deflate index survives
+    // between opens -- so a run that opened per use paid for all of that four
+    // times before the title started.
+    //
+    // A failure here is reported and is not fatal: the title is still uploaded
+    // and started, exactly as before, and every disc read it makes then fails.
+    let mut disc_reader: Option<Box<dyn disc_formats::types::DiscFormat>> = None;
+    if let Some(path) = redirect_disc.as_deref() {
+        match dispatch::open_disc(path) {
+            Ok(disc) => disc_reader = Some(disc),
+            Err(e) => {
+                error!("CDFS redirection DISABLED: {e}");
+                error!("the title will be started anyway, and every disc read it makes will fail");
+            }
+        }
+    }
+
     // Relocate BEFORE uploading the title. Any chainload replaces the whole
     // loader, so a title uploaded first would be uploaded into an image that is
     // about to be overwritten -- and the game's own RAM is zero-filled by the
     // loader that comes up.
-    if let Commands::UExec { ref disc, .. } = args.command
-        && let Some(want) = wanted_loader_base(&args, disc.as_ref())
+    if matches!(args.command, Commands::UExec { .. })
+        && let Some(want) = wanted_loader_base(
+            &args,
+            disc_reader.as_deref().zip(redirect_disc.as_deref()),
+        )
     {
         match running_base {
             Some(base) => {
@@ -490,13 +723,32 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let result: Result<ExitCode, Box<dyn std::error::Error>> = match args.command {
         Commands::UExec {
-            file,
-            disc,
-            mount,
+            ref file,
+            ref mount,
             console,
+            ..
         } => {
-            let uploaded = file.clone();
-            match dispatch::upload(&mut udpsender, file, args.address, running_base) {
+            // A disc image resolves to the boot binary it names; anything else
+            // is uploaded as it lies.
+            // The same image, when `uexec <image>` was given without `-d`.
+            let payload_disc = disc_reader
+                .as_deref()
+                .filter(|_| redirect_disc.as_deref() == Some(file.as_str()));
+            let (payload, label) = match resolve_payload(&args, file, payload_disc) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("{e}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            let has_disc = redirect_disc.is_some();
+            match dispatch::upload_bytes(
+                &mut udpsender,
+                &payload,
+                &label,
+                args.address,
+                running_base,
+            ) {
             Err(e) => Err(e),
             Ok((addr, _size)) => {
                 // After the title, before EXEC: the region is clear of both.
@@ -505,9 +757,10 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // bootstrap in RAM, so fall back to entering the binary rather
                 // than jumping into whatever was there before.
                 let mut entry = addr;
-                if let Some(ref d) = disc {
+                if let (Some(reader), Some(d)) = (disc_reader.as_deref(), redirect_disc.as_ref()) {
                     match dispatch::load_ip_bin(
                         &mut udpsender,
+                        reader,
                         d,
                         running_base,
                         args.boot_ipbin,
@@ -536,11 +789,18 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         }
                     }
                 } else if args.boot_ipbin {
-                    warn!("--boot-ipbin needs a disc image; entering 0x{addr:08x} directly");
+                    if has_disc {
+                        warn!(
+                            "--boot-ipbin asked for, but the disc image could not be \
+                             opened (see above); entering 0x{addr:08x} directly"
+                        );
+                    } else {
+                        warn!("--boot-ipbin needs a disc image; entering 0x{addr:08x} directly");
+                    }
                 }
                 // Before --patch, so an explicit patch still wins over it.
                 if !args.no_gaps_guard {
-                    let guard = dispatch::gaps_probe_patches(&uploaded, args.address);
+                    let guard = dispatch::gaps_probe_patches(&payload, args.address);
                     if !guard.is_empty()
                         && let Err(e) = dispatch::apply_patches(&mut udpsender, &guard)
                     {
@@ -561,11 +821,14 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     warn!("could not place probes: {e}");
                 }
                 info!("Upload complete, executing at 0x{:08x}", entry);
-                match dispatch::execute(&mut udpsender, entry, console || disc.is_some() || mount.is_some(), disc.is_some()) {
+                // The title is on the console now; the host's copy is only
+                // holding up to 16 MiB for the length of the session.
+                drop(payload);
+                match dispatch::execute(&mut udpsender, entry, console || has_disc || mount.is_some(), has_disc) {
                     Err(e) => Err(e),
                     Ok(_) => {
-                        if disc.is_some() || mount.is_some() || console {
-                            dispatch::receive_syscalls(&mut udpsender, disc, mount)?;
+                        if has_disc || mount.is_some() || console {
+                            dispatch::receive_syscalls(&mut udpsender, disc_reader, mount.clone())?;
                             return Ok(ExitCode::SUCCESS);
                         }
                         Ok(ExitCode::SUCCESS)
@@ -573,9 +836,22 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 }
             }
         }},
-        Commands::Upload { file } => {
-            return match dispatch::upload(&mut udpsender, file, args.address, running_base)
-                .map(|_s| ExitCode::SUCCESS)
+        Commands::Upload { ref file } => {
+            let (payload, label) = match resolve_payload(&args, file, None) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("{e}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            return match dispatch::upload_bytes(
+                &mut udpsender,
+                &payload,
+                &label,
+                args.address,
+                running_base,
+            )
+            .map(|_s| ExitCode::SUCCESS)
             {
                 Err(e) => Err(e),
                 Ok(code) => {
@@ -587,7 +863,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         // Handled before the socket is opened; unreachable here, but spelled
         // out rather than caught by a wildcard so adding a subcommand keeps
         // failing to compile until it is wired up.
-        Commands::Identify { .. } => unreachable!("handled before connecting"),
+        Commands::Identify { .. } | Commands::Extract { .. } => {
+            unreachable!("handled before connecting")
+        }
         Commands::SelftestReadback {} => {
             return match dispatch::selftest_readback(&mut udpsender)? {
                 true => Ok(ExitCode::SUCCESS),
@@ -608,5 +886,26 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Ok(ExitCode::FAILURE)
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default output name comes out of the IMAGE, and nothing in an image
+    /// stops those sixteen bytes reading `../../.bashrc`. `extract` would then
+    /// write there, with no confirmation and no overwrite check.
+    #[test]
+    fn an_image_cannot_choose_where_extract_writes() {
+        assert_eq!(safe_output_name("1ST_READ.BIN"), "1ST_READ.BIN");
+        assert_eq!(safe_output_name("0WINCEOS.BIN"), "0WINCEOS.BIN");
+        for hostile in ["../../.bashrc", "/etc/cron.d/x", r"..\..\.bashrc"] {
+            let out = safe_output_name(hostile);
+            assert!(!out.contains('/') && !out.contains('\\'), "{hostile} -> {out}");
+            assert!(!out.starts_with('.'), "{hostile} -> {out}");
+        }
+        assert_eq!(safe_output_name(".."), "1ST_READ.BIN");
+        assert_eq!(safe_output_name(""), "1ST_READ.BIN");
     }
 }

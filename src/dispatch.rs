@@ -14,10 +14,13 @@ use crate::{
     cd::build_dc_toc,
     cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
     disc_formats::{
+        boot,
         cdi::Cdi,
         gdi::Gdi,
         iso::Iso,
-        types::{StubDisc, get_disc_format},
+        source::{Container, FileSource},
+        types::{DiscFormat, StubDisc, get_disc_format},
+        zip::{ZipArchive, ZipContainer},
     },
     fs::{self, FSSyscallState},
     io::ExternalDcIo,
@@ -74,39 +77,83 @@ fn refuse_self_overwrite(
     ))))
 }
 
+/// The most this will ever send. A Dreamcast has 16 MiB of RAM.
+pub const MAX_PAYLOAD_BYTES: u64 = crate::types::DREAMCAST_RAM_BYTES;
+
+/// Read a file that is about to be uploaded, refusing an impossible one BEFORE
+/// reading it.
+///
+/// The size check used to be here and moved to `upload_bytes`, which is after
+/// the whole file is in RAM -- so `uexec` on a mistyped path that happens to
+/// name a 1.1 GB image allocated all of it and only then said it was too large.
+/// `upload_bytes` still checks, for the callers that hand it bytes; this stops
+/// the file case from paying for it.
+pub fn read_payload_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let len = std::fs::metadata(path)?.len();
+    if len > MAX_PAYLOAD_BYTES {
+        return Err(Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "{} is {len} bytes, too large for a Dreamcast executable (>{} bytes)",
+                path.display(),
+                MAX_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    std::fs::read(path)
+}
+
+/// A file on the command line, as the pair everything downstream wants: the
+/// bytes, and what to call them in the log and on the progress bar.
+pub fn payload_from_file(path: &Path) -> std::io::Result<(Vec<u8>, String)> {
+    let bytes = read_payload_file(path)?;
+    debug!("Read file {} ({} bytes)", path.display(), bytes.len());
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    Ok((bytes, label))
+}
+
 pub fn upload(
     conn: &mut impl ExternalDcIo,
     file: String,
+    address: u32,
+    running_base: Option<u32>,
+) -> std::result::Result<(u32, usize), std::boxed::Box<dyn std::error::Error>> {
+    let (bytes, label) = payload_from_file(Path::new(&file))?;
+    upload_bytes(conn, &bytes, &label, address, running_base)
+}
+
+/// Upload a payload that is already in memory.
+///
+/// EVERYTHING reaches the Dreamcast through here -- a file named on the command
+/// line, and a boot binary read straight out of a disc image. Keeping one body
+/// is what stops the ELF handling, the self-overwrite refusal and the byte
+/// accounting from drifting apart between the two paths.
+pub fn upload_bytes(
+    conn: &mut impl ExternalDcIo,
+    file_buffer: &[u8],
+    label: &str,
     mut address: u32,
     running_base: Option<u32>,
 ) -> std::result::Result<(u32, usize), std::boxed::Box<dyn std::error::Error>> {
-    let path = Path::new(&file);
-    let metadata = std::fs::metadata(path)?;
-    let file_size = metadata.len() as usize;
-
-    if file_size > 16 * 1024 * 1024 {
+    if file_buffer.len() as u64 > MAX_PAYLOAD_BYTES {
         error!(
             "File size seems too large for a Dreamcast executable (>{} bytes)",
-            16 * 1024 * 1024
+            MAX_PAYLOAD_BYTES
         );
         return Err(Box::new(Error::new(
             std::io::ErrorKind::FileTooLarge,
             "File too large",
         )));
     }
-
-    let file_buffer = std::fs::read(path)?;
-    debug!("Read file {} ({} bytes)", file, file_size);
-
-    let label = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file.clone());
+    let label = label.to_string();
 
     let mut elf_parts: Vec<SectionHeader> = vec![];
 
     // Analyze the ELF file
-    let elf = ElfBytes::<AnyEndian>::minimal_parse(file_buffer.as_slice());
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(file_buffer);
     let started = Instant::now();
     if let Ok(elf) = elf {
         // Let's keep the entrypoint somewhere, it may be handy 👀
@@ -208,7 +255,7 @@ pub fn upload(
     } else {
         refuse_self_overwrite(running_base, address, file_buffer.len())?;
         let bar = ui::bytes_bar(file_buffer.len() as u64, label);
-        let result = send_data(conn, file_buffer.as_slice(), address, Some(&bar));
+        let result = send_data(conn, file_buffer, address, Some(&bar));
         drop(bar);
         if let Err(e) = result {
             error!("Error uploading binary: {}", e);
@@ -446,6 +493,7 @@ pub fn ensure_loader_base(
 /// (AGENTS.md 4.11), and the caller is told rather than left guessing.
 pub fn load_ip_bin(
     conn: &mut impl ExternalDcIo,
+    disc: &dyn DiscFormat,
     disc_path: &str,
     running_base: Option<u32>,
     full: bool,
@@ -467,10 +515,8 @@ pub fn load_ip_bin(
         _ => {}
     }
 
-    let disc = open_disc(disc_path).map_err(std::io::Error::other)?;
-
     if !full {
-        let sector = crate::disc_formats::types::find_ip_bin(disc.as_ref()).ok_or_else(|| {
+        let sector = crate::disc_formats::types::find_ip_bin(disc).ok_or_else(|| {
             std::io::Error::other(format!("{disc_path}: no IP.BIN header to load"))
         })?;
 
@@ -832,14 +878,10 @@ const GAPS_CORROBORATION_SPAN: usize = 4096;
 /// data -- so a slot-window literal must corroborate it nearby. In Sonic
 /// Adventure's 6.7 MB there is neither; in Sonic Adventure 2's 1.5 MB there is
 /// exactly one of each.
-pub fn gaps_probe_patches(file: &str, address: u32) -> Vec<(u32, u32)> {
-    let Ok(buf) = std::fs::read(Path::new(file)) else {
-        return vec![];
-    };
-
+pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
     // Raw binaries land whole at `address`; an ELF's sections land at their own.
     let mut spans: Vec<(u32, &[u8])> = vec![];
-    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf.as_slice()) {
+    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf) {
         if let Some(headers) = elf.section_headers() {
             for sh in headers.iter() {
                 if crate::loaders::is_uploadable(&sh)
@@ -850,7 +892,7 @@ pub fn gaps_probe_patches(file: &str, address: u32) -> Vec<(u32, u32)> {
             }
         }
     } else {
-        spans.push((address, buf.as_slice()));
+        spans.push((address, buf));
     }
 
     let mut out = vec![];
@@ -878,7 +920,7 @@ pub fn gaps_probe_patches(file: &str, address: u32) -> Vec<(u32, u32)> {
             info!(
                 "this title probes the expansion port for the GAPS bridge \
                  (signature at 0x{at:08x}); neutralising it so it cannot switch \
-                 the adapter off -- AGENTS.md 4.12"
+                 the adapter off"
             );
             out.push((at, 0xffff_ffff));
         }
@@ -933,14 +975,23 @@ fn read_word(conn: &mut impl ExternalDcIo, addr: u32) -> Option<u32> {
 /// the same sector DreamShell hashes to name its presets.
 ///
 /// Returns the reason on failure rather than a bare `None`. THAT MATTERS: the
-/// three ways this fails -- the path does not exist, the file is not a format
-/// we can read, and the file reads fine but holds no Dreamcast header -- call
-/// for completely different things from whoever is looking at the log, and
-/// reporting all three as "no readable IP.BIN in <path>" sent one debugging
-/// session after a disc reader when the file simply was not there.
-pub fn identify_disc(path: &str) -> Result<crate::presets::DiscIdentity, String> {
-    let disc = open_disc(path)?;
-    let sector = crate::disc_formats::types::find_ip_bin(disc.as_ref()).ok_or_else(|| {
+/// ways this fails -- `open_disc` says the path does not exist or the file is
+/// not a format we can read, and this one says the file reads fine but holds no
+/// Dreamcast header -- call for completely different things from whoever is
+/// looking at the log, and reporting all of them as "no readable IP.BIN in
+/// <path>" sent one debugging session after a disc reader when the file simply
+/// was not there.
+///
+/// A run that boots an image needs its identity, its boot binary, its IP.BIN
+/// and then its sectors. The image is opened ONCE for all four (`main` holds
+/// the reader): opening it again per use re-reads the zip central directory,
+/// re-probes every CDI track for a PVD and re-opens every GDI track file, none
+/// of which is cached. `path` is only what to call it in the message.
+pub fn identify(
+    disc: &dyn DiscFormat,
+    path: &str,
+) -> Result<crate::presets::DiscIdentity, String> {
+    let sector = crate::disc_formats::types::find_ip_bin(disc).ok_or_else(|| {
         format!(
             "{path} opened, but neither its boot sector nor an IP.BIN file in its \
              root directory carries a Dreamcast header"
@@ -958,22 +1009,172 @@ pub fn identify_disc(path: &str) -> Result<crate::presets::DiscIdentity, String>
 /// warned on the `.iso` branch, so a typo in a path, or an image in a format
 /// the reader does not understand, produced a session with CDFS silently dead
 /// and nothing in the log to say so.
-fn open_disc(cd_path: &str) -> Result<Box<dyn crate::disc_formats::types::DiscFormat>, String> {
-    if !std::path::Path::new(cd_path).is_file() {
-        return Err(format!("no such disc image: {cd_path}"));
+///
+/// A `.zip` is opened IN PLACE -- see `disc_formats::zip`. `archive.zip#member`
+/// picks a member explicitly when the archive holds more than one image.
+pub fn open_disc(spec: &str) -> Result<Box<dyn DiscFormat>, String> {
+    let (path_str, member) = split_member(spec);
+    let path = Path::new(path_str);
+    if !path.is_file() {
+        return Err(format!("no such disc image: {path_str}"));
     }
-    let lower = cd_path.to_ascii_lowercase();
+
+    if crate::disc_formats::zip::looks_like_zip(path) {
+        let archive =
+            std::rc::Rc::new(ZipArchive::open(path).map_err(|e| e.to_string())?);
+        let member = match member {
+            Some(want) => archive
+                .find(want)
+                .map(|e| e.name.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "{path_str} holds no member '{want}'. It holds: {}",
+                        image_candidates(&archive).join(", ")
+                    )
+                })?,
+            None => pick_zip_image(&archive, path_str)?,
+        };
+        info!("{path_str}: reading '{member}' from inside the archive");
+        return open_zip_member(archive, &member);
+    }
+
+    if member.is_some() {
+        warn!("{path_str} is not a zip archive; the '#member' part is ignored");
+    }
+
+    let lower = path_str.to_ascii_lowercase();
     if lower.ends_with(".gdi") {
-        Gdi::new(cd_path.to_string())
+        Gdi::open_path(path_str)
             .map(get_disc_format)
-            .map_err(|e| format!("cannot read the GDI {cd_path}: {e}"))
+            .map_err(|e| format!("cannot read the GDI {path_str}: {e}"))
     } else if lower.ends_with(".cdi") {
-        Cdi::new(cd_path.to_string()).map(get_disc_format)
+        let src = FileSource::open(path).map_err(|e| format!("cannot open {path_str}: {e}"))?;
+        Cdi::new(Box::new(src)).map(get_disc_format)
     } else {
-        Iso::new(cd_path.to_string())
+        let src = FileSource::open(path).map_err(|e| format!("cannot open {path_str}: {e}"))?;
+        Iso::new(Box::new(src))
             .map(get_disc_format)
-            .map_err(|e| format!("cannot read {cd_path} as a plain ISO: {e}"))
+            .map_err(|e| format!("cannot read {path_str} as a plain ISO: {e}"))
     }
+}
+
+/// `archive.zip#member`, but only when the left half is really a file.
+///
+/// A `#` in an ordinary path is legal and does happen, so the split is only
+/// taken when it produces something that exists. Getting this backwards would
+/// turn a perfectly good filename into "no such disc image".
+fn split_member(spec: &str) -> (&str, Option<&str>) {
+    match spec.rsplit_once('#') {
+        Some((left, right)) if !right.is_empty() && Path::new(left).is_file() => {
+            (left, Some(right))
+        }
+        _ => (spec, None),
+    }
+}
+
+const IMAGE_EXTENSIONS: [&str; 3] = [".gdi", ".cdi", ".iso"];
+
+fn image_candidates(archive: &ZipArchive) -> Vec<String> {
+    archive
+        .entries()
+        .iter()
+        .filter(|e| !e.is_dir())
+        // Archives made on macOS carry a shadow copy of every file under
+        // __MACOSX/; it is metadata, not an image, and picking one is an
+        // instant "this .cdi has no tracks".
+        .filter(|e| !e.name.starts_with("__MACOSX/"))
+        .filter(|e| {
+            let lower = e.name.to_ascii_lowercase();
+            IMAGE_EXTENSIONS.iter().any(|x| lower.ends_with(x))
+        })
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// Which image inside the archive to read.
+///
+/// Preference is `.gdi`, then `.cdi`, then `.iso`, and a tie is REFUSED rather
+/// than broken: an archive holding two games is a question only the user can
+/// answer, and quietly picking the alphabetically-first one would boot the
+/// wrong title with everything else looking normal.
+fn pick_zip_image(archive: &ZipArchive, label: &str) -> Result<String, String> {
+    let candidates = image_candidates(archive);
+    for ext in IMAGE_EXTENSIONS {
+        let of_kind: Vec<&str> = candidates
+            .iter()
+            .filter(|n| n.to_ascii_lowercase().ends_with(ext))
+            .map(|n| n.as_str())
+            .collect();
+        match of_kind.len() {
+            0 => continue,
+            1 => return Ok(of_kind[0].to_string()),
+            _ => {
+                return Err(format!(
+                    "{label} holds {} {ext} images and nothing says which one to run: \
+                     {}. Name one with {label}#<member>.",
+                    of_kind.len(),
+                    of_kind.join(", ")
+                ));
+            }
+        }
+    }
+    // Falling out of the loop and an empty `candidates` are the same answer:
+    // `image_candidates` only ever returns names ending in one of these
+    // extensions, so nothing matching means nothing usable.
+    Err(format!(
+        "{label} holds no .gdi, .cdi or .iso ({} members)",
+        archive.entries().len()
+    ))
+}
+
+fn open_zip_member(
+    archive: std::rc::Rc<ZipArchive>,
+    member: &str,
+) -> Result<Box<dyn DiscFormat>, String> {
+    let lower = member.to_ascii_lowercase();
+    let base = member.rsplit('/').next().unwrap_or(member).to_string();
+    if lower.ends_with(".gdi") {
+        // A .gdi names its track files, and inside an archive "next to it"
+        // means the same prefix -- that is what ZipContainer resolves.
+        let container: Box<dyn Container> = Box::new(ZipContainer::new(archive, member));
+        return Gdi::new(container, &base)
+            .map(get_disc_format)
+            .map_err(|e| format!("cannot read the GDI '{member}' in the archive: {e}"));
+    }
+    let src = archive.open_named(member).map_err(|e| e.to_string())?;
+    if lower.ends_with(".cdi") {
+        Cdi::new(src).map(get_disc_format)
+    } else {
+        Iso::new(src)
+            .map(get_disc_format)
+            .map_err(|e| format!("cannot read '{member}' as a plain ISO: {e}"))
+    }
+}
+
+/// The title's own boot binary, read out of the disc image.
+///
+/// This is what makes `uexec <image>` work: the image already says which file
+/// it boots and where that file is, so nobody has to extract `1ST_READ.BIN`
+/// by hand and then pass two paths that have to agree.
+pub fn boot_binary(
+    spec: &str,
+    mode: boot::Descramble,
+) -> Result<boot::BootBinary, String> {
+    let disc = open_disc(spec)?;
+    boot::extract(disc.as_ref(), mode).map_err(|e| format!("{spec}: {e}"))
+}
+
+/// Does this path look like a disc image rather than something to upload?
+///
+/// By extension, plus the zip magic -- a zip is recognised by content because
+/// the interesting case is exactly the one where the name is unhelpful.
+pub fn is_disc_image(spec: &str) -> bool {
+    let (path_str, _) = split_member(spec);
+    let lower = path_str.to_ascii_lowercase();
+    if IMAGE_EXTENSIONS.iter().any(|x| lower.ends_with(x)) {
+        return true;
+    }
+    crate::disc_formats::zip::looks_like_zip(Path::new(path_str))
 }
 
 pub fn reboot(
@@ -991,29 +1192,23 @@ pub fn reboot(
 
 pub fn receive_syscalls(
     conn: &mut impl ExternalDcIo,
-    cd_path: Option<String>,
+    cd_disc: Option<Box<dyn DiscFormat>>,
     mount: Option<String>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
-    // A disc that cannot be opened must not be a silent no-op here: the title
-    // is about to be started with CDFS redirection ON, so it will ask for
-    // sectors and get errors for the rest of the session. Say so once, loudly,
-    // with the reason.
-    let disc = match cd_path {
-        None => get_disc_format(StubDisc {}),
-        Some(path) => match open_disc(&path) {
-            Ok(disc) => disc,
-            Err(e) => {
-                error!("CDFS redirection DISABLED: {e}");
-                error!("the title will be started anyway, and every disc read it makes will fail");
-                get_disc_format(StubDisc {})
-            }
-        },
-    };
-    debug!(
-        "CDFS source: start_sector={} num_sectors={}",
-        disc.start_sector(),
-        disc.num_sectors()
-    );
+    // A disc that could not be opened is not a silent no-op: the title is
+    // about to be started with CDFS redirection ON, so it will ask for sectors
+    // and get errors for the rest of the session. Whoever failed to open it
+    // said so, loudly and with the reason; here it is a stub that answers
+    // every read with one.
+    let disc = cd_disc.unwrap_or_else(|| get_disc_format(StubDisc {}));
+    // Worked out HERE, not in the ReadToc arm. Both answers are fixed for the
+    // session, and `num_sectors()` on a zipped GDI opens the last data track --
+    // which can mean a full deflate index build, with the title frozen waiting
+    // for its table of contents. (A `debug!` would not have warmed it: log
+    // macros do not evaluate their arguments at the default verbosity.)
+    let toc_start = disc.start_sector();
+    let toc_sectors = disc.num_sectors();
+    debug!("CDFS source: start_sector={toc_start} num_sectors={toc_sectors}");
     let base_path = mount.as_ref().map(Path::new);
     if let Some(base_path) = base_path
         && !base_path.exists()
@@ -1029,7 +1224,7 @@ pub fn receive_syscalls(
     fs_syscall_state.opendirs.resize_with(256, || None);
     fs_syscall_state.openfiles.resize_with(256, || None);
     let mut logged_lbas: HashSet<u32> = HashSet::new();
-    let pvd_lba = disc.start_sector().saturating_add(16);
+    let pvd_lba = toc_start.saturating_add(16);
     // Aggregates the title's disc reads into "loading" bursts (see `ui`). It
     // also decides how long we wait for the next packet: forever when nothing
     // is loading, which is exactly what this loop did before, and briefly while
@@ -1230,7 +1425,7 @@ pub fn receive_syscalls(
                                 }
                             }
                             DCLoadClientCmds::ReadToc(_session, dc_address, _unused) => {
-                                let toc = build_dc_toc(disc.start_sector(), disc.num_sectors());
+                                let toc = build_dc_toc(toc_start, toc_sectors);
                                 if let Err(e) = send_data(conn, &toc, dc_address, None) {
                                     warn!("Failed to send CDFS TOC data: {}", e);
                                     let _ = conn.send_command(DCLoadCmd {
@@ -2277,22 +2472,19 @@ mod probe_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// A raw image with `image[at..at+4]` set to `word`, zero elsewhere.
-    fn raw(len: usize, words: &[(usize, u32)]) -> std::path::PathBuf {
+    ///
+    /// It used to be written to a temp file, because `gaps_probe_patches` took
+    /// a path. It takes the bytes now -- the payload can come out of a disc
+    /// image and never exists as a file -- so the tests do not touch the
+    /// filesystem at all.
+    fn raw(len: usize, words: &[(usize, u32)]) -> Vec<u8> {
         let mut b = vec![0u8; len];
         for &(at, w) in words {
             b[at..at + 4].copy_from_slice(&w.to_le_bytes());
         }
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "gaps-probe-{}-{}.bin",
-            std::process::id(),
-            words.len() * 1000 + len
-        ));
-        std::fs::File::create(&p).unwrap().write_all(&b).unwrap();
-        p
+        b
     }
 
     #[test]
@@ -2300,8 +2492,7 @@ mod tests {
         // The shape Sonic Adventure 2 has: one "GAPS" comparison constant and
         // the slot literals in a pool a few hundred bytes away.
         let p = raw(0x1000, &[(0x100, 0xa100_1400), (0x348, GAPS_SIGNATURE)]);
-        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
-        std::fs::remove_file(&p).ok();
+        let got = gaps_probe_patches(&p, 0x0c01_0000);
         assert_eq!(got, vec![(0x8c01_0000 + 0x348, 0xffff_ffff)]);
     }
 
@@ -2310,8 +2501,7 @@ mod tests {
         // "GAPS" as ASCII in data, with no slot window anywhere: a title that
         // never touches the expansion port must come back untouched.
         let p = raw(0x1000, &[(0x348, GAPS_SIGNATURE)]);
-        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
-        std::fs::remove_file(&p).ok();
+        let got = gaps_probe_patches(&p, 0x0c01_0000);
         assert!(got.is_empty(), "patched on the signature alone: {got:?}");
     }
 
@@ -2323,8 +2513,7 @@ mod tests {
             0x8000,
             &[(0x100, 0xa100_1400), (0x100 + GAPS_CORROBORATION_SPAN + 4, GAPS_SIGNATURE)],
         );
-        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
-        std::fs::remove_file(&p).ok();
+        let got = gaps_probe_patches(&p, 0x0c01_0000);
         assert!(got.is_empty(), "corroborated across {GAPS_CORROBORATION_SPAN}+ bytes: {got:?}");
     }
 
@@ -2333,8 +2522,7 @@ mod tests {
         // Sonic Adventure's shape: nothing to neutralise, and nothing to warn
         // about either.
         let p = raw(0x1000, &[(0x100, 0xa100_1400)]);
-        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
-        std::fs::remove_file(&p).ok();
+        let got = gaps_probe_patches(&p, 0x0c01_0000);
         assert!(got.is_empty());
     }
 
@@ -2343,8 +2531,7 @@ mod tests {
         // A literal pool entry is always 4-aligned; ASCII in the middle of a
         // string is not, and is the likeliest false positive.
         let p = raw(0x1000, &[(0x100, 0xa100_1400), (0x34a, GAPS_SIGNATURE)]);
-        let got = gaps_probe_patches(p.to_str().unwrap(), 0x0c01_0000);
-        std::fs::remove_file(&p).ok();
+        let got = gaps_probe_patches(&p, 0x0c01_0000);
         assert!(got.is_empty(), "matched an unaligned occurrence: {got:?}");
     }
 }

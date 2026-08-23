@@ -9,6 +9,22 @@ opt-level = 2
 codegen-units = 1
 lto = "fat"
 
+# A DEBUG BUILD STILL HAS TO READ A DISC, and an unoptimised inflate makes that
+# look like a slow network. Measured on the 1.10 GiB Sonic Adventure 2 track,
+# over SMB: the release build indexes it in 4.6 s (inflate 3.73 s, crc 0.49 s),
+# the stock debug build in 40.5 s (inflate 33.58 s, crc 6.30 s) -- 29 MiB/s,
+# which is slow enough to look like the share is at fault. It is not: the
+# reader threads waited 0.07 s in both.
+#
+# So the dependency that does the decoding is always optimised, and this crate
+# is built at opt-level 1, which keeps line numbers and backtraces usable while
+# making our own byte loops (CRC-32, descrambling) stop being the bottleneck.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
 [dependencies]
 clap = { version = "4.5.58", features = ["derive"] }
 clap-num = "1.2.0"
@@ -21,5 +37,10 @@ log = "0.4.29"
 # DreamShell names its per-game presets after the MD5 of a disc's boot sector,
 # so recognising a disc means computing the same hash. Not a security use.
 md5 = "0.8.0"
+# Inflate with RESTART POINTS. The `block-boundary` feature is what makes
+# random access into a zipped disc image possible without unpacking it: it
+# exposes the decoder state at a deflate block boundary, which is all a
+# checkpoint needs. See src/disc_formats/deflate.rs.
+miniz_oxide = { version = "0.9", features = ["block-boundary"] }
 polling = "3.11.0"
 pretty_env_logger = "0.5.0"

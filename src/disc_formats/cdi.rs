@@ -51,11 +51,9 @@
 //! A Dreamcast header at sector 0 is kept only as a fallback, and an image that
 //! satisfies neither is refused rather than served as though it were fine.
 
-use std::cell::RefCell;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-
-use crate::disc_formats::types::DiscFormat;
+use crate::disc_formats::source::ImageSource;
+use crate::disc_formats::iso9660;
+use crate::disc_formats::types::{DiscFormat, HARDWARE_ID, check_read_len};
 
 const V2: u32 = 0x8000_0004;
 const V3: u32 = 0x8000_0005;
@@ -63,8 +61,6 @@ const V35: u32 = 0x8000_0006;
 
 /// Appears twice at the head of every track record.
 const START_MARK: [u8; 10] = [0, 0, 1, 0, 0, 0, 255, 255, 255, 255];
-
-const HARDWARE_ID: &[u8] = b"SEGA SEGAKATANA";
 
 #[derive(Debug, Clone)]
 pub struct CdiTrack {
@@ -86,7 +82,7 @@ impl CdiTrack {
 }
 
 pub struct Cdi {
-    file: RefCell<File>,
+    source: Box<dyn ImageSource>,
     tracks: Vec<CdiTrack>,
     boot: usize,
 }
@@ -158,20 +154,17 @@ fn data_offset(sector_size: u32, mode: u32) -> u32 {
 }
 
 impl Cdi {
-    pub fn new(filename: String) -> Result<Self, String> {
-        let mut file =
-            File::open(&filename).map_err(|e| format!("cannot open {filename}: {e}"))?;
-        let size = file
-            .metadata()
-            .map_err(|e| format!("cannot stat {filename}: {e}"))?
-            .len();
+    pub fn new(source: Box<dyn ImageSource>) -> Result<Self, String> {
+        let filename = source.describe();
+        let size = source.len();
         if size < 16 {
             return Err(format!("{filename} is too small to be a disc image"));
         }
 
         let mut tail = [0u8; 8];
-        file.seek(SeekFrom::End(-8)).map_err(|e| e.to_string())?;
-        file.read_exact(&mut tail).map_err(|e| e.to_string())?;
+        source
+            .read_at(size - 8, &mut tail)
+            .map_err(|e| e.to_string())?;
         let version = u32::from_le_bytes(tail[0..4].try_into().unwrap());
         let header_offset = u32::from_le_bytes(tail[4..8].try_into().unwrap()) as u64;
 
@@ -195,9 +188,9 @@ impl Cdi {
         }
 
         let mut blob = vec![0u8; (size - header_pos) as usize];
-        file.seek(SeekFrom::Start(header_pos))
+        source
+            .read_at(header_pos, &mut blob)
             .map_err(|e| e.to_string())?;
-        file.read_exact(&mut blob).map_err(|e| e.to_string())?;
 
         let tracks = parse_tracks(&blob, version)?;
         if tracks.is_empty() {
@@ -207,7 +200,7 @@ impl Cdi {
         // Which one is the game? Position is not a reliable answer and neither
         // is the Dreamcast header -- see the module docs. Ask the filesystem,
         // and only fall back to the header.
-        let boot = find_boot_track(&mut file, &tracks).ok_or_else(|| {
+        let boot = find_boot_track(source.as_ref(), &tracks).ok_or_else(|| {
             format!(
                 "no track of {filename} holds a readable ISO9660 filesystem or a \
                  Dreamcast IP.BIN header ({} track(s) parsed). The descriptor \
@@ -230,7 +223,7 @@ impl Cdi {
         }
 
         Ok(Cdi {
-            file: RefCell::new(file),
+            source,
             tracks,
             boot,
         })
@@ -238,11 +231,10 @@ impl Cdi {
 }
 
 /// Read one track-relative sector's user bytes.
-fn read_track_sector(file: &mut File, t: &CdiTrack, k: u32) -> Option<[u8; 2048]> {
+fn read_track_sector(source: &dyn ImageSource, t: &CdiTrack, k: u32) -> Option<[u8; 2048]> {
     let at = t.file_offset + (k as u64) * (t.sector_size as u64) + t.data_offset as u64;
     let mut buf = [0u8; 2048];
-    file.seek(SeekFrom::Start(at)).ok()?;
-    file.read_exact(&mut buf).ok()?;
+    source.read_at(at, &mut buf).ok()?;
     Some(buf)
 }
 
@@ -251,22 +243,21 @@ fn read_track_sector(file: &mut File, t: &CdiTrack, k: u32) -> Option<[u8; 2048]
 /// Searched from the last track backwards, because a Dreamcast boots the last
 /// session — the filesystem test is what stops that preference from picking a
 /// trailing stub session.
-fn find_boot_track(file: &mut File, tracks: &[CdiTrack]) -> Option<usize> {
+fn find_boot_track(source: &dyn ImageSource, tracks: &[CdiTrack]) -> Option<usize> {
     // Primary: a real ISO9660 volume whose root directory is in this track.
     for (i, t) in tracks.iter().enumerate().rev() {
         if t.mode == 0 {
             continue;
         }
-        let Some(pvd) = read_track_sector(file, t, 16) else {
+        let Some(pvd) = read_track_sector(source, t, 16) else {
             continue;
         };
-        // Primary volume descriptor: type 1, identifier "CD001".
-        if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        if !iso9660::is_pvd(&pvd) {
             continue;
         }
-        // The root directory record sits at offset 156; its extent LBA is a
-        // both-endian pair whose little-endian half starts at +2.
-        let root_lba = u32::from_le_bytes(pvd[158..162].try_into().unwrap());
+        let Some(root_lba) = iso9660::root_extent_lba(&pvd) else {
+            continue;
+        };
         if root_lba >= t.start_lba && root_lba < t.start_lba.saturating_add(t.length) {
             return Some(i);
         }
@@ -276,7 +267,7 @@ fn find_boot_track(file: &mut File, tracks: &[CdiTrack]) -> Option<usize> {
         if t.mode == 0 {
             continue;
         }
-        if let Some(s) = read_track_sector(file, t, 0)
+        if let Some(s) = read_track_sector(source, t, 0)
             && s.starts_with(HARDWARE_ID)
         {
             return Some(i);
@@ -358,9 +349,48 @@ impl DiscFormat for Cdi {
         lba: u32,
         num_sectors: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if num_sectors == 0 {
+            return Ok(vec![]);
+        }
+        // BEFORE the allocation: `num_sectors` is what the title's syscall
+        // asked for, and the loop below only discovers that an LBA is in no
+        // track after `out` has been sized for it.
+        check_read_len(num_sectors)?;
+        let last = lba.saturating_add(num_sectors - 1);
+        let track = self
+            .tracks
+            .iter()
+            .find(|t| t.contains(lba))
+            .ok_or_else(|| format!("LBA {lba} is in no track of this CDI"))?;
         let mut out = vec![0u8; (num_sectors as usize) * 2048];
-        let mut file = self.file.borrow_mut();
 
+        // Only the user bytes are read: `data_offset` steps over the
+        // sync/subheader in front of them, and the ECC behind them is of no
+        // interest.
+        let at = |want: u32, t: &CdiTrack| {
+            t.file_offset
+                + ((want - t.start_lba) as u64) * (t.sector_size as u64)
+                + t.data_offset as u64
+        };
+
+        if track.contains(last) {
+            // The whole request is inside one track, which is the case for
+            // every read a title actually makes. On a 2048-byte Mode 1 track
+            // the sectors are then contiguous in the file and the request is
+            // ONE read -- a 128-sector read used to be 128 positioned reads
+            // and 128 scans of the track list, with the console frozen.
+            if track.sector_size == 2048 && track.data_offset == 0 {
+                self.source.read_at(at(lba, track), &mut out)?;
+                return Ok(out);
+            }
+            for (i, chunk) in out.chunks_mut(2048).enumerate() {
+                self.source.read_at(at(lba + i as u32, track), chunk)?;
+            }
+            return Ok(out);
+        }
+
+        // Spanning two tracks: rare enough to be worth no cleverness, and the
+        // per-sector lookup is what names the LBA that is in none of them.
         for (i, chunk) in out.chunks_mut(2048).enumerate() {
             let want = lba.saturating_add(i as u32);
             let track = self
@@ -368,19 +398,7 @@ impl DiscFormat for Cdi {
                 .iter()
                 .find(|t| t.contains(want))
                 .ok_or_else(|| format!("LBA {want} is in no track of this CDI"))?;
-
-            let at = track.file_offset
-                + ((want - track.start_lba) as u64) * (track.sector_size as u64)
-                + track.data_offset as u64;
-            file.seek(SeekFrom::Start(at))?;
-
-            if track.sector_size == 2048 {
-                file.read_exact(chunk)?;
-            } else {
-                // Read only the user bytes: the seek above already skipped the
-                // sync/subheader, and the ECC after them is of no interest.
-                file.read_exact(chunk)?;
-            }
+            self.source.read_at(at(want, track), chunk)?;
         }
         Ok(out)
     }

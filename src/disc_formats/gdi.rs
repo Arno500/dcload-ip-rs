@@ -1,59 +1,76 @@
 use std::cell::RefCell;
-use std::fs::{File, read_to_string};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::disc_formats::types::{DiscFormat, Track};
+use crate::disc_formats::source::{Container, DirContainer, ImageSource};
+use crate::disc_formats::types::{DiscFormat, Track, check_read_len};
+
 pub struct Gdi {
     tracks: RefCell<Vec<Track>>,
+    /// Where the track files come from. A `.gdi` is a text file that NAMES its
+    /// tracks, so opening one means opening its siblings -- and "sibling" is a
+    /// directory for a loose dump and a prefix inside the archive for a zipped
+    /// one. That is the only difference between the two cases.
+    container: Box<dyn Container>,
 }
 
 impl Gdi {
-    pub fn new(filename: String) -> Result<Self, std::io::Error> {
-        let parent_path = Path::new(&filename).parent().unwrap_or(Path::new(""));
-        match read_to_string(&filename) {
-            Err(e) => Err(e),
-            Ok(f) => {
-                let mut lines = f.lines();
-                let number_of_tracks = lines.next();
-                if let Some(num_tracks) = number_of_tracks {
-                    let num_tracks: usize = num_tracks.trim().parse().unwrap_or(0);
-                    let mut tracks = Vec::with_capacity(num_tracks);
-                    for _ in 0..num_tracks {
-                        if let Some(line) = lines.next() {
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.len() >= 6 {
-                                let track_number: u8 = parts[0].parse().unwrap_or(0);
-                                let start_lba = parts[1].parse().unwrap_or(0);
-                                let track_type: u8 = parts[2].parse().unwrap_or(0);
-                                let sector_size: u32 = parts[3].parse().unwrap_or(2048);
-                                let track = Path::join(parent_path, parts[4])
-                                    .to_string_lossy()
-                                    .into();
-                                let offset: u32 = parts[5].parse().unwrap_or(0);
-                                tracks.push(Track {
-                                    track_number,
-                                    start_lba,
-                                    track_type,
-                                    sector_size,
-                                    track,
-                                    offset,
-                                    file: None,
-                                });
-                            }
-                        }
-                    }
-                    Ok(Gdi {
-                        tracks: RefCell::new(tracks),
-                    })
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid GDI file: missing number of tracks",
-                    ))
+    /// A `.gdi` sitting in a directory, with its tracks next to it.
+    pub fn open_path(filename: &str) -> Result<Self, std::io::Error> {
+        let path = Path::new(filename);
+        let parent = path.parent().unwrap_or(Path::new(""));
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| filename.to_string());
+        Self::new(Box::new(DirContainer::new(PathBuf::from(parent))), &name)
+    }
+
+    pub fn new(container: Box<dyn Container>, name: &str) -> Result<Self, std::io::Error> {
+        let text = container.read_text(name)?;
+        let mut lines = text.lines();
+        let Some(num_tracks) = lines.next() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid GDI file: missing number of tracks",
+            ));
+        };
+        let num_tracks: usize = num_tracks.trim().parse().unwrap_or(0);
+        let mut tracks = Vec::with_capacity(num_tracks);
+        for _ in 0..num_tracks {
+            if let Some(line) = lines.next() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 6 {
+                    let track_number: u8 = parts[0].parse().unwrap_or(0);
+                    let start_lba = parts[1].parse().unwrap_or(0);
+                    let track_type: u8 = parts[2].parse().unwrap_or(0);
+                    let sector_size: u32 = parts[3].parse().unwrap_or(2048);
+                    let offset: u32 = parts[5].parse().unwrap_or(0);
+                    tracks.push(Track {
+                        track_number,
+                        start_lba,
+                        track_type,
+                        sector_size,
+                        track: parts[4].to_string(),
+                        offset,
+                        source: None,
+                    });
                 }
             }
         }
+        Ok(Gdi {
+            tracks: RefCell::new(tracks),
+            container,
+        })
+    }
+
+    /// The logical start of the lowest or highest data track. `start_sector`
+    /// and `boot_sector` are this same walk with `min` and `max`.
+    fn data_track_edge(&self, highest: bool) -> u32 {
+        let tracks = self.tracks.borrow();
+        let starts = tracks.iter().filter(|t| t.track_type == 4).map(|t| t.start_lba);
+        if highest { starts.max() } else { starts.min() }
+            .unwrap_or(0)
+            .saturating_add(150)
     }
 }
 impl DiscFormat for Gdi {
@@ -62,13 +79,26 @@ impl DiscFormat for Gdi {
         lba: u32,
         num_sectors: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Before the allocation, not after it: `num_sectors` is whatever the
+        // title's syscall asked for. See `types::MAX_READ_SECTORS`.
+        check_read_len(num_sectors)?;
+        if num_sectors == 0 {
+            return Ok(vec![]);
+        }
         let mut tracks = self.tracks.borrow_mut();
-        let mut buffer = vec![0_u8; (num_sectors * 2048).try_into()?];
-        for (sector_idx, chunk) in buffer.chunks_mut(2048).enumerate() {
-            let req_lba = lba.saturating_add(sector_idx as u32);
+        let mut buffer = vec![0_u8; (num_sectors as usize) * 2048];
 
-            // Pick the most recent data track whose logical start is <= requested LBA.
-            let data_track_index = tracks
+        // Sector by sector only where the format forces it. A request lands in
+        // one track and, on a 2048-byte track, in one contiguous run of bytes
+        // -- so it is ONE read. The old loop resolved the track and issued a
+        // 2048-byte read per sector: 128 of each for a 128-sector request,
+        // with the console frozen for all of them.
+        let mut done = 0usize;
+        while done < num_sectors as usize {
+            let req_lba = lba.saturating_add(done as u32);
+
+            // The most recent data track whose logical start is <= requested LBA.
+            let idx = tracks
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| t.track_type == 4 && t.start_lba.saturating_add(150) <= req_lba)
@@ -76,33 +106,38 @@ impl DiscFormat for Gdi {
                 .map(|(i, _)| i)
                 .ok_or_else(|| format!("No data track found for LBA 0x{req_lba:08x}"))?;
 
-            let current_track = &mut tracks[data_track_index];
-            if current_track.file.is_none() {
-                current_track.file = Some(File::open(current_track.track.clone())?);
+            if tracks[idx].source.is_none() {
+                // Name the container, not just the track: "track03.bin is
+                // missing" is a very different problem next to a loose .gdi
+                // than it is inside an archive that was supposed to be
+                // self-contained.
+                let opened = self.container.open(&tracks[idx].track).map_err(|e| {
+                    format!(
+                        "cannot open track '{}' in {}: {e}",
+                        tracks[idx].track,
+                        self.container.describe()
+                    )
+                })?;
+                tracks[idx].source = Some(opened);
             }
 
-            let logical_track_start = current_track.start_lba.saturating_add(150);
-            let in_track_lba = req_lba.checked_sub(logical_track_start).ok_or_else(|| {
-                format!(
-                    "Requested LBA 0x{req_lba:08x} is before logical data track start 0x{logical_track_start:08x}"
-                )
-            })?;
+            // Where this track stops being the answer: the next data track's
+            // start, if there is one.
+            let track_start = tracks[idx].start_lba.saturating_add(150);
+            let next_start = tracks
+                .iter()
+                .filter(|t| t.track_type == 4 && t.start_lba.saturating_add(150) > track_start)
+                .map(|t| t.start_lba.saturating_add(150))
+                .min();
+            let left = num_sectors as usize - done;
+            let run = match next_start {
+                Some(n) => left.min((n - req_lba) as usize),
+                None => left,
+            };
 
-            let file = current_track.file.as_mut().unwrap();
-            file.seek(SeekFrom::Start(
-                (current_track.offset as u64)
-                    + (in_track_lba as u64) * (current_track.sector_size as u64),
-            ))?;
-
-            if current_track.sector_size == 2048 {
-                file.read_exact(chunk)?;
-                continue;
-            }
-
-            let mut raw_sector = vec![0_u8; current_track.sector_size as usize];
-            file.read_exact(&mut raw_sector)?;
-
-            let payload_offset: usize = match current_track.sector_size {
+            let track = &tracks[idx];
+            let payload_offset: u64 = match track.sector_size {
+                2048 => 0,
                 // dc-virtcd-compatible secskip for packed formats.
                 2056 | 2336 => 8,
                 // Keep raw extraction deterministic for compatibility:
@@ -110,90 +145,89 @@ impl DiscFormat for Gdi {
                 2352 | 2448 => 16,
                 s => return Err(format!("Unsupported GDI sector size: {}", s).into()),
             };
-
-            let payload_end = payload_offset + 2048;
-            if payload_end > raw_sector.len() {
-                return Err(
-                    format!(
-                        "Raw sector too small for payload extraction: {} bytes (offset {})",
-                        raw_sector.len(),
-                        payload_offset
-                    )
-                    .into(),
-                );
+            if payload_offset + 2048 > track.sector_size as u64 {
+                return Err(format!(
+                    "Raw sector too small for payload extraction: {} bytes (offset {})",
+                    track.sector_size, payload_offset
+                )
+                .into());
             }
-            chunk.copy_from_slice(&raw_sector[payload_offset..payload_end]);
+
+            let in_track_lba = req_lba.checked_sub(track_start).ok_or_else(|| {
+                format!(
+                    "Requested LBA 0x{req_lba:08x} is before logical data track start 0x{track_start:08x}"
+                )
+            })?;
+            let at = (track.offset as u64) + (in_track_lba as u64) * (track.sector_size as u64);
+            let source = track.source.as_ref().unwrap();
+            let out = &mut buffer[done * 2048..(done + run) * 2048];
+
+            if track.sector_size == 2048 {
+                source.read_at(at, out)?;
+            } else {
+                // Only the user bytes are read: the sync/subheader in front of
+                // them is skipped by the seek and the ECC behind them is of no
+                // interest -- so a raw track is still one read per sector.
+                for (i, chunk) in out.chunks_mut(2048).enumerate() {
+                    let sector_at = at + (i as u64) * (track.sector_size as u64);
+                    source.read_at(sector_at + payload_offset, chunk)?;
+                }
+            }
+            done += run;
         }
         Ok(buffer)
     }
 
     fn start_sector(&self) -> u32 {
-        let tracks = self.tracks.borrow();
-        tracks
-            .iter()
-            .filter(|t| t.track_type == 4)
-            .map(|t| t.start_lba)
-            .min()
-            .unwrap_or(0)
-            .saturating_add(150)
+        self.data_track_edge(false)
     }
 
     /// The HIGHEST-LBA data track, i.e. the high-density area -- the mirror of
-    /// `start_sector()`'s `min`. See the trait for why the two differ.
+    /// `start_sector()`'s lowest. See the trait for why the two differ.
     fn boot_sector(&self) -> u32 {
-        let tracks = self.tracks.borrow();
-        tracks
-            .iter()
-            .filter(|t| t.track_type == 4)
-            .map(|t| t.start_lba)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(150)
+        self.data_track_edge(true)
     }
 
+    /// The lead-in the reader adds to every track start, and that the disc's
+    /// own filesystem does not count. See the trait.
+    fn fs_lba(&self, iso_lba: u32) -> u32 {
+        iso_lba + 150
+    }
+
+    /// Where the lead-out is: the end of the LAST data track, measured from the
+    /// start of the first.
+    ///
+    /// Only the last track is opened. It is the only one whose end can be the
+    /// lead-out -- the tracks are in LBA order and the ones in front of it end
+    /// where the next one begins -- and opening the others would cost a full
+    /// deflate index build on a zipped dump for the low-density track nobody
+    /// reads, which is exactly what `Track::source` is lazy to avoid. This runs
+    /// inside the TOC syscall, with the title frozen (AGENTS.md 16).
     fn num_sectors(&self) -> u32 {
+        let first_start = self.start_sector();
+        let last_start = self.boot_sector();
         let mut tracks = self.tracks.borrow_mut();
-        let data_track_indices: Vec<usize> = tracks
+        let Some(last) = tracks
             .iter()
-            .enumerate()
-            .filter(|(_, t)| t.track_type == 4)
-            .map(|(i, _)| i)
-            .collect();
-
-        if data_track_indices.is_empty() {
+            .position(|t| t.track_type == 4 && t.start_lba.saturating_add(150) == last_start)
+        else {
             return 0;
+        };
+
+        let t = &mut tracks[last];
+        if t.source.is_none()
+            && let Ok(s) = self.container.open(&t.track)
+        {
+            t.source = Some(s);
         }
-
-        let first_start = data_track_indices
-            .iter()
-            .map(|i| tracks[*i].start_lba.saturating_add(150))
-            .min()
-            .unwrap_or(0);
-
-        let mut leadout = first_start;
-        for idx in data_track_indices {
-            let t = &mut tracks[idx];
-            if t.file.is_none()
-                && let Ok(f) = File::open(t.track.clone())
-            {
-                t.file = Some(f);
-            }
-            if let Some(f) = t.file.as_ref()
-                && let Ok(meta) = f.metadata()
-            {
-                let track_data_len = meta.len().saturating_sub(t.offset as u64);
-                let track_sectors = (track_data_len / (t.sector_size as u64)) as u32;
-                let track_end = t
-                    .start_lba
-                    .saturating_add(150)
-                    .saturating_add(track_sectors);
-                if track_end > leadout {
-                    leadout = track_end;
-                }
-            }
-        }
-
-        leadout.saturating_sub(first_start)
+        let Some(s) = t.source.as_ref() else {
+            return 0;
+        };
+        let bytes = s.len().saturating_sub(t.offset as u64);
+        let track_sectors = (bytes / (t.sector_size as u64)) as u32;
+        last_start
+            .saturating_add(track_sectors)
+            .saturating_sub(first_start)
     }
 }
 
@@ -207,7 +241,9 @@ mod tests {
     /// without the dumps.
     fn sa_gdi() -> Option<Gdi> {
         let p = "test/Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi";
-        std::path::Path::new(p).exists().then(|| Gdi::new(p.to_string()).expect("parse gdi"))
+        std::path::Path::new(p)
+            .exists()
+            .then(|| Gdi::open_path(p).expect("parse gdi"))
     }
 
     /// THE BUG THIS LOCKS DOWN. `start_sector()` is the LOWEST data track and
@@ -245,6 +281,22 @@ mod tests {
         // And the guard load_ip_bin() actually uses.
         assert_eq!(&low[0x0cb0..0x0cb4], &[0, 0, 0, 0], "low: no patch site");
         assert_eq!(&high[0x0cb0..0x0cb4], &[0x03, 0x63, 0x00, 0x40], "high: stock");
+    }
+
+    /// The lead-out is the end of the LAST data track, and only that track is
+    /// opened to find it.
+    ///
+    /// This runs inside the TOC syscall with the title frozen, so opening the
+    /// low-density track as well -- which on a zipped dump means a full inflate
+    /// and index build for bytes nobody reads -- is not a small waste.
+    #[test]
+    fn the_lead_out_comes_from_the_last_data_track_alone() {
+        let Some(gdi) = sa_gdi() else { return };
+        let len = std::fs::metadata("test/track03.bin").expect("track03").len();
+        // 45000 (+150 lead-in) + its own sectors, measured from the first data
+        // track's start at 0 (+150).
+        let want = 45150 + (len / 2352) as u32 - 150;
+        assert_eq!(gdi.num_sectors(), want);
     }
 
     /// isoldr's `Load_IPBin()` patch offsets, worked out from its pointer

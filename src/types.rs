@@ -1,5 +1,11 @@
 use std::{error, fmt};
 
+/// A Dreamcast has 16 MiB of RAM, and every size limit in this program is that
+/// same fact: the most `upload_bytes` will send, and the largest file the
+/// ISO9660 reader will pull out of an image. Stated once so raising one cannot
+/// leave the other refusing.
+pub const DREAMCAST_RAM_BYTES: u64 = 16 * 1024 * 1024;
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct DCLoadDirEnt {
