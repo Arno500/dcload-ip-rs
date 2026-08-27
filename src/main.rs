@@ -15,6 +15,7 @@ mod disc_formats;
 mod dispatch;
 mod io;
 mod loaders;
+mod memmap;
 mod presets;
 mod types;
 mod ui;
@@ -108,6 +109,10 @@ struct Args {
     /// "the probe fired" and "the probe was never reached" are the same dead
     /// console. This path belongs to the loader, needs no vector table, and
     /// says so in the log. The stub destroys 28 bytes at ADDR and parks there.
+    /// Where to read and write the learned memory map (game-memory.tsv)
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    memory_db: Option<String>,
+
     #[arg(long, value_parser = parse_probe)]
     probe: Vec<(u32, u8, Option<u32>)>,
 
@@ -271,6 +276,99 @@ fn parse_patch(s: &str) -> Result<(u32, u32), String> {
 /// Returns `None` when there is no reason to move: no disc, no database, no
 /// match. The caller keeps the running loader in that case, which is the stock
 /// 0x8c004000 and is what every title got before any of this existed.
+/// Where to put the loader when the preset's own address is one the title
+/// addresses. `None` means there is nowhere better.
+///
+/// One function, called by `uexec` and by `identify`, because the whole value
+/// of the offline report is that it says what a run would actually do.
+fn pick_clear_base(
+    loaders: &loaders::LoaderSet,
+    boot: &[u8],
+    address: u32,
+    wanted: u32,
+    seen: Option<&memmap::MemoryMap>,
+) -> Option<u32> {
+    // WHAT THE TITLE HAS BEEN SEEN USING BEATS WHAT IT MENTIONS.
+    //
+    // The constant scan is a guess about an allocator and misses every failure
+    // measured so far; `game-memory.tsv` is where reads actually landed, in
+    // earlier sessions of this same game. Tried with a margin first, because
+    // 0x8cfd0000 overlapped nothing and still froze 41 KB from the textures,
+    // then without, then not at all -- a rich map must narrow the choice, never
+    // empty it.
+    for margin in [0x4_0000u32, 0] {
+        let strict = |b: u32| {
+            dispatch::literals_in_loader_footprint(boot, address, b).is_empty()
+                && seen.is_none_or(|m| !m.hits(b, loaders::LOADER_SPAN, margin))
+        };
+        if let Some(found) = choose(loaders, wanted, &strict) {
+            if margin == 0 {
+                warn!(
+                    "0x{found:08x} is clear of where this title's reads have landed, but only \
+                     just -- no base was clear of them with room to spare"
+                );
+            }
+            return Some(found);
+        }
+    }
+    if let Some(m) = seen.filter(|m| !m.is_empty()) {
+        warn!(
+            "every base this host can offer is inside RAM this title has been seen using \
+             ({} of 256 blocks of 64 KB); falling back to constants alone, and the result \
+             is a guess",
+            m.blocks_marked()
+        );
+    }
+    let is_clear = |b: u32| dispatch::literals_in_loader_footprint(boot, address, b).is_empty();
+    choose(loaders, wanted, &is_clear)
+}
+
+/// The pre-built set first, then relocation -- for whatever "clear" means to
+/// the caller.
+fn choose(
+    loaders: &loaders::LoaderSet,
+    wanted: u32,
+    is_clear: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
+
+    // THE PRE-BUILT SET FIRST. Relocation answers what it cannot.
+    //
+    // Three measurements on Sonic Adventure 2, whose preset is 0x8cfe8000,
+    // settle this — and the middle one is why "nearest to the preset" is NOT
+    // the rule, though it was for an afternoon:
+    //
+    //   0x8cef8000  the game and its Kart mode both run
+    //   0x8cfd0000  freezes loading COURSE.PVM, the Kart's track textures,
+    //               which it decompresses into ~0x8cfc0000..0x8cfc6000 —
+    //               41 KB under that base
+    //   0x8ce00000  Kart is a black screen; it streams KART.ADX into
+    //               0x8ce3a920, 182 KB above that base
+    //
+    // Being near the preset is worth nothing on its own: DreamShell picked
+    // 0x8cfe8000 for isoldr, whose network build is 13 KB and fits the 32 KB
+    // hole between the title's texture buffers and its Maple DMA list. Ours
+    // needs 56 KB and does not fit that hole at all, so "just below the preset"
+    // lands in the texture buffers and "well below" lands in the audio heap.
+    // 0x8cef8000 works because it is in neither — and the only reason anyone
+    // knows that is that someone ran it.
+    //
+    // So a base someone linked and ran outranks one this pass merely believes
+    // in, and the constant scan's blind spot is exactly why: it sees addresses
+    // a title NAMES, and every failure above was an allocator, which names
+    // none. `receive_syscalls` reports how close reads actually come, which is
+    // the evidence this choice cannot have in advance.
+    let clear: Vec<u32> = loaders.available().into_iter().filter(|&b| is_clear(b)).collect();
+    if let Some(built) = loaders::nearest_clear_base(wanted, &clear) {
+        return Some(built);
+    }
+    loaders
+        .relocatable()
+        .is_some()
+        .then(|| loaders::search_free_base(wanted, is_clear))
+        .flatten()
+        .filter(|&b| b != wanted)
+}
+
 fn wanted_loader_base(
     args: &Args,
     disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
@@ -374,7 +472,141 @@ fn wanted_loader_base(
         warn!("'{}': not honoured -- {}", preset.title, note);
     }
 
-    Some(preset.memory)
+    // A PRESET CAN ASK FOR A BASE THE TITLE ITSELF WRITES TO.
+    //
+    // DreamShell's addresses are chosen for isoldr, whose network build is
+    // 13 KB; ours reserves 0xe000 from the base for image, stack, packet
+    // buffers and Maple buffer, so a base that leaves isoldr room can leave us
+    // none. Sonic Adventure 2 is the measured case: preset 0x8cfe8000, and its
+    // own Maple DMA list at 0x8cff0000, which is our stack. The console then
+    // goes quiet with nothing logged at either end -- the DMA is written by the
+    // hardware, so neither dcload nor this host is in the path (AGENTS.md 4.12
+    // has the other cause with the same silence). 0x8cef8000 runs it perfectly.
+    //
+    // Checked here, from the disc's own boot binary, because this is the last
+    // moment the base can still be changed: the relocation happens before the
+    // title is uploaded. It re-reads the boot binary that `resolve_payload`
+    // will read again -- a megabyte or two, against a session that would end in
+    // a black screen with no way to tell why.
+    let boot = match disc_formats::boot::extract(disc, args.descramble.into()) {
+        Ok(b) => b.bytes,
+        Err(e) => {
+            // Not fatal, and not silent: the base stands, and if it does
+            // collide this line is the only warning there will ever be.
+            warn!(
+                "could not read the boot binary to check it against the loader's \
+                 address ({e}); using 0x{:08x} unchecked",
+                preset.memory
+            );
+            return Some(preset.memory);
+        }
+    };
+    let hits = dispatch::literals_in_loader_footprint(&boot, args.address, preset.memory);
+
+    // WHICH ADDRESSES WERE ON THE TABLE, not just the one that won. Measured
+    // 2026-08-27: a run picked 0x8ce00000 when the policy says 0x8cef8000,
+    // because the loader set it was reading did not have the latter -- and the
+    // log gave no way to tell. The set is deployed by hand (AGENTS.md 16), so
+    // "which loaders were actually there" is a real question with a silent
+    // wrong answer.
+    info!(
+        "loader candidates in {}: {}",
+        loaders.dir().display(),
+        if loaders.available().is_empty() {
+            "none".to_string()
+        } else {
+            loaders
+                .available()
+                .iter()
+                .map(|b| format!("0x{b:08x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    let memory_path = memory_db_path(args, &loaders);
+    let seen_db = memmap::MemoryDb::load(&memory_path);
+    let seen = seen_db.get(&identity.md5).map(|r| r.map);
+    match seen.as_ref() {
+        Some(m) => info!(
+            "memory map: this title has been seen using {} of 256 blocks of RAM ({}, {} games)",
+            m.blocks_marked(),
+            memory_path.display(),
+            seen_db.len()
+        ),
+        None => info!(
+            "memory map: nothing recorded for this game yet ({}, {} games); \
+             this session will start one",
+            memory_path.display(),
+            seen_db.len()
+        ),
+    }
+    // THE PRESET IS THE ANSWER UNLESS SOMETHING SAYS OTHERWISE, and there are
+    // exactly two things that can: what the title NAMES (constants in its
+    // binary) and where its reads have LANDED (the learned map). DreamShell's
+    // address is isoldr's own answer for this game and is right far more often
+    // than any rule of ours -- it is only wrong when our 0xe000 does not fit
+    // where isoldr's 13 KB did.
+    //
+    // The map is consulted for the preset itself, not just for the
+    // alternatives. It used to be checked only after the constant scan had
+    // already rejected the preset, which meant a game whose map said "the
+    // preset is in the middle of my texture buffers" was sent there anyway --
+    // the one case where the map has something to say and nothing to say it
+    // about.
+    let seen_hits_preset = seen
+        .as_ref()
+        .is_some_and(|m| m.hits(preset.memory, loaders::LOADER_SPAN, 0x4_0000));
+    if hits.is_empty() && !seen_hits_preset {
+        return Some(preset.memory);
+    }
+    if hits.is_empty() {
+        warn!(
+            "'{}' has been seen using RAM within 256 KB of 0x{:08x}, the address its preset \
+             asks for, though nothing in its binary names it. Looking for somewhere else.",
+            preset.title, preset.memory
+        );
+    }
+    match pick_clear_base(&loaders, &boot, args.address, preset.memory, seen.as_ref()) {
+        Some(alt) => {
+            if hits.is_empty() {
+                warn!(
+                    "'{}': using 0x{alt:08x} instead of the preset's 0x{:08x}, which this \
+                     title's own memory map rules out; pin it with --loader-base to override.",
+                    preset.title, preset.memory
+                );
+            } else {
+                warn!(
+                    "'{}' addresses RAM the loader would occupy at 0x{:08x}: {} constant(s) \
+                     point inside it, the first at 0x{:08x} (loaded at 0x{:08x}). A write \
+                     there -- and a Maple DMA list is filled by the hardware itself -- \
+                     overwrites the loader with no syscall, no packet and no exception. \
+                     Using 0x{alt:08x} instead; pin it with --loader-base to override.",
+                    preset.title,
+                    preset.memory,
+                    hits.len(),
+                    hits[0].0,
+                    hits[0].1,
+                );
+            }
+            Some(alt)
+        }
+        None => {
+            error!(
+                "'{}': 0x{:08x} is ruled out ({} constant(s) point into it{}), and nothing \
+                 clear of it can be produced. Going ahead there anyway: if the console goes \
+                 silent with nothing logged, this is why.",
+                preset.title,
+                preset.memory,
+                hits.len(),
+                if seen_hits_preset {
+                    ", and its reads have landed nearby"
+                } else {
+                    ""
+                },
+            );
+            Some(preset.memory)
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -439,6 +671,22 @@ enum Commands {
         #[arg(value_hint = clap::ValueHint::FilePath)]
         disc: String,
     },
+    /// Move a relocatable loader ELF to another base and write it out.
+    ///
+    /// The same relocation `uexec` performs in memory, exposed so it can be
+    /// inspected, diffed against a native build, or kept. Needs no Dreamcast
+    /// and no SH toolchain.
+    Relocate {
+        /// The loader to move (loaders/dcload-relocatable.elf)
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        elf: String,
+        /// Base to move it to, e.g. 0x8cef8000
+        #[arg(value_parser = maybe_hex::<u32>)]
+        to: u32,
+        /// Where to write the result
+        #[arg(short, long, value_hint = clap::ValueHint::FilePath)]
+        output: String,
+    },
 }
 
 /// `identify`: everything the loader-placement pass would work out, printed.
@@ -461,7 +709,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     println!("product  : {} {}", identity.product, identity.version);
     println!("region   : {}", identity.region);
     println!("boot md5 : {}", identity.md5);
-    match disc_formats::boot::extract(reader.as_ref(), args.descramble.into()) {
+    let boot_bytes = match disc_formats::boot::extract(reader.as_ref(), args.descramble.into()) {
         Ok(b) => {
             println!(
                 "boot bin : {} ({} bytes at LBA {}){}",
@@ -475,11 +723,81 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 }
             );
             println!("bin md5  : {:x}", md5::compute(&b.bytes));
+            Some(b.bytes)
         }
-        Err(e) => println!("boot bin : NOT FOUND -- {e}"),
-    }
+        Err(e) => {
+            println!("boot bin : NOT FOUND -- {e}");
+            None
+        }
+    };
 
     let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
+
+    // Does the title address the RAM the loader would be sitting in? Answered
+    // HERE because it needs no console: a collision found offline costs one
+    // command, and the same collision found on hardware costs a session that
+    // ends with a black screen and nothing logged (see
+    // `literals_in_loader_footprint`).
+    // The same memory `uexec` would consult, so the offline report answers with
+    // what a run would actually pick.
+    let seen_db = memmap::MemoryDb::load(&memory_db_path(args, &loaders));
+    let seen = seen_db.get(&identity.md5).map(|r| r.map);
+    match seen.as_ref() {
+        Some(m) => println!(
+            "seen     : {} of 256 blocks of 64 KB used in earlier sessions \
+             (of {} games recorded)",
+            m.blocks_marked(),
+            seen_db.len()
+        ),
+        None => println!(
+            "seen     : nothing recorded for this game yet (of {} games recorded)",
+            seen_db.len()
+        ),
+    }
+    let report_collisions = |base: u32| {
+        let Some(bytes) = boot_bytes.as_deref() else {
+            return;
+        };
+        let hits = dispatch::literals_in_loader_footprint(bytes, args.address, base);
+        let where_ = loaders::live_footprint(base)
+            .iter()
+            .map(|(lo, hi)| format!("0x{lo:08x}..0x{hi:08x}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        if hits.is_empty() {
+            println!("overlap  : none -- nothing the title loads points into {where_}");
+            return;
+        }
+        println!(
+            "overlap  : {} CONSTANT(S) POINT INTO THE LOADER at {where_}",
+            hits.len()
+        );
+        for (at, site) in hits.iter().take(8) {
+            println!("           0x{at:08x} loaded at 0x{site:08x}");
+        }
+        println!(
+            "           If the title writes there the loader is overwritten -- and a \
+             Maple DMA does it with no syscall, no packet and no exception."
+        );
+        // The same policy `uexec` applies, out of the same function, so this
+        // cannot drift from what a run would actually do. The answer is what
+        // the reader actually needs; without it "pick another base" is an
+        // invitation to guess, and a guess costs a session per attempt.
+        match pick_clear_base(&loaders, bytes, args.address, base, seen.as_ref()) {
+            Some(alt) => println!(
+                "           uexec would use 0x{alt:08x} instead ({}).",
+                if loaders.has(alt) {
+                    "a loader built for that address".to_string()
+                } else {
+                    format!("relocating {} there -- no rebuild", loaders::RELOCATABLE_NAME)
+                }
+            ),
+            None => println!(
+                "           Nowhere clear of it, so uexec would go ahead here. Note this \
+                 only sees constants: a heap that grows into the loader has none."
+            ),
+        }
+    };
     let (db_path, db_searched) = game_db_path(args, &loaders);
     match presets::PresetDb::load(&db_path) {
         Err(e) => println!(
@@ -488,11 +806,14 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             db_searched
         ),
         Ok(db) => match db.lookup(&identity) {
-            None => println!(
-                "preset   : not in the database ({} rows); would stay at 0x{:08x}",
-                db.len(),
-                loaders::DEFAULT_BASE
-            ),
+            None => {
+                println!(
+                    "preset   : not in the database ({} rows); would stay at 0x{:08x}",
+                    db.len(),
+                    loaders::DEFAULT_BASE
+                );
+                report_collisions(loaders::DEFAULT_BASE);
+            }
             Some((p, kind)) => {
                 let how = match kind {
                     presets::MatchKind::BootSectorMd5 => "exact (boot-sector md5)".to_string(),
@@ -525,6 +846,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 for note in p.unsupported() {
                     println!("not done : {note}");
                 }
+                report_collisions(p.memory);
             }
         },
     }
@@ -620,6 +942,32 @@ fn game_db_path(args: &Args, loaders: &loaders::LoaderSet) -> (std::path::PathBu
     (chosen, searched)
 }
 
+/// Where the learned memory map is read from and written back to.
+fn memory_db_path(args: &Args, loaders: &loaders::LoaderSet) -> std::path::PathBuf {
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    let candidates = loaders::memory_db_candidates(
+        args.memory_db.clone(),
+        std::env::var("DCLOAD_MEMORY_DB").ok(),
+        loaders.dir(),
+        exe.as_deref(),
+        cwd.as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    if let Some(found) = candidates.iter().find(|p| p.is_file()) {
+        return found.clone();
+    }
+    // Nothing yet, so this run creates it -- BESIDE THE PRESET DATABASE, not in
+    // whichever directory happened to be searched first. The two are read
+    // together, shipped together and committed together; a memory map that
+    // lands somewhere else is one the next deployment does not carry.
+    let (presets, _) = game_db_path(args, loaders);
+    if let Some(dir) = presets.parent().filter(|d| d.is_dir()) {
+        return dir.join("game-memory.tsv");
+    }
+    candidates[0].clone()
+}
+
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
     // Logging goes through the progress display (see `ui`), so that a log
@@ -628,6 +976,36 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Before the socket: these never talk to a Dreamcast.
     if let Commands::Identify { ref disc } = args.command {
         return Ok(identify_only(&args, disc));
+    }
+    if let Commands::Relocate {
+        ref elf,
+        to,
+        ref output,
+    } = args.command
+    {
+        let bytes = match std::fs::read(elf) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("cannot read {elf}: {e}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        return Ok(match loaders::relocate(&bytes, to) {
+            Ok(moved) => match std::fs::write(output, &moved) {
+                Ok(()) => {
+                    println!("{elf} -> {output}, based at 0x{to:08x} ({} bytes)", moved.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    error!("cannot write {output}: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                error!("cannot relocate {elf}: {e}");
+                ExitCode::FAILURE
+            }
+        });
     }
     if let Commands::Extract {
         ref disc,
@@ -798,11 +1176,50 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         warn!("--boot-ipbin needs a disc image; entering 0x{addr:08x} directly");
                     }
                 }
+                // SAID BEFORE THE TITLE STARTS, WHILE THE BASE CAN STILL
+                // BE CHANGED -- because once it is running, nothing can say it.
+                // A title that writes over the loader ends the session in
+                // silence, and when it does it by DMA (Maple above all) not one
+                // byte passes through dcload or through this host. The check is
+                // one pass over the image for constants naming RAM the loader
+                // occupies, kept honest by requiring an instruction to actually
+                // load them.
+                if let Some(base) = running_base {
+                    let hits =
+                        dispatch::literals_in_loader_footprint(&payload, args.address, base);
+                    if !hits.is_empty() {
+                        error!(
+                            "THIS TITLE ADDRESSES RAM THE LOADER IS SITTING IN. The loader at \
+                             0x{base:08x} occupies {}, and the title loads {} constant(s) \
+                             pointing inside it. If it writes there -- and a Maple DMA list is \
+                             filled by the hardware itself -- the loader is overwritten with no \
+                             syscall, no packet and no exception: black screen, no further disc \
+                             reads, nothing logged at either end. Try another base with \
+                             --loader-base.",
+                            crate::loaders::live_footprint(base)
+                                .iter()
+                                .map(|(lo, hi)| format!("0x{lo:08x}..0x{hi:08x}"))
+                                .collect::<Vec<_>>()
+                                .join(" and "),
+                            hits.len(),
+                        );
+                        for (at, site) in hits.iter().take(8) {
+                            error!("    0x{at:08x} loaded at 0x{site:08x}");
+                        }
+                    }
+                }
                 // Before --patch, so an explicit patch still wins over it.
+                //
+                // Kept, not dropped: the words this neutralises live in the
+                // title's own image, which a title is free to reload from its
+                // disc. `receive_syscalls` watches every read for one landing
+                // on them and puts them back, so the guard survives a reload
+                // instead of being undone by one.
+                let mut gaps_guard: Vec<(u32, u32)> = vec![];
                 if !args.no_gaps_guard {
-                    let guard = dispatch::gaps_probe_patches(&payload, args.address);
-                    if !guard.is_empty()
-                        && let Err(e) = dispatch::apply_patches(&mut udpsender, &guard)
+                    gaps_guard = dispatch::gaps_probe_patches(&payload, args.address);
+                    if !gaps_guard.is_empty()
+                        && let Err(e) = dispatch::apply_patches(&mut udpsender, &gaps_guard)
                     {
                         warn!("could not neutralise the GAPS probe: {e}");
                     }
@@ -820,6 +1237,46 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 {
                     warn!("could not place probes: {e}");
                 }
+                // Set up BEFORE the title starts, while the disc is still in
+                // hand: from here on the reader belongs to the syscall loop.
+                // A title with no identity records nothing rather than filing
+                // its map under a name that could be any dump.
+                let memory_recorder = disc_reader
+                    .as_deref()
+                    .zip(redirect_disc.as_deref())
+                    .and_then(|(d, p)| dispatch::identify(d, p).ok())
+                    .map(|id| {
+                        let path = memory_db_path(&args, &loaders::LoaderSet::discover(
+                            args.loader_dir.clone(),
+                        ));
+                        // What is already known, so the end-of-session report
+                        // can say what THIS session added rather than how much
+                        // there is in total.
+                        let baseline = memmap::MemoryDb::load(&path)
+                            .get(&id.md5)
+                            .map(|r| r.map)
+                            .unwrap_or_default();
+                        info!("learning this title's memory map into {}", path.display());
+                        std::sync::Arc::new(std::sync::Mutex::new(memmap::MemoryRecorder::new(
+                            path, &id.md5, &id.title, baseline,
+                        )))
+                    });
+                // Ctrl-C is how this ends: the title is running and there is
+                // nothing to finish. Without this the map loses whatever it has
+                // not flushed, and nobody is told whether the run taught it
+                // anything -- which is the one thing worth knowing before
+                // deciding to try again.
+                {
+                    let rec = memory_recorder.clone();
+                    if let Err(e) =
+                        ctrlc::set_handler(move || memmap::report_and_exit(rec.as_deref()))
+                    {
+                        warn!(
+                            "no Ctrl-C handler ({e}); the memory map will still be written \
+                             every few seconds, but the last of it may be lost"
+                        );
+                    }
+                }
                 info!("Upload complete, executing at 0x{:08x}", entry);
                 // The title is on the console now; the host's copy is only
                 // holding up to 16 MiB for the length of the session.
@@ -828,7 +1285,14 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     Err(e) => Err(e),
                     Ok(_) => {
                         if has_disc || mount.is_some() || console {
-                            dispatch::receive_syscalls(&mut udpsender, disc_reader, mount.clone())?;
+                            dispatch::receive_syscalls(
+                                &mut udpsender,
+                                disc_reader,
+                                mount.clone(),
+                                running_base,
+                                &gaps_guard,
+                                memory_recorder,
+                            )?;
                             return Ok(ExitCode::SUCCESS);
                         }
                         Ok(ExitCode::SUCCESS)
@@ -863,7 +1327,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         // Handled before the socket is opened; unreachable here, but spelled
         // out rather than caught by a wildcard so adding a subcommand keeps
         // failing to compile until it is wired up.
-        Commands::Identify { .. } | Commands::Extract { .. } => {
+        Commands::Identify { .. } | Commands::Extract { .. } | Commands::Relocate { .. } => {
             unreachable!("handled before connecting")
         }
         Commands::SelftestReadback {} => {

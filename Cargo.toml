@@ -31,6 +31,11 @@ clap-num = "1.2.0"
 # Already in the tree as indicatif's own terminal backend; declared here so the
 # progress display can ask how wide the terminal is before it picks a layout.
 console = "0.16.2"
+# Ctrl-C is how a session with a title normally ends -- the game is running,
+# there is nothing to "finish". Without a handler the learned memory map
+# (src/memmap.rs) loses whatever it has not flushed, and the user is told
+# nothing about what the session taught. See report_and_exit().
+ctrlc = "3.5.2"
 elf = "0.8.0"
 indicatif = "0.18.3"
 log = "0.4.29"

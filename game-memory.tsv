@@ -1,0 +1,14 @@
+# dcload-ip-rs: RAM a title has been seen writing, learned from the disc reads
+# it asks for. Used to place the loader somewhere the game does not go.
+#
+# One row per boot-sector md5 (the key DreamShell's presets use). `blocks` is a
+# 256-bit bitmap, one bit per 64 KB of the Dreamcast's 16 MB, lowest first: bit
+# n covers 0x8c000000 + n*0x10000.
+#
+# ROWS MERGE BY OR, so this file is worth sharing: play a part of a game nobody
+# has, commit the row, and everyone's placement gets better. A row is only ever
+# incomplete, never wrong -- a bit is set because a read really landed there.
+#
+# md5	title	blocks	sessions
+752b24f3b041e14d75c37a22b23036ce	SONIC ADVENTURE 2	000000040042ffffffff000000000008000000f0000000000000f000f8010070	1
+9d7c156e132d74ab5c82352e02b91876	SONIC ADVENTURE	0800000000000000000000000006007c024000ff0000f0000078ffffffff0000	1

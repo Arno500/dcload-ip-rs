@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{Error, ErrorKind},
     path::Path,
     thread::sleep,
@@ -113,16 +113,6 @@ pub fn payload_from_file(path: &Path) -> std::io::Result<(Vec<u8>, String)> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     Ok((bytes, label))
-}
-
-pub fn upload(
-    conn: &mut impl ExternalDcIo,
-    file: String,
-    address: u32,
-    running_base: Option<u32>,
-) -> std::result::Result<(u32, usize), std::boxed::Box<dyn std::error::Error>> {
-    let (bytes, label) = payload_from_file(Path::new(&file))?;
-    upload_bytes(conn, &bytes, &label, address, running_base)
 }
 
 /// Upload a payload that is already in memory.
@@ -386,20 +376,21 @@ pub fn ensure_loader_base(
         );
         return running;
     }
-    if !loaders.has(want) {
+    if !loaders.can_provide(want) {
         let available: Vec<String> = loaders
             .available()
             .iter()
             .map(|b| format!("0x{b:08x}"))
             .collect();
         warn!(
-            "this title wants the loader at 0x{:08x} but {} has no dcload-0x{:08x}.elf \
-             (available: {}); staying at 0x{:08x}. Build the set with \
+            "this title wants the loader at 0x{:08x} but {} has neither dcload-0x{:08x}.elf \
+             nor {} (available: {}); staying at 0x{:08x}. Build the set with \
              `make -C target-src/dcload loaders` and put it in a `loaders` \
              directory at this project's root. Looked in: {}.",
             want,
             loaders.dir().display(),
             want,
+            crate::loaders::RELOCATABLE_NAME,
             if available.is_empty() {
                 "none".to_string()
             } else {
@@ -411,16 +402,40 @@ pub fn ensure_loader_base(
         return running;
     }
 
-    let want_image = match crate::loaders::image_extent(&loaders.path_for(want)) {
+    // Materialised ONCE, here, and carried to the upload. Relocating is cheap,
+    // but doing it twice would leave two answers to "what is being uploaded",
+    // and only one of them checked.
+    let mut images: std::collections::HashMap<u32, (Vec<u8>, String)> = Default::default();
+    let mut fetch = |base: u32| -> Option<(Vec<u8>, String)> {
+        if let Some(v) = images.get(&base) {
+            return Some(v.clone());
+        }
+        match loaders.image_for(base) {
+            Ok(v) => {
+                images.insert(base, v.clone());
+                Some(v)
+            }
+            Err(e) => {
+                warn!("cannot get a loader for 0x{base:08x}: {e}");
+                None
+            }
+        }
+    };
+
+    let Some((want_bytes, _)) = fetch(want) else {
+        warn!("staying at 0x{running:08x}");
+        return running;
+    };
+    let want_image = match crate::loaders::image_extent_bytes(&want_bytes) {
         Ok(extent) => extent,
         Err(e) => {
             warn!("cannot read the loader for 0x{want:08x}: {e}; staying at 0x{running:08x}");
             return running;
         }
     };
-    let scratch_image =
-        crate::loaders::image_extent(&loaders.path_for(crate::loaders::SCRATCH_BASE))
-            .unwrap_or((u32::MAX, u32::MAX));
+    let scratch_image = fetch(crate::loaders::SCRATCH_BASE)
+        .and_then(|(b, _)| crate::loaders::image_extent_bytes(&b).ok())
+        .unwrap_or((u32::MAX, u32::MAX));
 
     let hops = crate::loaders::plan(running, want, want_image, scratch_image);
     if hops.is_empty() {
@@ -440,15 +455,12 @@ pub fn ensure_loader_base(
 
     let mut current = running;
     for hop in hops {
-        if !loaders.has(hop) {
-            warn!(
-                "intermediate loader dcload-0x{hop:08x}.elf is missing; staying at 0x{current:08x}"
-            );
+        let Some((bytes, label)) = fetch(hop) else {
+            warn!("staying at 0x{current:08x}");
             return current;
-        }
-        let path = loaders.path_for(hop).to_string_lossy().into_owned();
-        info!("chainloading dcload to 0x{:08x}", hop);
-        let entry = match upload(conn, path, hop, Some(current)) {
+        };
+        info!("chainloading dcload to 0x{:08x} ({label})", hop);
+        let entry = match upload_bytes(conn, &bytes, &label, hop, Some(current)) {
             Ok((entry, _)) => entry,
             Err(e) => {
                 warn!(
@@ -928,6 +940,111 @@ pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
     out
 }
 
+/// Addresses the title loads as constants that land inside the running
+/// loader's memory -- reported BEFORE the title is started, because nothing
+/// can report them afterwards.
+///
+/// A title writes where it likes. When it writes with the CPU through a disc
+/// read, the host sees the destination and `receive_syscalls` says so; when it
+/// programs a DMA engine, nothing on either side is in the path at all. The
+/// Maple DMA is the case that matters: the controller writes guest RAM
+/// directly, so a loader whose stack and packet buffers sit in the target
+/// region is overwritten by hardware, mid-frame, with no syscall, no packet
+/// and no exception. The loader simply stops answering -- black screen, no
+/// further requests, nothing logged anywhere. That is indistinguishable from
+/// the adapter having been switched off (AGENTS.md 4.12) and from every other
+/// silent ending, which is exactly why it has to be caught up front.
+///
+/// Sonic Adventure 2 is the measured case: it loads 0x0cff0000 into its Maple
+/// DMA list, and at the 0x8cfe8000 base DreamShell asks for, the loader's own
+/// stack top is 0x8cff3000, its `.hiram` packet buffers 0x8cff4000 and its
+/// Maple buffer 0x8cff5000 -- all above the address the console's own hardware
+/// is about to fill. isoldr fits at that base because its image is 13 KB and
+/// it keeps everything under 0x8cff0000; ours reserves 56 KB from the base and
+/// does not.
+///
+/// FOUND BY CONTENT, AND CORROBORATED THE SAME WAY THE GAPS PROBE IS. A bare
+/// four-byte match is not enough -- any pointer-sized datum can read as a high
+/// RAM address -- so a literal only counts when an `mov.l @(disp,PC),Rn`
+/// actually loads it. On Sonic Adventure 2 that is the whole difference between
+/// eight occurrences of 0x0cff0000 and the two sites that use them.
+pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<(u32, u32)> {
+    let mut spans: Vec<(u32, &[u8])> = vec![];
+    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf) {
+        if let Some(headers) = elf.section_headers() {
+            for sh in headers.iter() {
+                if crate::loaders::is_uploadable(&sh)
+                    && let Ok((data, _)) = elf.section_data(&sh)
+                {
+                    spans.push((sh.sh_addr as u32, data));
+                }
+            }
+        }
+    } else {
+        spans.push((address, buf));
+    }
+
+    let ranges: Vec<(u32, u32)> = crate::loaders::live_footprint(base)
+        .into_iter()
+        .filter(|&(lo, _)| lo >= 0x8c01_0000)
+        .collect();
+    if ranges.is_empty() {
+        return vec![];
+    }
+
+    let mut out: Vec<(u32, u32)> = vec![];
+    for (span_base, data) in spans {
+        // Pass one: every aligned word that names RAM inside the footprint.
+        let mut pool: HashMap<usize, u32> = HashMap::new();
+        for i in (0..data.len().saturating_sub(3)).step_by(4) {
+            let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            // Only the three windows onto RAM; anything else is a plain number.
+            if !matches!(raw & 0xff00_0000, 0x0c00_0000 | 0x8c00_0000 | 0xac00_0000) {
+                continue;
+            }
+            let at = (raw & 0x1fff_ffff) | 0x8c00_0000;
+            // ONLY THE PART OF THE LOADER NO TITLE HAS BUSINESS ADDRESSING.
+            //
+            // A low loader shares its region with the BIOS work area by
+            // construction (AGENTS.md 4.6): 0x8c008000 is where IP.BIN lives,
+            // and a title reads its own disc header there as a matter of
+            // course. Measured: Sonic Adventure -- which runs perfectly at the
+            // stock base -- has eleven constants in 0x8c0080f0..0x8c008208,
+            // every one of them legitimate. Reporting those would have this
+            // check crying wolf on the one title known to work, and a guard
+            // that always fires guards nothing (AGENTS.md 14.9). The high
+            // ranges are different: a loader's stack, packet buffers and Maple
+            // buffer up there are in RAM a title is supposed to own outright,
+            // so a constant naming them is a real collision either way.
+            if ranges.iter().any(|&(lo, hi)| at >= lo && at < hi) {
+                pool.insert(i, at);
+            }
+        }
+        if pool.is_empty() {
+            continue;
+        }
+        // Pass two: the `mov.l @(disp,PC),Rn` that read them. SH4 is fixed
+        // 16-bit, PC-relative long loads round the PC down to 4.
+        for i in (0..data.len().saturating_sub(1)).step_by(2) {
+            let op = u16::from_le_bytes([data[i], data[i + 1]]);
+            if op & 0xf000 != 0xd000 {
+                continue;
+            }
+            let target = ((i + 4) & !3) + (op & 0xff) as usize * 4;
+            if let Some(&at) = pool.get(&target) {
+                // Reported in the cached window, which is what a disassembly
+                // of the title shows, whatever window the payload was uploaded
+                // through.
+                let site = span_base.wrapping_add(i as u32);
+                out.push((at, (site & 0x1fff_ffff) | 0x8c00_0000));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 pub fn apply_patches(
     conn: &mut impl ExternalDcIo,
     patches: &[(u32, u32)],
@@ -1194,6 +1311,9 @@ pub fn receive_syscalls(
     conn: &mut impl ExternalDcIo,
     cd_disc: Option<Box<dyn DiscFormat>>,
     mount: Option<String>,
+    running_base: Option<u32>,
+    gaps_guard: &[(u32, u32)],
+    memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     // A disc that could not be opened is not a silent no-op: the title is
     // about to be started with CDFS redirection ON, so it will ask for sectors
@@ -1224,6 +1344,16 @@ pub fn receive_syscalls(
     fs_syscall_state.opendirs.resize_with(256, || None);
     fs_syscall_state.openfiles.resize_with(256, || None);
     let mut logged_lbas: HashSet<u32> = HashSet::new();
+    // Destinations already reported as landing on the loader. The condition is
+    // fatal but not immediate, so the same read can be re-requested several
+    // times on the way down; saying it once per destination keeps the line that
+    // matters at the top of the log rather than buried in its own repeats.
+    let mut warned_overlap: HashSet<u32> = HashSet::new();
+    let loader_base = running_base.unwrap_or(crate::loaders::DEFAULT_BASE);
+    // Closest a disc read has come to the loader, and whether that has been
+    // said. See the check itself for what the number is worth.
+    let mut nearest_read: u32 = u32::MAX;
+    let mut warned_near = false;
     let pvd_lba = toc_start.saturating_add(16);
     // Aggregates the title's disc reads into "loading" bursts (see `ui`). It
     // also decides how long we wait for the next packet: forever when nothing
@@ -1338,6 +1468,112 @@ pub fn receive_syscalls(
                                         );
                                     }
                                 }
+                                // A DISC READ THAT LANDS ON THE LOADER IS THE
+                                // ONE FAILURE NOTHING REPORTS.
+                                //
+                                // dcload writes what it is handed, wherever it
+                                // is handed it: cmd_partbin checks the address
+                                // against the transfer window and never against
+                                // the loader's own image. So a title whose
+                                // allocator reaches the RAM the loader sits in
+                                // has dcload overwrite itself with disc data
+                                // while it is serving the read, and the session
+                                // ends in silence -- black screen, no further
+                                // requests, no error at either end (AGENTS.md
+                                // 4.6, 14.17). The host is the only side that
+                                // can see it coming, and seeing it costs one
+                                // comparison per read.
+                                if let Some(hit) = crate::loaders::overlapping_range(
+                                    loader_base,
+                                    (dc_address, dc_address.saturating_add(buf.len() as u32)),
+                                ) && warned_overlap.insert(dc_address)
+                                {
+                                    error!(
+                                        "DISC READ LANDS ON THE LOADER: LBA 0x{start:08x} -> \
+                                         0x{dc_address:08x}..0x{:08x} ({} B) runs through \
+                                         0x{:08x}..0x{:08x}, which the loader running at \
+                                         0x{loader_base:08x} is using. Serving it anyway, but it \
+                                         overwrites dcload while dcload is receiving it: expect \
+                                         the console to go quiet from here with nothing else \
+                                         logged. This title needs a loader base its own memory \
+                                         map leaves alone.",
+                                        dc_address.saturating_add(buf.len() as u32),
+                                        buf.len(),
+                                        hit.0,
+                                        hit.1,
+                                    );
+                                }
+                                // WHERE THIS TITLE'S MEMORY ACTUALLY IS, kept
+                                // for the next session. This is the only place
+                                // anyone ever learns it: the addresses that
+                                // matter are computed by the title's allocator
+                                // and appear nowhere in its binary.
+                                // Locked only for the marking, which is two
+                                // shifts; the Ctrl-C handler is the only other
+                                // holder and it takes it once, at the end.
+                                if let Some(rec) = memory.as_ref()
+                                    && let Ok(mut rec) = rec.lock()
+                                {
+                                    rec.record(dc_address, buf.len() as u32);
+                                }
+                                // HOW CLOSE THE TITLE IS COMING, not just whether
+                                // it has hit. A collision is detected before the
+                                // run from constants the title loads
+                                // (`literals_in_loader_footprint`), but an
+                                // allocator that grows into the loader names no
+                                // address at all, so nothing sees it coming.
+                                // Where a title's disc reads land is the one
+                                // direct evidence of where its memory actually
+                                // is, and this host has it for free.
+                                //
+                                // Measured 2026-08-27 on Sonic Adventure 2's
+                                // Kart mode, which streams KART.ADX into
+                                // 0x8ce3a920: with the loader at 0x8ce00000 --
+                                // 182 KB below those reads -- the mode is a
+                                // black screen; at 0x8cef8000, some 810 KB
+                                // clear of them, it runs. ONE pair of
+                                // observations, so treat this as a lead and not
+                                // a verdict: it says the loader is sitting in
+                                // the region the title is using, which is worth
+                                // knowing and is not proof of the mechanism.
+                                //
+                                // HIGH BASES ONLY, and for the same reason the
+                                // constant check excludes the low ranges: at the
+                                // stock base the title is loaded at 0x8c010000,
+                                // immediately above the loader, so every read it
+                                // ever makes is "near" and the warning would fire
+                                // on every title forever (AGENTS.md 14.9).
+                                if loader_base >= 0x8c01_0000 {
+                                    const TOO_NEAR: u32 = 0x4_0000;
+                                    let lo = dc_address & 0x1fff_ffff;
+                                    let (blo, bhi) = (
+                                        loader_base & 0x1fff_ffff,
+                                        (loader_base & 0x1fff_ffff)
+                                            .saturating_add(crate::loaders::LOADER_SPAN),
+                                    );
+                                    let gap = if lo >= bhi {
+                                        lo - bhi
+                                    } else {
+                                        blo.saturating_sub(lo + buf.len() as u32)
+                                    };
+                                    if gap < nearest_read {
+                                        nearest_read = gap;
+                                    }
+                                    if !warned_near && nearest_read < TOO_NEAR {
+                                        warned_near = true;
+                                        warn!(
+                                            "this title's disc reads come within {} KB of the \
+                                             loader at 0x{loader_base:08x} (LBA 0x{start:08x} -> \
+                                             0x{dc_address:08x}). Its memory reaches this far, so \
+                                             the loader is in ground it is using -- an allocation \
+                                             that goes a little further overwrites it, and nothing \
+                                             reports that. If this title misbehaves, move the \
+                                             loader further away with --loader-base before \
+                                             suspecting anything else.",
+                                            nearest_read / 1024
+                                        );
+                                    }
+                                }
                                 // A FAILED TRANSFER MUST NOT KILL THE SERVER.
                                 //
                                 // This used to be `send_data(...)?`, so the first
@@ -1401,6 +1637,47 @@ pub fn receive_syscalls(
                                                 Err(e) => {
                                                     warn!("VERIFY read-back failed: {e}");
                                                 }
+                                            }
+                                        }
+                                        // THE GAPS GUARD HAS TO SURVIVE A RELOAD.
+                                        //
+                                        // What it neutralises is a word in the
+                                        // title's own image, and a title is free
+                                        // to read its image back off its disc.
+                                        // That would restore the probe's
+                                        // comparison constant and let it switch
+                                        // the adapter off, after which the loader
+                                        // is deaf with nothing logged at either
+                                        // end (AGENTS.md 4.12) -- the same silent
+                                        // ending the guard exists to prevent,
+                                        // reached the long way round. Tested on
+                                        // every read, paid for only by one that
+                                        // actually covers a patched word, and
+                                        // done HERE: after the read-back
+                                        // comparison, so it has nothing to
+                                        // disagree with, and before the
+                                        // ReturnValue, which is the last moment
+                                        // the title is still parked and cannot
+                                        // yet run what was just delivered.
+                                        let reloaded: Vec<(u32, u32)> = gaps_guard
+                                            .iter()
+                                            .copied()
+                                            .filter(|&(at, _)| {
+                                                let lo = dc_address & 0x1fff_ffff;
+                                                let hi = lo.saturating_add(buf.len() as u32);
+                                                (lo..hi).contains(&(at & 0x1fff_ffff))
+                                            })
+                                            .collect();
+                                        if !reloaded.is_empty() {
+                                            warn!(
+                                                "this read reloads the code the GAPS guard \
+                                                 patched (LBA 0x{start:08x} -> 0x{dc_address:08x}, \
+                                                 {} B); re-applying it before the title can run \
+                                                 the bytes just delivered",
+                                                buf.len()
+                                            );
+                                            if let Err(e) = apply_patches(conn, &reloaded) {
+                                                error!("could not re-apply the GAPS guard: {e}");
                                             }
                                         }
                                         conn.send_command(DCLoadCmd {
@@ -2533,5 +2810,108 @@ mod tests {
         let p = raw(0x1000, &[(0x100, 0xa100_1400), (0x34a, GAPS_SIGNATURE)]);
         let got = gaps_probe_patches(&p, 0x0c01_0000);
         assert!(got.is_empty(), "matched an unaligned occurrence: {got:?}");
+    }
+
+    use super::literals_in_loader_footprint;
+
+    /// Sonic Adventure 2's base: image at 0x8cfe8000, stack top 0x8cff3000,
+    /// `.hiram` 0x8cff4000, Maple 0x8cff5000.
+    const HIGH_BASE: u32 = 0x8cfe_8000;
+
+    /// `mov.l @(disp,PC),Rn` at `at`, reading the long at `pool`.
+    ///
+    /// The displacement is computed from the same rounding the hardware does
+    /// (PC+4, rounded down to 4), because that rounding is the whole reason
+    /// this pass cannot just scan for constants.
+    fn mov_l_pc(at: usize, pool: usize, rn: u16) -> (usize, u16) {
+        let disp = (pool - ((at + 4) & !3)) / 4;
+        assert!(disp <= 0xff, "displacement out of range for a real load");
+        (at, 0xd000 | (rn << 8) | disp as u16)
+    }
+
+    fn raw_ops(len: usize, words: &[(usize, u32)], ops: &[(usize, u16)]) -> Vec<u8> {
+        let mut b = raw(len, words);
+        for &(at, op) in ops {
+            b[at..at + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn a_constant_the_title_loads_into_the_loader_is_reported() {
+        // What Sonic Adventure 2 does: 0x0cff0000 into a Maple DMA list, which
+        // at this base is the loader's own stack and packet buffers.
+        let p = raw_ops(
+            0x1000,
+            &[(0x200, 0x0cff_0000)],
+            &[mov_l_pc(0x100, 0x200, 1)],
+        );
+        let got = literals_in_loader_footprint(&p, 0x0c01_0000, HIGH_BASE);
+        assert_eq!(got, vec![(0x8cff_0000, 0x8c01_0000 + 0x100)]);
+    }
+
+    #[test]
+    fn a_constant_nothing_loads_is_ignored() {
+        // The corroboration that matters. Sonic Adventure 2 has eight aligned
+        // occurrences of 0x0cff0000 and two instructions that read one; without
+        // this test the check would report the six that are only ever data.
+        let p = raw(0x1000, &[(0x200, 0x0cff_0000)]);
+        let got = literals_in_loader_footprint(&p, 0x0c01_0000, HIGH_BASE);
+        assert!(got.is_empty(), "reported a literal nothing loads: {got:?}");
+    }
+
+    #[test]
+    fn a_constant_outside_the_footprint_is_ignored() {
+        // Loaded, and RAM, and none of our business: the title owns everything
+        // the loader is not sitting in.
+        let p = raw_ops(
+            0x1000,
+            &[(0x200, 0x0c80_0000)],
+            &[mov_l_pc(0x100, 0x200, 1)],
+        );
+        let got = literals_in_loader_footprint(&p, 0x0c01_0000, HIGH_BASE);
+        assert!(got.is_empty(), "reported an address outside the loader: {got:?}");
+    }
+
+    #[test]
+    fn the_same_address_is_seen_through_every_window() {
+        // 0x0c..., 0x8c... and 0xac... are one address. A title picks the
+        // window by what it is doing -- physical for a DMA engine, cached for
+        // the CPU -- and the loader is hit either way.
+        for w in [0x0cff_0000u32, 0x8cff_0000, 0xacff_0000] {
+            let p = raw_ops(0x1000, &[(0x200, w)], &[mov_l_pc(0x100, 0x200, 1)]);
+            let got = literals_in_loader_footprint(&p, 0x0c01_0000, HIGH_BASE);
+            assert_eq!(got, vec![(0x8cff_0000, 0x8c01_0000 + 0x100)], "window 0x{w:08x}");
+        }
+    }
+
+    #[test]
+    fn the_bios_work_area_a_low_loader_shares_is_not_reported() {
+        // Sonic Adventure's shape, and the control that keeps this check
+        // honest: it runs at the stock base and loads constants in the IP.BIN
+        // region, which the loader's own range covers. Reporting them would
+        // condemn the one title measured to work.
+        let p = raw_ops(0x1000, &[(0x200, 0x8c00_8200)], &[mov_l_pc(0x100, 0x200, 1)]);
+        let got = literals_in_loader_footprint(&p, 0x0c01_0000, 0x8c00_4000);
+        assert!(got.is_empty(), "reported the shared BIOS work area: {got:?}");
+    }
+
+    #[test]
+    fn a_low_loaders_high_buffers_are_still_reported() {
+        // The other half of the same rule: a low loader keeps its packet and
+        // Maple buffers at 0x8cfe8000, outside its image and outside anything
+        // a title legitimately shares. A constant naming those is a collision.
+        let p = raw_ops(0x1000, &[(0x200, 0x0cfe_8800)], &[mov_l_pc(0x100, 0x200, 1)]);
+        let got = literals_in_loader_footprint(&p, 0x0c01_0000, 0x8c00_4000);
+        assert_eq!(got, vec![(0x8cfe_8800, 0x8c01_0000 + 0x100)]);
+    }
+
+    #[test]
+    fn the_stock_low_base_does_not_see_sonic_adventure_2s_maple_buffer() {
+        // The same title at the stock base: 0x8cff0000 is nowhere near the
+        // loader, and a check that fired here would cry wolf on every title.
+        let p = raw_ops(0x1000, &[(0x200, 0x0cff_0000)], &[mov_l_pc(0x100, 0x200, 1)]);
+        let got = literals_in_loader_footprint(&p, 0x0c01_0000, 0x8c00_4000);
+        assert!(got.is_empty(), "the low base reported a high-RAM constant: {got:?}");
     }
 }

@@ -110,7 +110,7 @@ fn bar_template() -> &'static str {
 ///
 /// `total` is the whole job -- not one LoadBinary window. The rate and the ETA
 /// are only meaningful if the bar spans something a human recognises as a unit
-/// of work, which is why `upload()` creates exactly one of these per file and
+/// of work, which is why `upload_bytes()` creates exactly one of these per file and
 /// hands it down, rather than letting each 360 KiB transfer make its own.
 pub fn bytes_bar(total: u64, prefix: impl Into<Cow<'static, str>>) -> Bar {
     if total < BAR_MIN_BYTES {
