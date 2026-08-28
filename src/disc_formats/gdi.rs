@@ -64,13 +64,43 @@ impl Gdi {
     }
 
     /// The logical start of the lowest or highest data track. `start_sector`
-    /// and `boot_sector` are this same walk with `min` and `max`.
+    /// and `num_sectors` are this same walk with `min` and `max`.
     fn data_track_edge(&self, highest: bool) -> u32 {
         let tracks = self.tracks.borrow();
         let starts = tracks.iter().filter(|t| t.track_type == 4).map(|t| t.start_lba);
         if highest { starts.max() } else { starts.min() }
             .unwrap_or(0)
             .saturating_add(150)
+    }
+
+    /// The FIRST data track of the high-density area, which is not always the
+    /// last data track on the disc.
+    ///
+    /// A GD-ROM's high-density area begins at LBA 45000, always -- it is a
+    /// property of the medium, and a `.gdi` records its track starts in that
+    /// same origin. What is NOT fixed is how many tracks follow: a title whose
+    /// CDDA lives up there is mastered `data / audio / ... / data`, and then
+    /// the highest-LBA data track is a bare file area with no header and no
+    /// filesystem on it.
+    ///
+    /// Measured on the Buzz Lightyear of Star Command PAL dump, five tracks:
+    /// `0 data, 6986 audio, 45000 data, 257827 audio, 263852 data`. IP.BIN and
+    /// the ISO9660 PVD are at track 3 (45000 and 45016); track 5 sector 0 is
+    /// mid-file payload. Asking the highest track for a header therefore said
+    /// "the disc does not say which file it boots" about a disc that says so
+    /// perfectly clearly, 219000 sectors earlier.
+    ///
+    /// `None` when no data track reaches the high-density area at all, which is
+    /// every synthetic and single-density image.
+    fn high_density_start(&self) -> Option<u32> {
+        const HIGH_DENSITY_LBA: u32 = 45000;
+        self.tracks
+            .borrow()
+            .iter()
+            .filter(|t| t.track_type == 4 && t.start_lba >= HIGH_DENSITY_LBA)
+            .map(|t| t.start_lba)
+            .min()
+            .map(|lba| lba.saturating_add(150))
     }
 }
 impl DiscFormat for Gdi {
@@ -182,10 +212,16 @@ impl DiscFormat for Gdi {
         self.data_track_edge(false)
     }
 
-    /// The HIGHEST-LBA data track, i.e. the high-density area -- the mirror of
-    /// `start_sector()`'s lowest. See the trait for why the two differ.
+    /// The start of the high-density area -- see `high_density_start()` for why
+    /// that is not the same thing as the highest data track, and the trait for
+    /// why it is not `start_sector()`.
+    ///
+    /// The fallback is the highest data track, which is what this always used
+    /// to answer: on an image with no high-density area there is no better
+    /// guess, and on the ordinary three-track GDI the two are the same track.
     fn boot_sector(&self) -> u32 {
-        self.data_track_edge(true)
+        self.high_density_start()
+            .unwrap_or_else(|| self.data_track_edge(true))
     }
 
     /// The lead-in the reader adds to every track start, and that the disc's
@@ -205,7 +241,10 @@ impl DiscFormat for Gdi {
     /// inside the TOC syscall, with the title frozen (AGENTS.md 16).
     fn num_sectors(&self) -> u32 {
         let first_start = self.start_sector();
-        let last_start = self.boot_sector();
+        // The LAST data track, not `boot_sector()`: on a disc whose CDDA is in
+        // the high-density area those are different tracks, and the lead-out is
+        // behind the last one.
+        let last_start = self.data_track_edge(true);
         let mut tracks = self.tracks.borrow_mut();
         let Some(last) = tracks
             .iter()
@@ -246,15 +285,65 @@ mod tests {
             .then(|| Gdi::open_path(p).expect("parse gdi"))
     }
 
+    /// A GDI with nothing but a track list. `start_sector`, `boot_sector` and
+    /// `data_track_edge` read no bytes, so no track file has to exist -- which
+    /// is what lets the layouts below be tested on a machine with no dumps.
+    fn tracks_at(spec: &[(u32, u8)]) -> Gdi {
+        Gdi {
+            tracks: RefCell::new(
+                spec.iter()
+                    .enumerate()
+                    .map(|(i, &(start_lba, track_type))| Track {
+                        track_number: i as u8 + 1,
+                        start_lba,
+                        track_type,
+                        sector_size: 2352,
+                        track: format!("track{:02}.bin", i + 1),
+                        offset: 0,
+                        source: None,
+                    })
+                    .collect(),
+            ),
+            container: Box::new(DirContainer::new(PathBuf::new())),
+        }
+    }
+
     /// THE BUG THIS LOCKS DOWN. `start_sector()` is the LOWEST data track and
-    /// `boot_sector()` the HIGHEST, and on a GD-ROM they are different tracks
-    /// with the same valid header. Getting them the same way round again would
-    /// make `--boot-ipbin` execute 32 KB of zeroes, silently.
+    /// `boot_sector()` the high-density one, and on a GD-ROM they are different
+    /// tracks with the same valid header. Getting them the same way round again
+    /// would make `--boot-ipbin` execute 32 KB of zeroes, silently.
     #[test]
     fn boot_sector_is_the_high_density_area() {
         let Some(gdi) = sa_gdi() else { return };
         assert_eq!(gdi.start_sector(), 150, "low-density data track");
         assert_eq!(gdi.boot_sector(), 45150, "high-density data track");
+    }
+
+    /// AND THE ONE AFTER IT: the high-density area is not always one track.
+    ///
+    /// A title whose CDDA lives up there is mastered `data / audio / ... /
+    /// data`, and the boot track is the FIRST data track of that area, not the
+    /// last one on the disc -- which carries no header and no filesystem. This
+    /// is the Buzz Lightyear of Star Command PAL layout, the disc that failed
+    /// with "the disc does not say which file it boots" while saying so
+    /// perfectly clearly 219000 sectors earlier.
+    #[test]
+    fn cdda_in_the_high_density_area_does_not_move_the_boot_track() {
+        let gdi = tracks_at(&[(0, 4), (6986, 0), (45000, 4), (257827, 0), (263852, 4)]);
+        assert_eq!(gdi.start_sector(), 150, "low-density data track");
+        assert_eq!(gdi.boot_sector(), 45150, "first high-density data track");
+        // The lead-out is still measured behind the LAST data track, which is
+        // why `num_sectors()` may not go through `boot_sector()`.
+        assert_eq!(gdi.data_track_edge(true), 264002, "last data track");
+    }
+
+    /// The ordinary three-track GDI, where the two answers coincide, and an
+    /// image with no high-density area at all, where the highest data track is
+    /// all there is to point at.
+    #[test]
+    fn the_boot_track_falls_back_to_the_highest_data_track() {
+        assert_eq!(tracks_at(&[(0, 4), (600, 0), (45000, 4)]).boot_sector(), 45150);
+        assert_eq!(tracks_at(&[(0, 4), (100, 4)]).boot_sector(), 250);
     }
 
     /// Both areas open with a valid Dreamcast header for the same title --

@@ -382,15 +382,32 @@ pub fn ensure_loader_base(
             .iter()
             .map(|b| format!("0x{b:08x}"))
             .collect();
+        // Say WHICH of the two is missing. With the relocatable image present
+        // this is now nearly unreachable -- it answers for any base a loader
+        // fits at, in either family -- so when it does fire, the address itself
+        // is the problem and the message has to say so rather than ask for a
+        // file that may already be sitting in the directory.
+        let missing = if loaders.relocatable().is_some() {
+            format!(
+                "has no dcload-0x{want:08x}.elf, and 0x{want:08x} is not an address {} \
+                 can be moved to: a loader's image, stack and buffers have to fit \
+                 there, and they do not",
+                crate::loaders::RELOCATABLE_NAME
+            )
+        } else {
+            format!(
+                "has neither dcload-0x{want:08x}.elf nor {}",
+                crate::loaders::RELOCATABLE_NAME
+            )
+        };
         warn!(
-            "this title wants the loader at 0x{:08x} but {} has neither dcload-0x{:08x}.elf \
-             nor {} (available: {}); staying at 0x{:08x}. Build the set with \
+            "this title wants the loader at 0x{:08x} but {} {} (available: {}); \
+             staying at 0x{:08x}. Build the set with \
              `make -C target-src/dcload loaders` and put it in a `loaders` \
              directory at this project's root. Looked in: {}.",
             want,
             loaders.dir().display(),
-            want,
-            crate::loaders::RELOCATABLE_NAME,
+            missing,
             if available.is_empty() {
                 "none".to_string()
             } else {
@@ -984,10 +1001,7 @@ pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<
         spans.push((address, buf));
     }
 
-    let ranges: Vec<(u32, u32)> = crate::loaders::live_footprint(base)
-        .into_iter()
-        .filter(|&(lo, _)| lo >= 0x8c01_0000)
-        .collect();
+    let ranges = crate::loaders::exclusive_footprint(base);
     if ranges.is_empty() {
         return vec![];
     }
@@ -1003,19 +1017,9 @@ pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<
                 continue;
             }
             let at = (raw & 0x1fff_ffff) | 0x8c00_0000;
-            // ONLY THE PART OF THE LOADER NO TITLE HAS BUSINESS ADDRESSING.
-            //
-            // A low loader shares its region with the BIOS work area by
-            // construction (AGENTS.md 4.6): 0x8c008000 is where IP.BIN lives,
-            // and a title reads its own disc header there as a matter of
-            // course. Measured: Sonic Adventure -- which runs perfectly at the
-            // stock base -- has eleven constants in 0x8c0080f0..0x8c008208,
-            // every one of them legitimate. Reporting those would have this
-            // check crying wolf on the one title known to work, and a guard
-            // that always fires guards nothing (AGENTS.md 14.9). The high
-            // ranges are different: a loader's stack, packet buffers and Maple
-            // buffer up there are in RAM a title is supposed to own outright,
-            // so a constant naming them is a real collision either way.
+            // Only the part of the loader no title has business addressing --
+            // see `exclusive_footprint`, which is also what keeps this and the
+            // map check in main.rs looking at the same RAM.
             if ranges.iter().any(|&(lo, hi)| at >= lo && at < hi) {
                 pool.insert(i, at);
             }

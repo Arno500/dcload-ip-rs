@@ -240,6 +240,26 @@ dispatcher". The longer version, module by module:
   ranges and the reason a direct chainload to 0x8cfe8000 is refused), and the
   hop plan. Unit-tested.
 
+  `layout()` is the one copy on this side of the layout table in
+  target-src/dcload/Makefile: the four addresses a loader build is pinned to
+  (image, stack, `.hiram`, Maple DMA), and the two families they come in.
+  `live_footprint` and `relocate` both read it, so they cannot come to disagree
+  about where a loader's buffers are.
+
+  **`relocate()` applies four deltas, not one**, which is what lets one
+  `dcload-relocatable.elf` answer for a LOW base as well as a HIGH one — the
+  stock base included, which used to need its own pre-linked ELF. Each
+  `R_SH_DIR32` is classified by the VALUE of the symbol it names; classifying by
+  the symbol's *section* does not work (`PROVIDE (_dcload_base = ORIGIN(ram))`
+  is filed in `.hiram` by ld) and neither does the word's value (`commands.c`
+  reaches its base through P2). `.guestvbr` carries no relocations and is
+  base-dependent — six words naming the jump table at `base+0x00..+0x20`, from
+  `exception.S`'s `-D` literals — so it is patched by content and re-scanned;
+  before 2026-08-28 it was not patched at all, and every relocated loader handed
+  its title a vector table pointing at the base the image was linked for.
+  `relocating_reproduces_every_native_link_byte_for_byte` checks the whole thing
+  against whatever `make loaders` deployed, and skips when the set is not there.
+
 - **`src/main.rs`** — entry point. Defines the `Args`/`Commands` clap
   structs, sets up logging (`ui::init_logging`, `-v`/`-vv` for
   debug/trace, otherwise honors `RUST_LOG`), chooses legacy vs. modern
@@ -339,6 +359,25 @@ dispatcher". The longer version, module by module:
   `extract()` returns the binary a `uexec <image>` uploads. `scramble.rs` is
   Sega's CD-R permutation and, more importantly, the honest limits of detecting
   it.
+
+  **The boot track of a GDI is the FIRST data track of the high-density area,
+  which is neither the first nor reliably the last track on the disc.**
+  `start_sector()` is the lowest data track — the low-density stub, and the
+  sector DreamShell hashes to name a preset, so it must not move.
+  `boot_sector()` used to be its mirror, the highest data track, and that is
+  right only for the ordinary three-track dump. A title whose CDDA lives in the
+  high-density area is mastered `data / audio / … / data`: measured on the Buzz
+  Lightyear of Star Command PAL dump, `0 data, 6986 audio, 45000 data, 257827
+  audio, 263852 data`, where IP.BIN and the ISO9660 PVD are on track 3 and
+  track 5 sector 0 is mid-file payload. The rule is now "the lowest data track
+  at or above LBA 45000" — 45000 is where the high-density area begins on every
+  GD-ROM, and a `.gdi` records its track starts in that same origin — falling
+  back to the highest data track when no track reaches it. `num_sectors()` still
+  asks for the last data track directly, because the lead-out is behind *that*
+  one. The failure this fixes was total and looked like a bad dump: "neither LBA
+  264002 nor an IP.BIN file in the root directory there carries a Dreamcast
+  header, so the disc does not say which file it boots", about a disc that says
+  so perfectly clearly 219000 sectors earlier.
 
   **`Cdi` used to be a stub and it mattered.** It sniffed the first sector,
   picked a sector size, and treated the whole file as one flat run from LBA

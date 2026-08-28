@@ -297,10 +297,7 @@ fn pick_clear_base(
     // then without, then not at all -- a rich map must narrow the choice, never
     // empty it.
     for margin in [0x4_0000u32, 0] {
-        let strict = |b: u32| {
-            dispatch::literals_in_loader_footprint(boot, address, b).is_empty()
-                && seen.is_none_or(|m| !m.hits(b, loaders::LOADER_SPAN, margin))
-        };
+        let strict = |b: u32| base_is_clear(boot, address, b, seen, margin);
         if let Some(found) = choose(loaders, wanted, &strict) {
             if margin == 0 {
                 warn!(
@@ -321,6 +318,100 @@ fn pick_clear_base(
     }
     let is_clear = |b: u32| dispatch::literals_in_loader_footprint(boot, address, b).is_empty();
     choose(loaders, wanted, &is_clear)
+}
+
+/// The two tests that decide whether a base is safe for a title: what the title
+/// NAMES (constants in its binary) and where its reads have LANDED (the learned
+/// map). One definition, because it is asked in three places -- of the base a
+/// preset wants, of each alternative, and of the base the loader is already at
+/// -- and an answer that differed between them would be worse than no answer.
+fn base_is_clear(
+    boot: &[u8],
+    address: u32,
+    base: u32,
+    seen: Option<&memmap::MemoryMap>,
+    margin: u32,
+) -> bool {
+    dispatch::literals_in_loader_footprint(boot, address, base).is_empty()
+        && !map_hits_loader(base, seen, margin)
+}
+
+/// Has this title been seen reading into RAM a loader at `base` would be using?
+///
+/// Over `exclusive_footprint`, the SAME ranges the constant scan reads. Asking
+/// the map about `base..base+LOADER_SPAN` flat is right for a high loader and
+/// wrong for a low one, whose span is the BIOS work area: every title uses low
+/// RAM, so that test rejects the stock base for all of them. Sonic Adventure's
+/// row marks 0x8c030000, and 0x8c004000 is the address 593 presets ask for and
+/// the one that title is measured to run at.
+fn map_hits_loader(base: u32, seen: Option<&memmap::MemoryMap>, margin: u32) -> bool {
+    seen.is_some_and(|m| {
+        loaders::exclusive_footprint(base)
+            .into_iter()
+            .any(|(lo, hi)| m.hits(lo, hi - lo, margin))
+    })
+}
+
+/// Where to put the loader when the preset's address is one this host cannot
+/// build at all -- 276 of the database's 1026 rows, every one of them below the
+/// BIOS syscall area.
+///
+/// THE PRESET STILL ANSWERS, IN THE NEGATIVE. `ruled_out_by_low_preset` is that
+/// reading: DreamShell reached for 0x8ce00000 and then 0x8cfe8000 before it gave
+/// up and went low, so those two are the last places this title's loader should
+/// go -- and "stay where you happen to be" lands on the first of them, because
+/// it is also the address every chainload bounces through.
+///
+/// What is left is the map. The seed is the middle of the biggest run of RAM
+/// this title has never been seen using; with no map at all that is the middle
+/// of the relocatable window, which is a guess and is logged as one.
+fn base_for_low_preset(
+    loaders: &loaders::LoaderSet,
+    boot: &[u8],
+    address: u32,
+    seen: Option<&memmap::MemoryMap>,
+) -> Option<u32> {
+    // FROM THE END OF THIS TITLE'S OWN IMAGE, not from the constant floor. For a
+    // title whose preset cannot be honoured, that constant is exactly what has
+    // to give: Jet Set Radio leaves one 64 KB block above 0x8ce00000, with its
+    // own data hard against both sides of it, and 12.4 MB below.
+    let image_end = ((address & 0x1fff_ffff) | 0x8c00_0000).saturating_add(boot.len() as u32);
+    let (lo, hi) = loaders::window_above_image(image_end);
+    let map = seen.copied().unwrap_or_default();
+    let (run_lo, run_hi, seed) = map
+        .free_runs(lo, hi)
+        .into_iter()
+        .find_map(|(a, b)| loaders::base_in_span(a, b).map(|s| (a, b, s)))?;
+    info!(
+        "this title's image ends at 0x{image_end:08x}, so a loader may go anywhere from \
+         0x{lo:08x} up; the biggest stretch of that no disc read has ever landed in is \
+         0x{run_lo:08x}..0x{run_hi:08x} ({} KB), and its middle is 0x{seed:08x}",
+        (run_hi - run_lo) / 1024
+    );
+    for margin in [0x4_0000u32, 0] {
+        let is_clear = |b: u32| {
+            !loaders::ruled_out_by_low_preset(b) && base_is_clear(boot, address, b, seen, margin)
+        };
+        let clear: Vec<u32> = loaders
+            .available()
+            .into_iter()
+            .filter(|&b| is_clear(b))
+            .collect();
+        // A base someone linked and ran outranks one this pass merely believes
+        // in -- the same order `choose` uses, and for the same reason.
+        if clear.contains(&seed) {
+            return Some(seed);
+        }
+        if let Some(built) = loaders::nearest_clear_base(seed, &clear) {
+            return Some(built);
+        }
+        if loaders.relocatable().is_some()
+            && let Some(found) = loaders::search_free_base_above(lo, seed, is_clear)
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// The pre-built set first, then relocation -- for whatever "clear" means to
@@ -361,6 +452,16 @@ fn choose(
     if let Some(built) = loaders::nearest_clear_base(wanted, &clear) {
         return Some(built);
     }
+    // SAME FAMILY IN THE RELOCATION BRANCH TOO, not just in `nearest_clear_base`.
+    // `search_free_base` walks a window that is entirely high, so without this a
+    // low `wanted` is answered with a high base -- which is the collision a low
+    // preset exists to avoid. Sonic Adventure is the case: preset 0x8c004000,
+    // and a map marking 0x8ce00000..0x8cef0000. This used to be a consequence of
+    // relocation being unable to produce a low image at all; it now stands on
+    // its own, and is the only thing keeping the families apart here.
+    if !loaders::is_high(wanted) {
+        return None;
+    }
     loaders
         .relocatable()
         .is_some()
@@ -371,6 +472,7 @@ fn choose(
 
 fn wanted_loader_base(
     args: &Args,
+    running: Option<u32>,
     disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
 ) -> Option<u32> {
     if args.no_relocate {
@@ -417,59 +519,64 @@ fn wanted_loader_base(
     };
     debug!("game database: {} rows from {}", db.len(), db_path.display());
 
-    let (preset, kind) = match db.lookup(&identity) {
-        Some(found) => found,
-        None => {
-            info!(
-                "'{}' is not in the game database; keeping the loader where it is \
-                 (the stock base is 0x{:08x})",
-                identity.title,
-                loaders::DEFAULT_BASE
-            );
-            return None;
-        }
-    };
-    // The whole row, once, for anyone reconstructing a session from the log.
-    // `dma` and `fastboot` describe DreamShell's own storage device and menu
-    // and mean nothing on a network transport; `async` is isoldr's sectors-per
-    // -request, which dcload fixes at 8 (GD_EMU_ASYNC) at build time.
-    debug!(
-        "preset: memory={:08x} async={} dma={} irq={} cdda={:08x} heap={:08x} \
-         low={} fastboot={} type={} mode={} altread={}",
-        preset.memory, preset.emu_async, preset.dma, preset.irq, preset.cdda,
-        preset.heap, preset.low, preset.fastboot, preset.bin_type,
-        preset.boot_mode, preset.altread
-    );
+    // NOT AN EARLY RETURN ANY MORE. "Not in the database" used to mean "keep the
+    // loader where it is", decided without ever looking at where that was -- and
+    // where it is need not be the stock base: a chainload leaves the loader
+    // wherever the last title needed it, and the next title inherits that. The
+    // answer is worked out below with the boot binary and the map in hand, like
+    // every other one.
+    let found = db.lookup(&identity);
+    if found.is_none() {
+        info!(
+            "'{}' is not in the game database ({} rows); nothing prescribes an address \
+             for it",
+            identity.title,
+            db.len()
+        );
+    }
+    if let Some((preset, kind)) = &found {
+        // The whole row, once, for anyone reconstructing a session from the log.
+        // `dma` and `fastboot` describe DreamShell's own storage device and menu
+        // and mean nothing on a network transport; `async` is isoldr's sectors-per
+        // -request, which dcload fixes at 8 (GD_EMU_ASYNC) at build time.
+        debug!(
+            "preset: memory={:08x} async={} dma={} irq={} cdda={:08x} heap={:08x} \
+             low={} fastboot={} type={} mode={} altread={}",
+            preset.memory, preset.emu_async, preset.dma, preset.irq, preset.cdda,
+            preset.heap, preset.low, preset.fastboot, preset.bin_type,
+            preset.boot_mode, preset.altread
+        );
 
-    match kind {
-        presets::MatchKind::BootSectorMd5 => info!(
-            "matched '{}' exactly (boot-sector md5): loader wants 0x{:08x}",
-            preset.title, preset.memory
-        ),
-        presets::MatchKind::Title => {
-            let ambiguity = db.title_ambiguity(&identity.title);
-            if ambiguity > 1 {
-                warn!(
-                    "matched '{}' BY TITLE ONLY, and presets under that title disagree \
-                     about the address ({} different values); using 0x{:08x}. Pin it with \
-                     --loader-base if this dump misbehaves.",
-                    preset.title, ambiguity, preset.memory
-                );
-            } else {
-                info!(
-                    "matched '{}' by title (this exact dump is not in the database): \
-                     loader wants 0x{:08x}",
-                    preset.title, preset.memory
-                );
+        match kind {
+            presets::MatchKind::BootSectorMd5 => info!(
+                "matched '{}' exactly (boot-sector md5): loader wants 0x{:08x}",
+                preset.title, preset.memory
+            ),
+            presets::MatchKind::Title => {
+                let ambiguity = db.title_ambiguity(&identity.title);
+                if ambiguity > 1 {
+                    warn!(
+                        "matched '{}' BY TITLE ONLY, and presets under that title disagree \
+                         about the address ({} different values); using 0x{:08x}. Pin it with \
+                         --loader-base if this dump misbehaves.",
+                        preset.title, ambiguity, preset.memory
+                    );
+                } else {
+                    info!(
+                        "matched '{}' by title (this exact dump is not in the database): \
+                         loader wants 0x{:08x}",
+                        preset.title, preset.memory
+                    );
+                }
             }
         }
-    }
 
-    // Say what the preset asked for that this host does not do. When a title
-    // misbehaves, "its preset wanted interrupt hooking and we dropped it" is
-    // the first thing worth knowing, and it is invisible otherwise.
-    for note in preset.unsupported() {
-        warn!("'{}': not honoured -- {}", preset.title, note);
+        // Say what the preset asked for that this host does not do. When a title
+        // misbehaves, "its preset wanted interrupt hooking and we dropped it" is
+        // the first thing worth knowing, and it is invisible otherwise.
+        for note in preset.unsupported() {
+            warn!("'{}': not honoured -- {}", preset.title, note);
+        }
     }
 
     // A PRESET CAN ASK FOR A BASE THE TITLE ITSELF WRITES TO.
@@ -492,16 +599,26 @@ fn wanted_loader_base(
         Ok(b) => b.bytes,
         Err(e) => {
             // Not fatal, and not silent: the base stands, and if it does
-            // collide this line is the only warning there will ever be.
-            warn!(
-                "could not read the boot binary to check it against the loader's \
-                 address ({e}); using 0x{:08x} unchecked",
-                preset.memory
-            );
-            return Some(preset.memory);
+            // collide this line is the only warning there will ever be. A
+            // preset this host cannot build is no better than none here --
+            // without the binary there is nothing to choose a substitute with.
+            let unchecked = found
+                .as_ref()
+                .map(|(p, _)| p.memory)
+                .filter(|&m| loaders::known_unsupported(m).is_none());
+            match unchecked {
+                Some(m) => warn!(
+                    "could not read the boot binary to check it against the loader's \
+                     address ({e}); using 0x{m:08x} unchecked"
+                ),
+                None => warn!(
+                    "could not read the boot binary to check it against the loader's \
+                     address ({e}); leaving the loader where it is, unchecked"
+                ),
+            }
+            return unchecked;
         }
     };
-    let hits = dispatch::literals_in_loader_footprint(&boot, args.address, preset.memory);
 
     // WHICH ADDRESSES WERE ON THE TABLE, not just the one that won. Measured
     // 2026-08-27: a run picked 0x8ce00000 when the policy says 0x8cef8000,
@@ -540,6 +657,73 @@ fn wanted_loader_base(
             seen_db.len()
         ),
     }
+    // NOTHING IN THE DATABASE PRESCRIBES AN ADDRESS, SO THE LOADER STAYS -- BUT
+    // "STAYS" IS A DECISION, and this is the first point at which this host
+    // checks it. It used to be taken before the boot binary or the map had been
+    // read, on the assumption that where the loader is, is the stock base; a
+    // chainload leaves it wherever the last title needed it, and 0x8ce00000 is
+    // where every chainload passes through.
+    let Some((preset, _)) = &found else {
+        let running = running?;
+        if base_is_clear(&boot, args.address, running, seen.as_ref(), 0x4_0000) {
+            info!("keeping the loader where it is, at 0x{running:08x}");
+            return None;
+        }
+        warn!(
+            "'{}' is not in the database, and 0x{running:08x} -- where the loader \
+             already is -- is RAM this title addresses or has been seen reading into. \
+             Looking for somewhere else.",
+            identity.title
+        );
+        return pick_clear_base(&loaders, &boot, args.address, running, seen.as_ref());
+    };
+
+    // A PRESET THIS HOST CANNOT BUILD IS THE STRONGEST STATEMENT IN THE
+    // DATABASE, NOT A MISSING ONE.
+    //
+    // It used to end the decision: `ensure_loader_base` refused the address and
+    // kept the loader where it was. That is the one answer the preset positively
+    // excludes -- DreamShell went below the BIOS syscall area only after
+    // 0x8ce00000 and 0x8cfe8000 had both failed for this title, and 0x8ce00000
+    // is exactly where a loader that has been chainloaded is sitting.
+    //
+    // Measured 2026-08-28 on Jet Set Radio (preset 0x8c000100): the host stayed
+    // at 0x8ce00000, the constant scan reported the title loading that very
+    // address, the run was started anyway, and the 81st disc read of the boot
+    // landed on the loader. Nothing had asked whether staying was safe.
+    if let Some(reason) = loaders::known_unsupported(preset.memory) {
+        warn!(
+            "'{}': its preset asks for 0x{:08x}, which this host cannot build -- {reason}. \
+             DreamShell puts isoldr below the BIOS syscall area only after its default \
+             (0x{:08x}) and its high option (0x{:08x}) have both been rejected for a \
+             title, so those two are ruled out here as well.",
+            preset.title,
+            preset.memory,
+            loaders::ISOLDR_DEFAULT_ADDR,
+            loaders::ISOLDR_HIGH_ADDR,
+        );
+        return match base_for_low_preset(&loaders, &boot, args.address, seen.as_ref()) {
+            Some(alt) => {
+                warn!(
+                    "'{}': using 0x{alt:08x}, the address furthest from anything this \
+                     title is known to touch; pin it with --loader-base to override.",
+                    preset.title
+                );
+                Some(alt)
+            }
+            None => {
+                error!(
+                    "'{}': its preset cannot be built and nothing clear of this title \
+                     could be produced either. The loader stays where it is: if the \
+                     console goes silent with nothing logged, this is why.",
+                    preset.title
+                );
+                None
+            }
+        };
+    }
+    let hits = dispatch::literals_in_loader_footprint(&boot, args.address, preset.memory);
+
     // THE PRESET IS THE ANSWER UNLESS SOMETHING SAYS OTHERWISE, and there are
     // exactly two things that can: what the title NAMES (constants in its
     // binary) and where its reads have LANDED (the learned map). DreamShell's
@@ -553,9 +737,10 @@ fn wanted_loader_base(
     // preset is in the middle of my texture buffers" was sent there anyway --
     // the one case where the map has something to say and nothing to say it
     // about.
-    let seen_hits_preset = seen
-        .as_ref()
-        .is_some_and(|m| m.hits(preset.memory, loaders::LOADER_SPAN, 0x4_0000));
+    // THE SAME TEST AS EVERYWHERE ELSE, which this line was not: it asked the map
+    // about a flat span, and so ruled out the stock base for every title that
+    // uses low RAM -- all of them.
+    let seen_hits_preset = map_hits_loader(preset.memory, seen.as_ref(), 0x4_0000);
     if hits.is_empty() && !seen_hits_preset {
         return Some(preset.memory);
     }
@@ -834,6 +1019,12 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         format!("UNSUPPORTED base -- {reason}")
                     } else if loaders.has(p.memory) {
                         format!("{} present", loaders.path_for(p.memory).display())
+                    } else if loaders.can_provide(p.memory) {
+                        format!(
+                            "no dcload-0x{:08x}.elf, {} relocated to it",
+                            p.memory,
+                            loaders::RELOCATABLE_NAME
+                        )
                     } else {
                         format!(
                             "MISSING dcload-0x{:08x}.elf in {} (looked in: {})",
@@ -846,7 +1037,32 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 for note in p.unsupported() {
                     println!("not done : {note}");
                 }
-                report_collisions(p.memory);
+                // The same two functions `uexec` calls, so this report cannot
+                // drift from what a run would do -- including for a preset this
+                // host cannot build, where "would stay put" was the old answer
+                // and is the one the preset rules out.
+                if loaders::known_unsupported(p.memory).is_some() {
+                    match boot_bytes
+                        .as_deref()
+                        .and_then(|b| base_for_low_preset(&loaders, b, args.address, seen.as_ref()))
+                    {
+                        Some(alt) => {
+                            println!(
+                                "would use: 0x{alt:08x} -- 0x{:08x} and 0x{:08x} are ruled out \
+                                 by a preset this low",
+                                loaders::ISOLDR_DEFAULT_ADDR,
+                                loaders::ISOLDR_HIGH_ADDR
+                            );
+                            report_collisions(alt);
+                        }
+                        None => println!(
+                            "would use: nothing clear of this title could be produced; the \
+                             loader would stay where it is"
+                        ),
+                    }
+                } else {
+                    report_collisions(p.memory);
+                }
             }
         },
     }
@@ -973,6 +1189,14 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Logging goes through the progress display (see `ui`), so that a log
     // record never lands on top of a bar that is being drawn.
     ui::init_logging(args.verbose);
+    // BEFORE anything can take time. A run spends its first seconds
+    // chainloading a loader and pushing megabytes at the console, and a Ctrl-C
+    // in that window used to be an outright kill because the handler was not
+    // installed until the title was already running. This also starts the
+    // ticker that keeps the learned memory map on disk -- read
+    // `memmap::install_signal_handler` for why that ticker, and not the
+    // handler, is what actually saves the file.
+    memmap::install_signal_handler();
     // Before the socket: these never talk to a Dreamcast.
     if let Commands::Identify { ref disc } = args.command {
         return Ok(identify_only(&args, disc));
@@ -1077,6 +1301,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if matches!(args.command, Commands::UExec { .. })
         && let Some(want) = wanted_loader_base(
             &args,
+            running_base,
             disc_reader.as_deref().zip(redirect_disc.as_deref()),
         )
     {
@@ -1261,22 +1486,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             path, &id.md5, &id.title, baseline,
                         )))
                     });
-                // Ctrl-C is how this ends: the title is running and there is
-                // nothing to finish. Without this the map loses whatever it has
-                // not flushed, and nobody is told whether the run taught it
-                // anything -- which is the one thing worth knowing before
-                // deciding to try again.
-                {
-                    let rec = memory_recorder.clone();
-                    if let Err(e) =
-                        ctrlc::set_handler(move || memmap::report_and_exit(rec.as_deref()))
-                    {
-                        warn!(
-                            "no Ctrl-C handler ({e}); the memory map will still be written \
-                             every few seconds, but the last of it may be lost"
-                        );
-                    }
-                }
+                // From here the ticker installed at the top of main has
+                // something to write, and a Ctrl-C has something to report.
+                memmap::set_active(memory_recorder.clone());
                 info!("Upload complete, executing at 0x{:08x}", entry);
                 // The title is on the console now; the host's copy is only
                 // holding up to 16 MiB for the length of the session.
@@ -1371,5 +1583,154 @@ mod tests {
         }
         assert_eq!(safe_output_name(".."), "1ST_READ.BIN");
         assert_eq!(safe_output_name(""), "1ST_READ.BIN");
+    }
+
+    /// Jet Set Radio's row after the session of 2026-08-28: the low buffer, the
+    /// boot's ascending load truncated exactly where it overwrote the loader at
+    /// 0x8ce00000, and the sector buffer the title keeps at the top of RAM.
+    const JSR_BLOCKS: &str =
+        "40000000000000000000000000000000000000000000000000e0ffff01000080";
+
+    /// A raw boot binary whose only content is a `mov.l @(disp,PC),R1` loading
+    /// `constant` -- the shape `literals_in_loader_footprint` reports, and the
+    /// shape Jet Set Radio has at 0x8c013bde.
+    fn boot_loading(constant: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 0x1000];
+        b[0x200..0x204].copy_from_slice(&constant.to_le_bytes());
+        let disp = (0x200 - ((0x100 + 4) & !3)) / 4;
+        b[0x100..0x102].copy_from_slice(&(0xd100u16 | disp as u16).to_le_bytes());
+        b
+    }
+
+    /// A `loaders/` directory holding names only: nothing on this path opens an
+    /// ELF, it asks which bases exist and whether the relocatable image is there.
+    fn fake_loader_dir(name: &str, bases: &[u32]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for b in bases {
+            std::fs::write(dir.join(format!("dcload-0x{b:08x}.elf")), []).unwrap();
+        }
+        std::fs::write(dir.join(loaders::RELOCATABLE_NAME), []).unwrap();
+        dir
+    }
+
+    /// Sonic Adventure's row: it marks 0x8c030000, in the BIOS work area a low
+    /// loader shares with the title by construction, and it marks
+    /// 0x8ce00000..0x8cef0000, which is most of where a relocation could go.
+    const SA_BLOCKS: &str =
+        "0800000000000000000000000006007c024000ff0000f0000078ffffffff0000";
+
+    #[test]
+    fn the_stock_base_is_not_condemned_by_a_title_using_low_ram() {
+        // The guard that fires on the one title known to work guards nothing
+        // (AGENTS.md 14.9). Sonic Adventure's preset IS the stock base and it
+        // is measured running there; judging that base on its flat span made
+        // the map say otherwise.
+        let map = memmap::MemoryMap::from_hex(SA_BLOCKS).unwrap();
+        assert!(map.is_marked(3), "the fixture must reproduce 0x8c030000");
+        assert!(!map_hits_loader(loaders::DEFAULT_BASE, Some(&map), 0x4_0000));
+
+        // What a low loader DOES keep in high RAM is still judged: its packet
+        // and Maple buffers at 0x8cfe8000 are in RAM a title owns outright.
+        let mut buffers = memmap::MemoryMap::new();
+        buffers.mark(0x8cfe_8000, 0x1000);
+        assert!(map_hits_loader(loaders::DEFAULT_BASE, Some(&buffers), 0));
+    }
+
+    #[test]
+    fn a_low_request_is_never_answered_with_a_high_base() {
+        // Relocation moves a HIGH image and its window is entirely high, so
+        // once the scan was clamped to that window a low `wanted` would have
+        // been answered with a base in the RAM the preset exists to leave to
+        // the title. The answer is no answer.
+        let dir = fake_loader_dir("dcload-family", &[loaders::ISOLDR_DEFAULT_ADDR]);
+        let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
+        let map = memmap::MemoryMap::from_hex(SA_BLOCKS).unwrap();
+        // A title naming a low loader's packet buffers: the stock base really
+        // is ruled out here, so this is not None for want of a reason.
+        let boot = boot_loading(0x8cfe_8000);
+        assert!(
+            !dispatch::literals_in_loader_footprint(&boot, 0x0c01_0000, loaders::DEFAULT_BASE)
+                .is_empty(),
+            "the fixture does not rule out the base it is about"
+        );
+        assert_eq!(
+            pick_clear_base(&set, &boot, 0x0c01_0000, loaders::DEFAULT_BASE, Some(&map)),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preset_this_host_cannot_build_moves_the_loader_off_isoldrs_addresses() {
+        let dir = fake_loader_dir("dcload-lowpreset", &[loaders::ISOLDR_DEFAULT_ADDR]);
+        let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
+        let map = memmap::MemoryMap::from_hex(JSR_BLOCKS).unwrap();
+        let boot = boot_loading(loaders::ISOLDR_DEFAULT_ADDR);
+
+        // THE FIXTURE HAS TO REPRODUCE THE FAILURE BEFORE ITS ABSENCE MEANS
+        // ANYTHING (AGENTS.md 14.9): 0x8ce00000 is where the loader was left,
+        // and it is both a constant this title loads and a block it read into.
+        assert!(
+            !dispatch::literals_in_loader_footprint(
+                &boot,
+                0x0c01_0000,
+                loaders::ISOLDR_DEFAULT_ADDR
+            )
+            .is_empty(),
+            "the fixture does not reproduce the collision it is about"
+        );
+        assert!(map.hits(loaders::ISOLDR_DEFAULT_ADDR, loaders::LOADER_SPAN, 0));
+
+        // The middle of the biggest stretch no disc read has ever landed in.
+        // NOT 0x8ce10000..0x8cff0000, the biggest one above the constant floor:
+        // this title's image is 4 KB here, so the floor is its own image's end
+        // and the answer comes from 0x8c070000..0x8ccd0000 -- 198 blocks
+        // against 30, and against the single block Jet Set Radio's finished map
+        // leaves above 0x8ce00000.
+        assert_eq!(
+            base_for_low_preset(&set, &boot, 0x0c01_0000, Some(&map)),
+            Some(0x8c69_0000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jet_set_radios_finished_map_leaves_only_one_block_up_high() {
+        // The row as it stands after several sessions: 0x8ccd0000..0x8cfdffff
+        // and 0x8cff0000 are all disc-read destinations, so the whole
+        // relocatable window is taken bar block 254 -- 64 KB for a 56 KB
+        // loader, with the title's own data hard against both sides. Below the
+        // constant floor, 12.4 MB of RAM no read has ever landed in.
+        const JSR_FULL: &str =
+            "40000000000000000000000000000000000000000000000000e0ffffffffffbf";
+        let map = memmap::MemoryMap::from_hex(JSR_FULL).unwrap();
+        assert!(!map.is_marked(254), "0x8cfe0000 is the one block left up high");
+        assert!(map.is_marked(253) && map.is_marked(255), "on both sides of it");
+
+        let dir = fake_loader_dir("dcload-jsr-full", &[loaders::ISOLDR_DEFAULT_ADDR]);
+        let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
+        // 1ST_READ.BIN as the disc holds it: 341696 bytes at 0x8c010000.
+        let boot = vec![0u8; 341_696];
+        assert_eq!(
+            base_for_low_preset(&set, &boot, 0x0c01_0000, Some(&map)),
+            Some(0x8c6a_0000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_low_preset_with_nothing_learned_still_avoids_the_two_it_rules_out() {
+        // No row for this game and a binary that names nothing: every base is
+        // equally unproven, so the answer is the middle of the window -- but
+        // 0x8ce00000, which is both isoldr's default and where a chainloaded
+        // loader is sitting, is still excluded rather than kept by default.
+        let dir = fake_loader_dir("dcload-lowpreset-blank", &[loaders::ISOLDR_DEFAULT_ADDR]);
+        let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
+        let got = base_for_low_preset(&set, &vec![0u8; 0x1000], 0x0c01_0000, None);
+        assert_eq!(got, Some(0x8c81_0000));
+        assert!(!loaders::ruled_out_by_low_preset(got.unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

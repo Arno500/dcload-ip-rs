@@ -92,6 +92,52 @@ impl MemoryMap {
         (first..=last.max(first)).any(|i| self.is_marked(i))
     }
 
+    /// The address a block starts at, in the cached window this host names RAM
+    /// by everywhere else.
+    fn block_addr(block: usize) -> u32 {
+        0x8c00_0000 + block as u32 * BLOCK
+    }
+
+    /// Runs of RAM this title has NEVER been seen using, clipped to `[lo, hi)`
+    /// and ordered longest first.
+    ///
+    /// THE BIGGEST HOLE, NOT THE HIGHEST FREE ADDRESS, and the difference is
+    /// the whole point. A run is bounded at both ends by blocks a read really
+    /// landed in, so its middle is the furthest a loader can get from anything
+    /// this title is known to touch -- and since a map is only ever a lower
+    /// bound on what a title uses, distance from the nearest evidence is the
+    /// only ranking available. The top of RAM, by contrast, looks gloriously
+    /// free on a map that stopped growing the moment the title overwrote the
+    /// loader, which is exactly the map this is read from: every row here for a
+    /// title that failed is truncated at its own failure.
+    ///
+    /// Ties keep block order, lowest first. Two runs of equal length carry no
+    /// information to choose between them, and being deterministic is worth
+    /// more than being clever.
+    pub fn free_runs(&self, lo: u32, hi: u32) -> Vec<(u32, u32)> {
+        let first = Self::index(lo).unwrap_or(0);
+        let last = Self::index(hi.saturating_sub(1)).unwrap_or(BLOCKS - 1).max(first);
+        let mut runs: Vec<(usize, usize)> = vec![];
+        let mut start: Option<usize> = None;
+        for i in first..=last {
+            match (self.is_marked(i), start) {
+                (true, Some(s)) => {
+                    runs.push((s, i));
+                    start = None;
+                }
+                (false, None) => start = Some(i),
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, last + 1));
+        }
+        runs.sort_by_key(|&(a, b)| std::cmp::Reverse(b - a));
+        runs.into_iter()
+            .map(|(a, b)| (Self::block_addr(a).max(lo), Self::block_addr(b).min(hi)))
+            .collect()
+    }
+
     /// Everything either map has seen. Order does not matter, which is what
     /// lets two people's files merge.
     pub fn merge(&mut self, other: &MemoryMap) {
@@ -254,11 +300,21 @@ impl MemoryDb {
 
 /// Accumulates one session's observations and writes them out as it goes.
 ///
-/// SAVED WHILE RUNNING, not at the end. A session with a title is normally
-/// ended by Ctrl-C or by pulling the console's plug, and neither runs any
-/// shutdown path -- so "write it when we are done" means writing it almost
-/// never, and the interesting sessions (the ones that hang) would be exactly
-/// the ones that record nothing.
+/// SAVED WHILE RUNNING, not at the end, and not from the read path either.
+/// A session with a title is normally ended by Ctrl-C or by pulling the
+/// console's plug, and neither runs any shutdown path -- so "write it when we
+/// are done" means writing it almost never, and the interesting sessions (the
+/// ones that hang) would be exactly the ones that record nothing.
+///
+/// **There are ends this process is not told about at all.** Under a debugger
+/// the Ctrl-C handler is not reached (see `install_signal_handler`), and a
+/// Stop button is a kill. So the file is kept current by a ticker thread that
+/// owes nothing to either: `record()` marks and returns, `flush_if_due()` on
+/// the ticker does the I/O. Two consequences, both wanted:
+///
+/// - the worst a `kill -9` can cost is `EVERY`, not a whole session;
+/// - **no disc read pays for a file write.** dcload answers a read
+///   synchronously, so anything done on that path is time the title is frozen.
 pub struct MemoryRecorder {
     path: std::path::PathBuf,
     md5: String,
@@ -271,18 +327,27 @@ pub struct MemoryRecorder {
     baseline: MemoryMap,
     last_save: std::time::Instant,
     first: bool,
+    /// How many new blocks have already been named in the log. The end-of-run
+    /// report is not reachable from every kind of exit, so the verdict it
+    /// carries is also emitted as it becomes true.
+    reported_new: usize,
 }
 
 impl MemoryRecorder {
-    /// The interval between writes. Long enough that the cost is nothing
-    /// against a session, short enough that a hang loses at most this much.
-    const EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+    /// The interval between writes -- and, since nothing else is guaranteed to
+    /// run at the end, the most a killed session can lose. It used to be 15 s
+    /// on the argument that a write is not free; that argument was about the
+    /// read path, which no longer writes at all, so the only thing left to
+    /// balance is loss against a 1 KB file rewrite every few seconds.
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(2);
     /// ...but the FIRST write comes quickly, because a title that dies in the
-    /// first few seconds is the one whose map is most worth having, and a
-    /// 15-second wait would mean it recorded nothing at all. Everything after
-    /// that is a refinement; this one is the difference between a row and no
-    /// row.
-    const FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+    /// first few seconds is the one whose map is most worth having, and a long
+    /// wait would mean it recorded nothing at all. Everything after that is a
+    /// refinement; this one is the difference between a row and no row.
+    const FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+    /// How often the ticker looks. Finer than `EVERY`, so a change is written
+    /// roughly when it is due rather than at the next multiple of anything.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
     pub fn new(path: std::path::PathBuf, md5: &str, title: &str, baseline: MemoryMap) -> Self {
         Self {
@@ -294,6 +359,7 @@ impl MemoryRecorder {
             baseline,
             last_save: std::time::Instant::now(),
             first: true,
+            reported_new: 0,
         }
     }
 
@@ -314,11 +380,32 @@ impl MemoryRecorder {
         &self.path
     }
 
-    /// Note a write, and flush if it is time. Called on the disc-read path, so
-    /// it must not do real work in the common case: marking is two shifts, and
-    /// the clock is only consulted when the map actually changed.
+    /// Note a write. Called on the disc-read path -- which is the path the
+    /// title is frozen on -- so it does no I/O at all: marking is two shifts,
+    /// and the writing is the ticker's job.
     pub fn record(&mut self, addr: u32, len: u32) {
+        let before = self.map;
         self.map.mark(addr, len);
+        if self.map == before {
+            return;
+        }
+        // WHAT THIS SESSION TAUGHT, SAID WHEN IT IS LEARNED rather than only at
+        // the end. `report_and_exit` is the nicer place to say it, and it is
+        // also the place a debugger's Stop button never reaches; a line in the
+        // log survives any ending, including the ones that leave no trace.
+        let new = self.new_blocks();
+        if new > self.reported_new {
+            self.reported_new = new;
+            log::info!(
+                "memory map: this title reads into 0x{addr:08x}, a 64 KB block that was \
+                 not known before -- {new} new this session"
+            );
+        }
+    }
+
+    /// Write, if there is anything to write and enough time has passed.
+    /// Called from the ticker, never from the read path.
+    pub fn flush_if_due(&mut self) {
         let due = if self.first { Self::FIRST } else { Self::EVERY };
         if self.map == self.saved || self.last_save.elapsed() < due {
             return;
@@ -345,6 +432,71 @@ impl MemoryRecorder {
     }
 }
 
+/// The recorder the ticker and the signal handler act on, or `None` before a
+/// title has been identified.
+///
+/// A slot rather than a captured value, because the handler has to be in place
+/// LONG BEFORE there is anything to hand it: a run spends its first seconds
+/// chainloading a loader and pushing several megabytes at the console, and a
+/// Ctrl-C in that window used to kill the process outright.
+static ACTIVE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<MemoryRecorder>>>> =
+    std::sync::Mutex::new(None);
+
+fn active() -> Option<std::sync::Arc<std::sync::Mutex<MemoryRecorder>>> {
+    ACTIVE.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// Hand the ticker and the signal handler this session's recorder.
+pub fn set_active(rec: Option<std::sync::Arc<std::sync::Mutex<MemoryRecorder>>>) {
+    if let Ok(mut slot) = ACTIVE.lock() {
+        *slot = rec;
+    }
+}
+
+/// Install the Ctrl-C handler and start the ticker that keeps the map on disk.
+///
+/// WHY THE TICKER IS NOT OPTIONAL. Ctrl-C is a courtesy this process is not
+/// always paid:
+///
+/// - **Under a debugger it never arrives.** lldb (so CodeLLDB, so Zed's debug
+///   panel) takes SIGINT for itself -- `pass=false, stop=true` -- and on
+///   Windows a console Ctrl-C reaches the debugger first as `DBG_CONTROL_C`.
+///   Either way the debuggee is *suspended*, which is exactly what it looks
+///   like: "it just stopped". Whatever ends it afterwards is a kill.
+/// - **A Stop button is a kill**, and `SIGKILL` / `TerminateProcess` run no
+///   handler by construction.
+/// - A process launched with pipes instead of a console (which is how a DAP
+///   adapter usually starts one on Windows) is not in any console process
+///   group, so no `CTRL_C_EVENT` is delivered to it at all.
+///
+/// So the handler is the good ending, not the mechanism. The mechanism is that
+/// the file is already current whenever the process dies.
+///
+/// To get the good ending back inside Zed, tell lldb to hand the signal over:
+/// `"postRunCommands": ["process handle SIGINT --stop false --pass true"]`
+/// in the debug configuration (see `.zed/debug.json`).
+pub fn install_signal_handler() {
+    if let Err(e) = ctrlc::set_handler(|| {
+        let rec = active();
+        report_and_exit(rec.as_deref())
+    }) {
+        log::warn!(
+            "no Ctrl-C handler ({e}); the memory map is still written every few \
+             seconds, but the end-of-session report will not be printed"
+        );
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(MemoryRecorder::TICK);
+            if let Some(rec) = active()
+                && let Ok(mut rec) = rec.lock()
+            {
+                rec.flush_if_due();
+            }
+        }
+    });
+}
+
 /// Flush what the session learned, say whether it learned anything, and leave.
 ///
 /// WHY THIS IS A WARNING AND NOT A CLOSING PLEASANTRY. When a title has just
@@ -356,6 +508,9 @@ impl MemoryRecorder {
 /// saying just as loudly, because retrying unchanged is the obvious thing to do
 /// and it is a waste of a session.
 pub fn report_and_exit(recorder: Option<&std::sync::Mutex<MemoryRecorder>>) -> ! {
+    // The bars own the cursor and hide it while they draw; exiting through
+    // them leaves a terminal with no cursor in it.
+    let _ = crate::ui::multi().clear();
     if let Some(lock) = recorder {
         // A poisoned lock means the main thread panicked while holding it; the
         // map is then not trustworthy and there is nothing to report.
@@ -395,6 +550,31 @@ mod tests {
     }
 
     #[test]
+    fn the_read_path_does_no_io() {
+        // dcload answers a disc read synchronously -- the title is frozen for
+        // as long as the host takes -- so a file write there is time stolen
+        // from the game. It is also what made the map depend on a clean exit:
+        // the writing belongs to the ticker now, which owes nothing to how the
+        // process ends.
+        let dir = std::env::temp_dir().join("dcload-memmap-readpath");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("x.tsv");
+        let mut rec = MemoryRecorder::new(path.clone(), "md5", "T", MemoryMap::new());
+
+        rec.record(0x8c40_0000, 16384);
+        assert!(
+            !path.exists(),
+            "record() wrote the database from the disc-read path"
+        );
+        assert_eq!(rec.new_blocks(), 1, "record() did not mark the block");
+
+        rec.flush();
+        assert!(path.exists(), "flush() did not write the database");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn what_a_session_taught_is_counted_against_what_was_known() {
         // The number the end-of-session report turns on: "run it again" is only
         // worth saying when this session actually added something.
@@ -413,6 +593,58 @@ mod tests {
         rec.map.mark(0x8cfc_0360, 16384);
         assert_eq!(rec.new_blocks(), 1);
         assert_eq!(rec.known_blocks(), 2);
+    }
+
+    /// Jet Set Radio's row, as `game-memory.tsv` held it after the session that
+    /// prompted all of this: one low buffer, the boot's big ascending load
+    /// TRUNCATED where it overwrote the loader at 0x8ce00000, and the ISO
+    /// sector buffer the title keeps at the very top of RAM.
+    const JSR: &str = "40000000000000000000000000000000000000000000000000e0ffff01000080";
+
+    #[test]
+    fn the_biggest_hole_is_not_the_top_of_ram() {
+        let m = MemoryMap::from_hex(JSR).unwrap();
+        // What the row actually says, so a change to it is visible here.
+        assert!(m.is_marked(224), "0x8ce00000 -- the read that killed the run");
+        assert!(m.is_marked(255), "0x8cff0000 -- the title's own sector buffer");
+
+        let runs = m.free_runs(0x8ce0_0000, 0x8d00_0000);
+        assert_eq!(
+            runs.first().copied(),
+            Some((0x8ce1_0000, 0x8cff_0000)),
+            "the biggest run in the relocatable window is not the one bounded by \
+             the two blocks the title is known to use"
+        );
+        // The top of RAM looks free only because the map stops at the failure.
+        // Taking the highest free address would put the loader at 0x8cfe0000,
+        // hard against the block the title demonstrably writes.
+        assert!(runs[0].1 <= 0x8cff_0000);
+    }
+
+    #[test]
+    fn an_empty_map_is_one_run_and_not_a_special_case() {
+        // No row for this game yet: every base is equally unproven, and the
+        // caller gets the middle of the window rather than a None to branch on.
+        let runs = MemoryMap::new().free_runs(0x8ce0_0000, 0x8d00_0000);
+        assert_eq!(runs, vec![(0x8ce0_0000, 0x8d00_0000)]);
+    }
+
+    #[test]
+    fn free_runs_are_ordered_longest_first() {
+        let mut m = MemoryMap::new();
+        m.mark(0x8ce2_0000, 1); // leaves 0x8ce00000..0x8ce20000 (2 blocks)
+        m.mark(0x8ce5_0000, 1); // then 0x8ce30000..0x8ce50000 (2 blocks)
+        // ... and 0x8ce60000..0x8ce90000, three blocks, is the longest.
+        let runs = m.free_runs(0x8ce0_0000, 0x8ce9_0000);
+        assert_eq!(
+            runs,
+            vec![
+                (0x8ce6_0000, 0x8ce9_0000),
+                (0x8ce0_0000, 0x8ce2_0000),
+                (0x8ce3_0000, 0x8ce5_0000),
+            ],
+            "longest first, and ties in block order"
+        );
     }
 
     #[test]

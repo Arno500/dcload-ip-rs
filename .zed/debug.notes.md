@@ -99,3 +99,29 @@ diagnose a stall on a non-SA target, add the env var to that config's
   the same setting; Zed has no global setupCommands)
 - `stdio: ""` and `terminal: "integrated"` → omitted (Zed defaults route
   stdio to the debug console and use the built-in terminal panel)
+
+---
+
+## Ctrl-C does not reach the program under the debugger
+
+Pressing Ctrl-C on a debug session **suspends** the program instead of
+delivering the interrupt to it: lldb (so CodeLLDB, so this panel) claims
+SIGINT for itself — `pass=false, stop=true` — and on the Windows build a
+console Ctrl-C reaches the debugger first as a `DBG_CONTROL_C` exception.
+Whatever ends the session afterwards is a kill, and the Stop button is a
+kill outright. That is why "Ctrl-C just stops the app".
+
+**Nothing is lost by this.** `src/memmap.rs` keeps `game-memory.tsv`
+current from a ticker thread (every 2 s, 1 s for the first write), and
+logs each newly-learned 64 KB block as it is marked, precisely so that no
+ending has to be graceful. What Ctrl-C adds is the closing report — "this
+session added N blocks, run it again" — and only that.
+
+To try to get the report back, add to a configuration:
+
+```json
+"postRunCommands": ["process handle SIGINT --stop false --pass true --notify false"]
+```
+
+Untested against the Windows (MSVC) target, where SIGINT is not the
+mechanism in the first place; harmless if it does nothing.

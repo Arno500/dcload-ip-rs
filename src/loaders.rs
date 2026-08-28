@@ -81,23 +81,109 @@ pub const SCRATCH_BASE: u32 = 0x8ce0_0000;
 /// stack pointer are exactly where they should be -- but it is deaf, and the
 /// session is over with no error anywhere.
 ///
-/// The ranges mirror DCLOAD_STACK / DCLOAD_HIRAM / DCLOAD_MAPLE in
-/// target-src/dcload/Makefile. If that layout table changes, this changes with
-/// it.
+/// The ranges come from `layout()`, which is the one copy of DCLOAD_STACK /
+/// DCLOAD_HIRAM / DCLOAD_MAPLE on this side.
 pub fn live_footprint(base: u32) -> Vec<(u32, u32)> {
-    if base < 0x8c01_0000 {
+    let l = layout(base);
+    if is_high(base) {
+        // A high loader keeps all of it together: image, stack, .hiram and the
+        // Maple DMA buffer, in that order, from the base.
+        vec![(l.image, l.maple + LAYOUT_PAGE)]
+    } else {
         vec![
             // Image, BSS, and the stack descending from the BIOS VBR.
-            (base, 0x8c00_f400),
-            // Maple DMA buffer (0x8cfe8000, 2 KB) and the .hiram packet
-            // buffers (0x8cfe9000, 3 KB), as one range.
-            (0x8cfe_8000, 0x8cfe_a000),
+            (l.image, l.stack),
+            // Maple DMA buffer (2 KB) and the .hiram packet buffers (3 KB), a
+            // page apart in high RAM, as one range.
+            (l.maple, l.hiram + LAYOUT_PAGE),
         ]
-    } else {
-        // A high loader keeps all of it together: image, stack to base+0xb000,
-        // .hiram at +0xc000, Maple at +0xd000.
-        vec![(base, base + 0xe000)]
     }
+}
+
+/// The four addresses one loader build is pinned to.
+///
+/// THIS IS THE LAYOUT TABLE in target-src/dcload/Makefile, and the only copy of
+/// it on the host. `live_footprint` and `relocate` both read it, so they cannot
+/// come to disagree about where a loader's buffers are -- which they would
+/// otherwise, since one of them decides what an upload may overwrite and the
+/// other decides what an address in the image is rewritten to.
+///
+/// The two families exist because 0x8cfe8000 and 0x8cfe9000 are INSIDE the
+/// image once the base is 0x8cfe8000. HIGH therefore takes all four relative to
+/// the base. LOW keeps the image where every KOS program expects it -- the
+/// magic at base+4, the syscall trampoline at base+8 -- with its stack
+/// descending from the BIOS VBR directly above it and its two big buffers far
+/// away in high RAM, out of reach of a title's descending stack (AGENTS.md 4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// The image: text, rodata, data, bss. The base itself.
+    pub image: u32,
+    /// The loader's own stack TOP. It descends from here, and for a LOW base it
+    /// is the BIOS VBR, which does not follow the image.
+    pub stack: u32,
+    /// The `.hiram` packet buffers (3 KB).
+    pub hiram: u32,
+    /// The Maple DMA buffer (2 KB).
+    pub maple: u32,
+}
+
+/// The width the layout gives each of the two buffers, in both families.
+///
+/// They are 3 KB and 2 KB, so a page is loose enough to contain `__hiram_end`
+/// -- one past the last byte, and named by a relocation like any other symbol
+/// -- and tight enough never to reach the neighbouring region.
+pub const LAYOUT_PAGE: u32 = 0x1000;
+
+pub fn layout(base: u32) -> Layout {
+    if is_high(base) {
+        Layout {
+            image: base,
+            stack: base + 0xb000,
+            hiram: base + 0xc000,
+            maple: base + 0xd000,
+        }
+    } else {
+        Layout {
+            image: base,
+            stack: 0x8c00_f400,
+            hiram: 0x8cfe_9000,
+            maple: 0x8cfe_8000,
+        }
+    }
+}
+
+/// The part of `live_footprint(base)` NO TITLE HAS BUSINESS ADDRESSING.
+///
+/// A low loader shares its region with the BIOS work area by construction
+/// (AGENTS.md 4.6): 0x8c008000 is where IP.BIN lives, and a title reads its own
+/// disc header there as a matter of course. Measured: Sonic Adventure -- which
+/// runs perfectly at the stock base -- has eleven constants in
+/// 0x8c0080f0..0x8c008208, every one of them legitimate. Reporting those would
+/// have the collision check crying wolf on the one title known to work, and a
+/// guard that always fires guards nothing (AGENTS.md 14.9).
+///
+/// The high ranges are different, and a low loader HAS ONE: its packet buffers
+/// and Maple DMA buffer live at 0x8cfe8000, in RAM a title owns outright. So
+/// this is not "skip the check for low bases" -- it is "check every range the
+/// title has no claim on", which for a low base is the buffers alone.
+///
+/// Both the constant scan and the learned-map check read this, so they cannot
+/// come to disagree about which RAM is the loader's.
+pub fn exclusive_footprint(base: u32) -> Vec<(u32, u32)> {
+    live_footprint(base)
+        .into_iter()
+        .filter(|&(lo, _)| is_high(lo))
+        .collect()
+}
+
+/// Which of the two layout families a base belongs to: HIGH keeps stack,
+/// `.hiram` and Maple buffer relative to the base, LOW leaves them at
+/// 0x8cfe8000 whatever the image's address (AGENTS.md 4.11). `relocate` crosses
+/// the line -- it moves each region by its own delta -- but a FALLBACK never
+/// does: answering a low request with a high base trades the collision the
+/// preset avoids for the one it exists to avoid.
+pub fn is_high(base: u32) -> bool {
+    base >= 0x8c01_0000
 }
 
 /// The image `make loaders` links with `ld -q`, which the host can move to any
@@ -113,8 +199,75 @@ pub const RELOCATABLE_NAME: &str = "dcload-relocatable.elf";
 /// long. The ceiling leaves the loader's whole span inside RAM. 64 KB steps
 /// give 31 candidates between the two -- far more than the four bases this
 /// replaces, and every one of them aligned enough to read in a log.
-const FREE_BASE_FLOOR: u32 = 0x8ce0_0000;
+const FREE_BASE_FLOOR: u32 = ISOLDR_DEFAULT_ADDR;
 const FREE_BASE_STEP: u32 = 0x1_0000;
+
+/// isoldr's own two answers to "the loader must be out of the title's way",
+/// and the reason a preset naming NEITHER is information rather than a shrug.
+///
+/// DreamShell places isoldr at `ISOLDR_DEFAULT_ADDR` by default and at `_HIGH`
+/// when that is not enough. A preset that instead asks for `_MIN` (0x8c000100)
+/// or `_MIN_GINSU` (0x8c001100) -- 276 of the database's 1026 rows -- is saying
+/// that BOTH of these were rejected for that title, and that the loader had to
+/// go below the BIOS syscall area, which is the only place left. An unsupported
+/// preset is therefore not "no opinion about where the loader goes". It is the
+/// strongest opinion in the database, and what it rules out is exactly the two
+/// addresses a host with nothing else to go on reaches for first.
+///
+/// Measured 2026-08-28 on Jet Set Radio, whose preset is 0x8c000100: the host
+/// could not honour it, kept the loader where it happened to be -- 0x8ce00000,
+/// which is this constant -- and the title both loads that address as a literal
+/// (at 0x8c013bde) and read a disc sector onto it 81 reads into the boot.
+pub const ISOLDR_DEFAULT_ADDR: u32 = 0x8ce0_0000;
+pub const ISOLDR_HIGH_ADDR: u32 = 0x8cfe_8000;
+
+/// Would a loader at `base` sit where isoldr would have, for a title whose
+/// preset says isoldr could not?
+///
+/// Overlap of the spans, not equality: isoldr's build is 13 KB and ours is
+/// 0xe000, so "DreamShell could not fit 13 KB here" says nothing good about a
+/// 56 KB image starting one step away.
+pub fn ruled_out_by_low_preset(base: u32) -> bool {
+    [ISOLDR_DEFAULT_ADDR, ISOLDR_HIGH_ADDR]
+        .iter()
+        .any(|&addr| base.abs_diff(addr) < LOADER_SPAN)
+}
+
+/// The same, for a title whose preset cannot be honoured -- floored by where
+/// that title's OWN IMAGE ends instead of by a constant.
+///
+/// `FREE_BASE_FLOOR` exists because "below it a loader starts competing with the
+/// title's own image, which is loaded at 0x8c010000 and is routinely megabytes
+/// long". That is a guess this host does not have to make: it uploaded the
+/// image and knows its length. Jet Set Radio's is 334 KB, and against that the
+/// constant floor hides **12.4 MB of RAM no disc read has ever landed in**
+/// behind an assumption about a different game -- while the only room left above
+/// it is a single 64 KB block with the title's data hard against both sides.
+///
+/// Only for that path. The normal one keeps the constant, because its ordering
+/// is what Sonic Adventure and Sonic Adventure 2 were measured against, and a
+/// title whose preset CAN be built has no reason to go looking down here.
+///
+/// One step of margin above the image, and `search_free_base`'s neighbour rule
+/// buys another: a title that allocates immediately after its own image is the
+/// obvious hazard down here.
+pub fn window_above_image(image_end: u32) -> (u32, u32) {
+    let floor = (image_end.max(0x8c01_0000).div_ceil(FREE_BASE_STEP) + 1) * FREE_BASE_STEP;
+    (floor, 0x8d00_0000)
+}
+
+/// The candidate base furthest from both ends of `[lo, hi)`.
+///
+/// CENTRED, because the only spans worth handing to this are ones bounded by
+/// RAM the title really does use: the middle is then the furthest point from
+/// both walls, and the walls are the only evidence there is. Aligned to the
+/// same step `search_free_base` uses, so the answer is one it could also have
+/// reached and reads the same way in a log.
+pub fn base_in_span(lo: u32, hi: u32) -> Option<u32> {
+    let first = lo.div_ceil(FREE_BASE_STEP) * FREE_BASE_STEP;
+    let last = (hi.checked_sub(LOADER_SPAN)? / FREE_BASE_STEP) * FREE_BASE_STEP;
+    (last >= first).then(|| first + ((last - first) / FREE_BASE_STEP / 2) * FREE_BASE_STEP)
+}
 
 /// Find a base whose span the title does not address, starting from the one its
 /// preset asked for.
@@ -129,12 +282,29 @@ const FREE_BASE_STEP: u32 = 0x1_0000;
 /// counts as clear is not this module's business -- today it is "the title
 /// loads no constant pointing inside the span".
 pub fn search_free_base(wanted: u32, is_clear: impl Fn(u32) -> bool) -> Option<u32> {
-    if is_clear(wanted) {
+    search_free_base_above(FREE_BASE_FLOOR, wanted, is_clear)
+}
+
+/// The same walk, from a floor the caller chose. See `window_above_image` for
+/// the one case that does not want the constant.
+pub fn search_free_base_above(
+    floor: u32,
+    wanted: u32,
+    is_clear: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let free_base_floor = floor;
+    let ceiling = (0x8d00_0000 - LOADER_SPAN) & !(FREE_BASE_STEP - 1);
+    // A `wanted` OUTSIDE THE WINDOW IS A STARTING POINT, NEVER AN ANSWER.
+    // Callers pass the address a preset asked for, and 276 of the 1026 presets
+    // ask for one below 0x8c004000 -- an address no relocation can produce.
+    // Returning it here, or letting it seed the scan (the old `min(ceiling)`
+    // clamped only the top, so a low `wanted` started the upward walk at
+    // 0x8c010000), offers a base inside the title's own image.
+    if (free_base_floor..=ceiling).contains(&wanted) && is_clear(wanted) {
         return Some(wanted);
     }
-    let ceiling = (0x8d00_0000 - LOADER_SPAN) & !(FREE_BASE_STEP - 1);
-    let start = wanted.min(ceiling) & !(FREE_BASE_STEP - 1);
-    let down = (FREE_BASE_FLOOR..=start).rev().step_by(FREE_BASE_STEP as usize);
+    let start = wanted.clamp(free_base_floor, ceiling) & !(FREE_BASE_STEP - 1);
+    let down = (free_base_floor..=start).rev().step_by(FREE_BASE_STEP as usize);
     let up = ((start + FREE_BASE_STEP)..=ceiling).step_by(FREE_BASE_STEP as usize);
     // THE NEIGHBOURS HAVE TO BE CLEAR TOO, which buys a step of margin on each
     // side. What is detected is a constant -- an address the title NAMES -- and
@@ -144,7 +314,7 @@ pub fn search_free_base(wanted: u32, is_clear: impl Fn(u32) -> bool) -> Option<u
     down.chain(up).find(|&b| {
         b != wanted
             && is_clear(b)
-            && (b < FREE_BASE_FLOOR + FREE_BASE_STEP || is_clear(b - FREE_BASE_STEP))
+            && (b < free_base_floor + FREE_BASE_STEP || is_clear(b - FREE_BASE_STEP))
             && (b + FREE_BASE_STEP > ceiling || is_clear(b + FREE_BASE_STEP))
     })
 }
@@ -154,48 +324,83 @@ pub fn search_free_base(wanted: u32, is_clear: impl Fn(u32) -> bool) -> Option<u
 /// at +0xd000.
 pub const LOADER_SPAN: u32 = 0xe000;
 
+/// How big the loader image is allowed to be for the CHEAP feasibility test
+/// below. Measured `_end - base = 0x65f8` on the build this was written
+/// against, rounded up with room to grow; `relocate` reads the real `_end` out
+/// of the ELF and is the authority.
+const LOADER_IMAGE_MAX: u32 = 0x8000;
+
+/// Whether `relocate` could put a loader at `base`, decided without reading an
+/// ELF: alignment, RAM, and enough room under a stack that for a LOW base does
+/// not follow the image down.
+///
+/// This exists because "can the set answer for this base" is asked before
+/// anything has been read from disk -- and answering it with "is it high?", as
+/// it was until 2026-08-28, told someone whose title wanted the stock base to
+/// go and build a file that was already sitting in the directory.
+pub fn could_relocate_to(base: u32) -> bool {
+    plausible_base(base)
+        && live_footprint(base)
+            .iter()
+            .all(|&(lo, hi)| lo < hi && hi <= 0x8d00_0000)
+        && base.saturating_add(LOADER_IMAGE_MAX).saturating_add(800) < layout(base).stack
+}
+
 /// Move a relocatable loader image to `to`, without rebuilding it.
 ///
-/// WHY THIS CAN BE A FLAT DELTA, AND HOW THAT IS KNOWN.
+/// WHY THIS WORKS, AND HOW THAT IS KNOWN.
 ///
 /// The loader is linked with `ld -q`, which keeps the relocations in the ELF.
 /// It emits exactly one type, `R_SH_DIR32`: an absolute 32-bit address in a
 /// literal pool or a data word. Everything else in the image -- every branch,
 /// every PC-relative load -- is already position-independent. So relocating is
-/// "add the delta to each word a relocation names", and nothing more.
+/// "rewrite each word a relocation names", and nothing more.
 ///
-/// Measured 2026-08-27, by linking the loader natively at several bases and
-/// diffing the loadable sections:
+/// NOT ONE DELTA, FOUR. A loader is pinned to four addresses (`Layout`) and
+/// only the HIGH family moves them together, which is why this used to refuse
+/// every base below 0x8c010000. Each relocation is classified by THE VALUE OF
+/// THE SYMBOL IT NAMES -- image, stack, `.hiram` or Maple DMA buffer -- and gets
+/// that region's delta. For a move inside one family all four deltas are equal
+/// and this is the flat delta it always was; for a move that crosses families
+/// they differ, and that difference is the whole of what was missing.
 ///
-/// - 833 words differ between two bases, **every one of them by exactly the
-///   delta**, and the relocations name exactly those 833 words -- none missed,
-///   and none naming a word that does not change. That second half matters as
-///   much as the first: it is what proves no relocation points at a hardware
-///   register or at the guest vector table, which a delta would corrupt.
-/// - Applying this to the image linked at 0x8ce00000 reproduces the native
-///   build at 0x8cef8000, at 0x8cc80000 (a negative delta) and at 0x8cd12000
-///   (a base nothing had ever been linked at) BYTE FOR BYTE.
+/// The symbol's value, not the word's: `commands.c` reaches its own base
+/// through the P2 window, so the word reads 0xace00000 where the symbol is
+/// 0x8ce00000. Adding the region's delta to the word preserves both the window
+/// bits and any addend. (`_dcload_base` is also why classifying by the symbol's
+/// SECTION does not work: the linker script PROVIDEs it after `.hiram`, so ld
+/// files it there, four words away from the region it actually names.)
 ///
-/// Getting there needed one fix on the DC side: the Maple DMA address used to
-/// reach C as a `-D`, i.e. a number, and a number in a literal pool carries no
-/// relocation. It is a linker symbol now (maple.c). Nine words, and they were
-/// the only ones.
+/// `.guestvbr` is not covered by the relocations and IS base-dependent.
+/// exception.S reaches the loader through the fixed jump table at base+0x00..
+/// +0x20 that dcload-crt0.s publishes (`.long DCLOAD_BASE + …`), and that image
+/// is linked separately, at the guest VBR, then folded in with objcopy -- so
+/// its six references arrive as plain literals with nothing naming them. They
+/// are patched by content, and then every unmoved section is re-scanned: a word
+/// still naming the image at its old base is an error, not a silent miss. Left
+/// alone, as it was until 2026-08-28, a relocated loader hands the title a
+/// vector table whose handlers jump back to whatever is at the base it was
+/// linked for -- and only when the title faults, which is the moment the dump
+/// exists for.
 ///
-/// HIGH BASES ONLY. A flat delta moves the whole layout together, which is true
-/// of the HIGH family -- stack, `.hiram` and Maple buffer are all base-relative
-/// -- and false of LOW, whose buffers stay at 0x8cfe8000 while its image sits
-/// at 0x8c004000. Nothing is lost: the CD always boots the stock base, and the
-/// 593 presets that ask for it ask for no move at all.
+/// Measured 2026-08-28 against the four natively linked loaders `make loaders`
+/// builds: relocating the image linked at 0x8ce00000 reproduces
+/// dcload-0x8c004000.elf, dcload-0x8ce00000.elf, dcload-0x8cef8000.elf and
+/// dcload-0x8cfe8000.elf BYTE FOR BYTE, `.guestvbr` included. The 833
+/// relocations split 824 image / 7 `.hiram` / 1 stack / 1 Maple, and the first
+/// of those four bases crosses families.
 ///
-/// `.guestvbr` is deliberately left where it is. It is the vector table handed
-/// to the title, linked at 0x8c00f400 for every base (AGENTS.md 4.11 item 2),
-/// so it falls outside the span and is not touched.
+/// (Earlier, 2026-08-27, with a flat delta: 833 words differ between two HIGH
+/// bases, every one of them by exactly the delta, and the relocations name
+/// exactly those 833 words -- none missed, and none naming a word that does not
+/// change. That second half is what proves no relocation points at a hardware
+/// register.)
 pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
-    const SHT_PROGBITS: u32 = 1;
     const SHT_SYMTAB: u32 = 2;
     const SHT_RELA: u32 = 4;
     const SHT_NOBITS: u32 = 8;
     const SHF_ALLOC: u32 = 2;
+    const STT_SECTION: u8 = 3;
 
     if elf.len() < 52 || &elf[..4] != b"\x7fELF" {
         return Err("not an ELF file".into());
@@ -215,42 +420,83 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
     if to % 4 != 0 {
         return Err(format!("0x{to:08x} is not 4-byte aligned"));
     }
-    if !plausible_base(to) || to.saturating_add(LOADER_SPAN) > 0x8d00_0000 {
-        return Err(format!(
-            "0x{to:08x}..0x{:08x} is not inside the Dreamcast's RAM",
-            to.saturating_add(LOADER_SPAN)
-        ));
+    if !plausible_base(to) {
+        return Err(format!("0x{to:08x} is not an address in the Dreamcast's RAM"));
     }
-    if from < 0x8c01_0000 {
-        return Err(format!(
-            "this image is linked at 0x{from:08x}, a LOW base: its buffers are at \
-             fixed high addresses, so it cannot be moved by a flat delta"
-        ));
+    let (src, dst) = (layout(from), layout(to));
+
+    /// Which of the four addresses in `Layout` something belongs to.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Region {
+        Image,
+        Stack,
+        Hiram,
+        Maple,
     }
-    let delta = to.wrapping_sub(from);
+    // Two classifiers, and they differ in one arm ON PURPOSE. A SECTION at the
+    // stack top is `.guestvbr` -- at the stock base the guest VBR and the
+    // loader's own stack top are the same address, 0x8c00f400 -- while a SYMBOL
+    // there is `_stack`. Using one for both would move the guest's vector table
+    // whenever the source image was a low one.
+    let region_of_section = |a: u32| -> Option<Region> {
+        if a >= src.image && a < src.stack {
+            Some(Region::Image)
+        } else if a >= src.hiram && a < src.hiram + LAYOUT_PAGE {
+            Some(Region::Hiram)
+        } else if a >= src.maple && a < src.maple + LAYOUT_PAGE {
+            Some(Region::Maple)
+        } else {
+            None
+        }
+    };
+    let region_of_symbol =
+        |a: u32| -> Option<Region> { region_of_section(a).or((a == src.stack).then_some(Region::Stack)) };
+    let delta_of = |r: Region| -> u32 {
+        match r {
+            Region::Image => dst.image.wrapping_sub(src.image),
+            Region::Stack => dst.stack.wrapping_sub(src.stack),
+            Region::Hiram => dst.hiram.wrapping_sub(src.hiram),
+            Region::Maple => dst.maple.wrapping_sub(src.maple),
+        }
+    };
 
     let shoff = rd(32) as usize;
     let shentsize = rd16(46) as usize;
     let shnum = rd16(48) as usize;
-    if shoff == 0 || shnum == 0 || shoff + shnum * shentsize > elf.len() {
+    if shoff == 0 || shnum == 0 || shentsize < 40 || shoff + shnum * shentsize > elf.len() {
         return Err("section headers are out of range".into());
     }
 
-    // The sections that move: allocated, and inside the loader's own span.
-    // `.guestvbr` is allocated too and is deliberately not among them.
-    let mut moving: Vec<(u32, u32, usize, u32)> = vec![]; // addr, size, offset, type
+    // The allocated sections, split by whether they move; where the image ends,
+    // which is `_end` and is what has to fit under the stack; and the symbol
+    // table, without which no relocation can be classified.
+    let mut moving: Vec<(u32, u32, usize, u32, Region)> = vec![]; // addr, size, offset, type, region
+    let mut fixed: Vec<(u32, usize)> = vec![]; // size and file offset of what stays put
+    let mut image_end = from;
     let mut has_rela = false;
+    let mut symtab: Option<(usize, usize, usize)> = None; // offset, size, entry size
     for i in 0..shnum {
         let sh = shoff + i * shentsize;
-        let (typ, flags, addr, off, size) = (rd(sh + 4), rd(sh + 8), rd(sh + 12), rd(sh + 16), rd(sh + 20));
+        let (typ, flags, addr, off, size) =
+            (rd(sh + 4), rd(sh + 8), rd(sh + 12), rd(sh + 16), rd(sh + 20));
         if typ == SHT_RELA {
             has_rela = true;
+        }
+        if typ == SHT_SYMTAB {
+            symtab = Some((off as usize, size as usize, rd(sh + 36) as usize));
         }
         if flags & SHF_ALLOC == 0 || size == 0 {
             continue;
         }
-        if addr >= from && addr < from.saturating_add(LOADER_SPAN) {
-            moving.push((addr, size, off as usize, typ));
+        match region_of_section(addr) {
+            Some(r) => {
+                if r == Region::Image {
+                    image_end = image_end.max(addr.saturating_add(size));
+                }
+                moving.push((addr, size, off as usize, typ, r));
+            }
+            None if typ != SHT_NOBITS => fixed.push((size, off as usize)),
+            None => {}
         }
     }
     if !has_rela {
@@ -263,9 +509,47 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
     if moving.is_empty() {
         return Err(format!("nothing allocated at 0x{from:08x}; is this a loader ELF?"));
     }
+    let Some((symoff, symsize, symentsize)) = symtab else {
+        return Err(
+            "this loader has no symbol table, so its relocations cannot be told apart -- \
+             do not strip dcload-relocatable.elf"
+                .into(),
+        );
+    };
+    if symentsize < 16 || symoff + symsize > elf.len() {
+        return Err("the symbol table is out of range".into());
+    }
+
+    // Everything the loader would occupy has to be in RAM, and the image has to
+    // fit under a stack that, for a LOW base, does not come down with it. The
+    // second rule is the link script's own ASSERT((_stack - _end) > 800), which
+    // is the check a native link would have made.
+    let image_len = image_end.wrapping_sub(from);
+    for (lo, hi) in live_footprint(to) {
+        if lo >= hi || hi > 0x8d00_0000 {
+            return Err(format!(
+                "a loader at 0x{to:08x} would need 0x{lo:08x}..0x{hi:08x}, which is not \
+                 inside the Dreamcast's RAM"
+            ));
+        }
+    }
+    if to.saturating_add(image_len).saturating_add(800) >= dst.stack {
+        return Err(format!(
+            "a {image_len}-byte image at 0x{to:08x} leaves under 800 bytes of stack \
+             below 0x{:08x}, which is the margin the link asserts",
+            dst.stack
+        ));
+    }
 
     let mut out = elf.to_vec();
     let mut wr = |o: usize, v: u32| out[o..o + 4].copy_from_slice(&v.to_le_bytes());
+
+    // st_value, and whether the entry is a section symbol -- see the two
+    // classifiers above.
+    let sym_at = |idx: usize| -> Option<(u32, bool)> {
+        let e = symoff + idx * symentsize;
+        (e + 16 <= symoff + symsize).then(|| (rd(e + 4), elf[e + 12] & 0xf == STT_SECTION))
+    };
 
     // 1. The words the relocations name. Only those inside a section that is
     //    actually moving -- a relocation against anything else would be a bug,
@@ -277,14 +561,14 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
             continue;
         }
         let (off, size, entsize) = (rd(sh + 16) as usize, rd(sh + 20) as usize, rd(sh + 36) as usize);
-        if entsize == 0 || off + size > elf.len() {
+        if entsize < 12 || off + size > elf.len() {
             return Err("a relocation section is out of range".into());
         }
         for e in (off..off + size).step_by(entsize) {
             let r_offset = rd(e);
-            let Some(&(addr, _, foff, typ)) = moving
+            let Some(&(addr, _, foff, typ, _)) = moving
                 .iter()
-                .find(|&&(a, sz, _, _)| r_offset >= a && r_offset < a + sz)
+                .find(|&&(a, sz, _, _, _)| r_offset >= a && r_offset < a + sz)
             else {
                 continue;
             };
@@ -295,7 +579,27 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
             if at + 4 > elf.len() {
                 return Err(format!("relocation at 0x{r_offset:08x} points outside the file"));
             }
-            wr(at, rd(at).wrapping_add(delta));
+            let idx = (rd(e + 4) >> 8) as usize;
+            let (value, is_section) = sym_at(idx).ok_or_else(|| {
+                format!(
+                    "the relocation at 0x{r_offset:08x} names symbol {idx}, which is not in \
+                     the symbol table"
+                )
+            })?;
+            let region = if is_section {
+                region_of_section(value)
+            } else {
+                region_of_symbol(value)
+            }
+            .ok_or_else(|| {
+                format!(
+                    "the relocation at 0x{r_offset:08x} names 0x{value:08x}, which is in none \
+                     of this loader's four regions (image 0x{:08x}, stack 0x{:08x}, .hiram \
+                     0x{:08x}, Maple 0x{:08x}) -- moving it would be a guess",
+                    src.image, src.stack, src.hiram, src.maple
+                )
+            })?;
+            wr(at, rd(at).wrapping_add(delta_of(region)));
             patched += 1;
         }
     }
@@ -303,56 +607,102 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
         return Err("no relocation landed inside the loader's own sections".into());
     }
 
-    // 2. Where those sections say they live -- this is what the upload reads.
-    for i in 0..shnum {
-        let sh = shoff + i * shentsize;
-        let (flags, addr, size) = (rd(sh + 8), rd(sh + 12), rd(sh + 20));
-        if flags & SHF_ALLOC != 0 && size != 0 && addr >= from && addr < from + LOADER_SPAN {
-            wr(sh + 12, addr.wrapping_add(delta));
+    // 2. The base references inside `.guestvbr`, which carries none of its own.
+    //    exception.S reaches the loader only through the jump table at the
+    //    base, so the window is that table and nothing else; the residual scan
+    //    at the end is what says so rather than assuming it.
+    const JUMP_TABLE: u32 = 0x20;
+    // The same RAM through any of P0/P1/P2/P3: commands.c uses the P2 alias and
+    // the vector table could too.
+    let window = |a: u32| a & 0x1fff_ffff;
+    for &(size, foff) in &fixed {
+        for o in (0..(size as usize & !3)).step_by(4) {
+            let at = foff + o;
+            if at + 4 > elf.len() {
+                break;
+            }
+            let w = rd(at);
+            let inside = window(w).wrapping_sub(window(from));
+            if inside < JUMP_TABLE {
+                wr(at, (w & 0xe000_0000) | window(to.wrapping_add(inside)));
+            }
         }
     }
 
-    // 3. The entry point.
-    wr(24, from.wrapping_add(delta));
+    // 3. Where the moving sections say they live -- this is what the upload
+    //    reads, and `.hiram` does not travel with the image across families.
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let (flags, addr, size) = (rd(sh + 8), rd(sh + 12), rd(sh + 20));
+        if flags & SHF_ALLOC != 0
+            && size != 0
+            && let Some(r) = region_of_section(addr)
+        {
+            wr(sh + 12, addr.wrapping_add(delta_of(r)));
+        }
+    }
 
-    // 4. Program headers, so the file stays self-consistent for any other tool
-    //    that reads it (readelf, gdb, objdump).
+    // 4. The entry point.
+    wr(24, to);
+
+    // 5. Program headers, so the file stays self-consistent for any other tool
+    //    that reads it (readelf, gdb, objdump). Each LOAD segment holds
+    //    sections from one region only -- `.hiram` gets its own -- so the same
+    //    per-region rule applies.
     let phoff = rd(28) as usize;
     let phentsize = rd16(42) as usize;
     let phnum = rd16(44) as usize;
-    if phoff != 0 && phoff + phnum * phentsize <= elf.len() {
+    if phoff != 0 && phentsize >= 20 && phoff + phnum * phentsize <= elf.len() {
         for i in 0..phnum {
             let ph = phoff + i * phentsize;
             for field in [8usize, 12] {
                 let v = rd(ph + field);
-                if v >= from && v < from + LOADER_SPAN {
-                    wr(ph + field, v.wrapping_add(delta));
+                if let Some(r) = region_of_section(v) {
+                    wr(ph + field, v.wrapping_add(delta_of(r)));
                 }
             }
         }
     }
 
-    // 5. The symbol table. Not needed to run the loader -- and needed by every
+    // 6. The symbol table. Not needed to run the loader -- and needed by every
     //    instrument that resolves a counter by name against this ELF. A symbol
     //    table left at the old base is exactly AGENTS.md 14.19: readings that
     //    come back believable and wrong.
-    for i in 0..shnum {
-        let sh = shoff + i * shentsize;
-        if rd(sh + 4) != SHT_SYMTAB {
-            continue;
+    for e in (symoff..symoff + symsize).step_by(symentsize) {
+        if e + 16 > symoff + symsize {
+            break;
         }
-        let (off, size, entsize) = (rd(sh + 16) as usize, rd(sh + 20) as usize, rd(sh + 36) as usize);
-        if entsize == 0 || off + size > elf.len() {
-            continue;
+        let v = rd(e + 4);
+        let r = if elf[e + 12] & 0xf == STT_SECTION {
+            region_of_section(v)
+        } else {
+            region_of_symbol(v)
+        };
+        if let Some(r) = r {
+            wr(e + 4, v.wrapping_add(delta_of(r)));
         }
-        for e in (off..off + size).step_by(entsize) {
-            let v = rd(e + 4);
-            if v >= from && v < from + LOADER_SPAN {
-                wr(e + 4, v.wrapping_add(delta));
+    }
+
+    // 7. And prove step 2 missed nothing: a word in an unmoved section still
+    //    naming the image at its old base would be a jump into whatever the
+    //    next title puts there, taken only on a fault.
+    for &(size, foff) in &fixed {
+        for o in (0..(size as usize & !3)).step_by(4) {
+            let at = foff + o;
+            if at + 4 > out.len() {
+                break;
+            }
+            let w = u32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]);
+            if window(w).wrapping_sub(window(from)) < image_len {
+                return Err(format!(
+                    "a section that does not move still names 0x{w:08x}, inside the image at \
+                     its old base 0x{from:08x} -- exception.S has grown a reference to the \
+                     loader that is not through the jump table, and this does not know how \
+                     to move it"
+                ));
             }
         }
     }
-    let _ = SHT_PROGBITS;
     Ok(out)
 }
 
@@ -374,11 +724,11 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
 /// better to rank them by, and staying close keeps the loader in the region
 /// DreamShell judged free for this title.
 pub fn nearest_clear_base(wanted: u32, candidates: &[u32]) -> Option<u32> {
-    let high = wanted >= 0x8c01_0000;
+    let high = is_high(wanted);
     candidates
         .iter()
         .copied()
-        .filter(|&b| b != wanted && (b >= 0x8c01_0000) == high)
+        .filter(|&b| b != wanted && is_high(b) == high)
         .min_by_key(|&b| b.abs_diff(wanted))
 }
 
@@ -664,11 +1014,12 @@ impl LoaderSet {
 
     /// Can this set produce a loader for `base` at all?
     ///
-    /// True for a base with its own pre-linked ELF, and true for ANY high base
-    /// once the relocatable image is present -- which is the whole point of it:
-    /// the set stops being a menu of addresses someone thought of in advance.
+    /// True for a base with its own pre-linked ELF, and true for ANY base the
+    /// relocatable image can be moved to once it is present -- which is the
+    /// whole point of it: the set stops being a menu of addresses someone
+    /// thought of in advance. Both families, since 2026-08-28.
     pub fn can_provide(&self, base: u32) -> bool {
-        self.has(base) || (base >= 0x8c01_0000 && self.relocatable().is_some())
+        self.has(base) || (self.relocatable().is_some() && could_relocate_to(base))
     }
 
     /// The ELF to upload for `base`, and a label for the log.
@@ -893,6 +1244,56 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_below_the_stock_base_never_seeds_a_low_answer() {
+        // 276 of the 1026 presets ask for 0x8c000100 or 0x8c001100. The old
+        // clamp was `min(ceiling)`, which left `start` at 0x8c000000, so the
+        // upward walk began at 0x8c010000 -- where the title's own image is
+        // loaded -- and `is_clear` says nothing about low RAM by design.
+        let tried = std::cell::RefCell::new(vec![]);
+        let answer = search_free_base(0x8c00_0100, |b| {
+            tried.borrow_mut().push(b);
+            true
+        });
+        assert!(
+            answer.is_some_and(|b| b >= FREE_BASE_FLOOR),
+            "answered {answer:x?} for a preset below the stock base"
+        );
+        assert!(
+            tried.borrow().iter().all(|&b| b >= FREE_BASE_FLOOR),
+            "the scan considered a base below 0x{FREE_BASE_FLOOR:08x}"
+        );
+    }
+
+    #[test]
+    fn a_base_is_centred_in_the_span_it_is_given() {
+        // Jet Set Radio's hole, between the read that killed a run (0x8ce00000)
+        // and the sector buffer it keeps at the top of RAM (0x8cff0000).
+        assert_eq!(base_in_span(0x8ce1_0000, 0x8cff_0000), Some(0x8cef_0000));
+        // The whole window, for a title with no map yet: 31 candidates fit
+        // between the floor and the top of RAM, and the 16th is the middle.
+        // (It is also the base Sonic Adventure 2 was measured running at --
+        // a coincidence, but a reassuring one.)
+        assert_eq!(base_in_span(0x8ce0_0000, 0x8d00_0000), Some(0x8cef_0000));
+        // Too small to hold a loader at all.
+        assert_eq!(base_in_span(0x8ce0_0000, 0x8ce0_8000), None);
+        assert_eq!(base_in_span(0x8ce0_0000, 0x8ce0_0000), None);
+    }
+
+    #[test]
+    fn a_low_preset_rules_out_isoldrs_own_two_addresses() {
+        // The point of reading an unsupported preset as information: these are
+        // the two DreamShell tried before it gave up and went low.
+        assert!(ruled_out_by_low_preset(ISOLDR_DEFAULT_ADDR));
+        assert!(ruled_out_by_low_preset(ISOLDR_HIGH_ADDR));
+        // Overlap, not equality -- ours is four times isoldr's size.
+        assert!(ruled_out_by_low_preset(ISOLDR_DEFAULT_ADDR - LOADER_SPAN + 4));
+        assert!(!ruled_out_by_low_preset(ISOLDR_DEFAULT_ADDR - LOADER_SPAN));
+        // And it must not condemn the rest of the window.
+        assert!(!ruled_out_by_low_preset(0x8cef_0000));
+        assert!(!ruled_out_by_low_preset(0x8cf7_0000));
+    }
+
+    #[test]
     fn the_fallback_stays_in_the_same_family() {
         // A high preset answered with the stock base would put the loader back
         // in the low RAM the preset moved it out of.
@@ -919,12 +1320,17 @@ mod tests {
     }
 
     /// A minimal ELF32-LE executable: one PROGBITS section at `base` holding
-    /// one word, and one RELA naming that word.
-    fn tiny_elf(base: u32, word: u32) -> Vec<u8> {
+    /// one word, one RELA naming that word, and the symbol table `relocate`
+    /// classifies it with. `sym` is the value of the symbol the relocation
+    /// names -- which is what decides the region, and therefore which of the
+    /// four deltas the word gets.
+    fn tiny_elf_named(base: u32, word: u32, sym: u32) -> Vec<u8> {
         const EH: usize = 52;
         const SH: usize = 40;
-        let shoff = EH + 4 + 12; // .text payload, then one Rela entry
-        let mut b = vec![0u8; shoff + 3 * SH];
+        const SYM: usize = EH + 4 + 12; // after the .text payload and the Rela
+        const STR: usize = SYM + 32; // two symbol table entries
+        let shoff = STR + 1;
+        let mut b = vec![0u8; shoff + 5 * SH];
         b[..4].copy_from_slice(b"\x7fELF");
         b[4] = 1; // 32-bit
         b[5] = 1; // little-endian
@@ -937,13 +1343,16 @@ mod tests {
         w(&mut b, 24, base); // e_entry
         w(&mut b, 32, shoff as u32);
         h(&mut b, 46, SH as u16);
-        h(&mut b, 48, 3);
+        h(&mut b, 48, 5);
         h(&mut b, 50, 0);
         // .text contents, and the relocation that names its only word
         w(&mut b, EH, word);
         w(&mut b, EH + 4, base); // r_offset
-        w(&mut b, EH + 8, 1); // r_info: R_SH_DIR32
+        w(&mut b, EH + 8, (1 << 8) | 1); // r_info: symbol 1, R_SH_DIR32
         w(&mut b, EH + 12, 0); // r_addend
+        // symbol 1 (symbol 0 is the reserved null entry, left zeroed)
+        w(&mut b, SYM + 16 + 4, sym); // st_value
+        h(&mut b, SYM + 16 + 14, 1); // st_shndx: .text
         // [1] .text
         let s1 = shoff + SH;
         w(&mut b, s1 + 4, 1); // SHT_PROGBITS
@@ -956,8 +1365,26 @@ mod tests {
         w(&mut b, s2 + 4, 4); // SHT_RELA
         w(&mut b, s2 + 16, (EH + 4) as u32);
         w(&mut b, s2 + 20, 12);
-        w(&mut b, s2 + 36, 12); // sh_entsize
+        w(&mut b, s2 + 40 - 4, 12); // sh_entsize
+        w(&mut b, s2 + 40 - 12, 3); // sh_link: the symbol table
+        // [3] .symtab
+        let s3 = shoff + 3 * SH;
+        w(&mut b, s3 + 4, 2); // SHT_SYMTAB
+        w(&mut b, s3 + 16, SYM as u32);
+        w(&mut b, s3 + 20, 32);
+        w(&mut b, s3 + 24, 4); // sh_link: the string table
+        w(&mut b, s3 + 36, 16); // sh_entsize
+        // [4] .strtab
+        let s4 = shoff + 4 * SH;
+        w(&mut b, s4 + 4, 3); // SHT_STRTAB
+        w(&mut b, s4 + 16, STR as u32);
+        w(&mut b, s4 + 20, 1);
         b
+    }
+
+    /// The ordinary case: a word naming an address inside the image.
+    fn tiny_elf(base: u32, word: u32) -> Vec<u8> {
+        tiny_elf_named(base, word, base)
     }
 
     fn word_of(elf: &[u8]) -> u32 {
@@ -987,12 +1414,111 @@ mod tests {
         assert_eq!(relocate(&e, 0x8ce0_0000).unwrap(), e);
     }
 
+    /// THE POINT OF THE FOUR DELTAS. A loader's stack, packet buffers and Maple
+    /// DMA buffer do not move with its image when the move crosses families, so
+    /// a word naming one of them follows THAT address and not the base.
     #[test]
-    fn a_low_image_is_refused_rather_than_mangled() {
-        // Its buffers are at fixed high addresses while its image is low, so no
-        // single delta describes the move. Refusing beats moving half of it.
-        let e = tiny_elf(0x8c00_4000, 0x8c00_5678);
-        assert!(relocate(&e, 0x8cef_8000).is_err());
+    fn each_region_follows_its_own_address_across_the_families() {
+        let src = layout(SCRATCH_BASE);
+        let dst = layout(DEFAULT_BASE);
+        for (what, sym, want) in [
+            ("image", src.image + 0x1234, dst.image + 0x1234),
+            ("stack", src.stack, dst.stack),
+            (".hiram", src.hiram + 0x600, dst.hiram + 0x600),
+            ("Maple DMA", src.maple, dst.maple),
+        ] {
+            let e = tiny_elf_named(SCRATCH_BASE, sym, sym);
+            let moved = relocate(&e, DEFAULT_BASE).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(word_of(&moved), want, "{what}: 0x{sym:08x}");
+        }
+    }
+
+    /// A low base is a base like any other now. It was refused outright until
+    /// 2026-08-28, which is what sent someone whose title wanted the stock
+    /// address off to build an ELF that was already on disk.
+    #[test]
+    fn a_low_target_is_no_longer_refused() {
+        assert!(could_relocate_to(DEFAULT_BASE));
+        let e = tiny_elf(SCRATCH_BASE, SCRATCH_BASE + 0x1234);
+        let moved = relocate(&e, DEFAULT_BASE).unwrap();
+        assert_eq!(word_of(&moved), DEFAULT_BASE + 0x1234);
+    }
+
+    /// And the other direction, because the rule is symmetric and a special
+    /// case that is not needed is a special case that goes wrong. Nothing builds
+    /// a low relocatable image today -- `make loaders` emits relocations for one
+    /// high base -- but nothing about this depends on which way it goes.
+    #[test]
+    fn a_low_image_moves_as_well_as_a_high_one() {
+        let low = layout(DEFAULT_BASE);
+        let e = tiny_elf_named(DEFAULT_BASE, low.hiram + 0x600, low.hiram + 0x600);
+        let moved = relocate(&e, 0x8cef_8000).unwrap();
+        assert_eq!(word_of(&moved), layout(0x8cef_8000).hiram + 0x600);
+    }
+
+    /// What a low base has that a high one does not: a ceiling. Its stack top
+    /// stays at the BIOS VBR whatever the image does, so the image has to fit
+    /// underneath it with the margin the link script asserts.
+    #[test]
+    fn a_low_base_too_close_to_the_bios_vbr_is_refused() {
+        assert!(!could_relocate_to(0x8c00_c000), "a real image would not fit");
+        // The synthetic image is four bytes, so this one is refused by the
+        // 800-byte stack margin alone.
+        let e = tiny_elf(SCRATCH_BASE, SCRATCH_BASE + 0x1234);
+        assert!(relocate(&e, 0x8c00_f200).is_err());
+    }
+
+    /// A relocation naming something in none of the four regions -- a hardware
+    /// register, say -- is a case this cannot answer. Guessing at it is what
+    /// would corrupt an image with nothing to show for it.
+    #[test]
+    fn a_relocation_pointing_outside_the_layout_is_refused() {
+        let e = tiny_elf_named(SCRATCH_BASE, 0xa05f_8000, 0xa05f_8000);
+        let err = relocate(&e, DEFAULT_BASE).unwrap_err();
+        assert!(err.contains("four regions"), "unhelpful message: {err}");
+    }
+
+    /// THE MEASUREMENT EVERYTHING HERE RESTS ON: relocating reproduces a native
+    /// link byte for byte, at every base `make loaders` builds -- the low one
+    /// included, which is the move that crosses families.
+    ///
+    /// Skipped, not failed, when the set is not on disk: it is build output of
+    /// the other repository, and the rest of the suite has to stay runnable
+    /// without it. When it IS there, this checks whatever is there, so a base
+    /// added to LOADER_BASES is covered the day it is deployed.
+    #[test]
+    fn relocating_reproduces_every_native_link_byte_for_byte() {
+        /// Every allocated PROGBITS section, keyed by the address it claims:
+        /// exactly what the host uploads, `.guestvbr` included.
+        fn loadable(bytes: &[u8]) -> std::collections::BTreeMap<u32, Vec<u8>> {
+            let elf = ElfBytes::<AnyEndian>::minimal_parse(bytes).expect("parse");
+            let mut m = std::collections::BTreeMap::new();
+            for sh in elf.section_headers().expect("sections").iter() {
+                if is_uploadable(&sh) {
+                    let (d, _) = elf.section_data(&sh).expect("section data");
+                    m.insert(sh.sh_addr as u32, d.to_vec());
+                }
+            }
+            m
+        }
+
+        let set = LoaderSet::discover(None);
+        let (Some(path), bases) = (set.relocatable(), set.available()) else {
+            return;
+        };
+        let Ok(src) = std::fs::read(&path) else { return };
+        if bases.is_empty() {
+            return;
+        }
+        for base in bases {
+            let native = std::fs::read(set.path_for(base)).expect("read the native link");
+            let moved = relocate(&src, base).unwrap_or_else(|e| panic!("0x{base:08x}: {e}"));
+            assert_eq!(
+                loadable(&moved),
+                loadable(&native),
+                "relocated to 0x{base:08x} is not the native link"
+            );
+        }
     }
 
     #[test]

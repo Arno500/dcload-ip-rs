@@ -8,9 +8,11 @@
 //!
 //! Two things this has to get right, both of which fail silently otherwise:
 //!
-//! 1. **The high-density area.** A GD-ROM has two data tracks and both carry a
-//!    valid filesystem; the low-density one is a stub. `boot_sector()` is the
-//!    one to read files from -- see `types::DiscFormat`.
+//! 1. **The high-density area.** A GD-ROM has at least two data tracks and the
+//!    low-density one is a stub carrying a valid filesystem for a different,
+//!    empty disc. `boot_sector()` is the one to read files from, and it is
+//!    neither the first nor reliably the last -- see `types::DiscFormat` and
+//!    `gdi::Gdi::high_density_start`.
 //! 2. **Scrambling.** A binary from a CD-R self-boot image is stored permuted
 //!    and the bootstrap unpermutes it while loading. We never run that
 //!    bootstrap, so it has to be undone here or the upload is noise. See

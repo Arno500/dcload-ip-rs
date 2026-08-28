@@ -32,10 +32,13 @@ clap-num = "1.2.0"
 # progress display can ask how wide the terminal is before it picks a layout.
 console = "0.16.2"
 # Ctrl-C is how a session with a title normally ends -- the game is running,
-# there is nothing to "finish". Without a handler the learned memory map
-# (src/memmap.rs) loses whatever it has not flushed, and the user is told
-# nothing about what the session taught. See report_and_exit().
-ctrlc = "3.5.2"
+# there is nothing to "finish" -- so it is the one ending worth reporting on.
+# It is NOT what saves the learned memory map (src/memmap.rs): a debugger
+# swallows SIGINT and a Stop button is a kill, so the file is kept current by a
+# ticker instead. See memmap::install_signal_handler(). `termination` adds
+# SIGTERM/SIGHUP and the Windows close/logoff events, which are the other
+# endings that can still run code.
+ctrlc = { version = "3.5.2", features = ["termination"] }
 elf = "0.8.0"
 indicatif = "0.18.3"
 log = "0.4.29"

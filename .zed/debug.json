@@ -96,11 +96,12 @@
       // "--loader-dir",
       // "$ZED_WORKTREE_ROOT/loaders-noheap",
       // "--loader-base",
-      // "0x8c004000",
+      // "0x8cef8000",
       "u-exec",
-      "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
-      "-d",
-      "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].gdi",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].zip"
+      // "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
+      // "-d",
+      // "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].gdi",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -190,7 +191,7 @@
     "sourceLanguages": ["rust"],
   },
   {
-    "label": "Launch Crazy Taxi",
+    "label": "Launch Buzz",
     "adapter": "CodeLLDB",
     "request": "launch",
     "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
@@ -200,11 +201,9 @@
     },
     "args": [
       "--host",
-      "192.168.1.130",
+      "192.168.1.64",
       "u-exec",
-      "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\1ST_READ.BIN",
-      "-d",
-      "C:\\Users\\arnod\\Downloads\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!].gdi",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Buzz Lightyear of Star Command v1.001 (2000)(Activision)(PAL)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -226,7 +225,7 @@
       "--host",
       "192.168.1.64",
       "u-exec",
-      "$ZED_WORKTREE_ROOT/loaders/dcload-0x8ce00000.elf"
+      "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",

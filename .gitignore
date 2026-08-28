@@ -6,3 +6,6 @@ test
 # A faulting guest writes these in the CWD
 dc_exception_dump-*.bin
 scripts/*.jpg
+
+# save() writes beside the target and renames; a killed run leaves this behind
+/game-memory.tsv.tmp
