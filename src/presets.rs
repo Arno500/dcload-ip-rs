@@ -83,14 +83,28 @@ impl Preset {
         let mut out = Vec::new();
         if self.irq != 0 {
             out.push("irq=1 (the title expects the loader to hook interrupts; \
-                      dcload's VBR leaves the interrupt vector as nop;rte;nop)"
+                      dcload's VBR leaves the interrupt vector as nop;rte;nop. \
+                      Its CDDA engine does not need it -- it writes sound RAM \
+                      with the CPU, so it raises no AICA DMA interrupt to \
+                      arbitrate, and it is driven from the GD syscalls)"
                 .to_string());
         }
+        // `cdda` is SERVED now (dcload's cdda.c), so what is worth reporting
+        // is which of isoldr's options this loader answers differently -- not
+        // that the feature is missing. The source and destination bits pick
+        // between an IDE/SD device and DMA/SQ/PIO, none of which describe a
+        // loader reading over UDP and writing sound RAM with the CPU; the
+        // position bits pick an SH4 timer, and this engine reads the AICA's
+        // own play position instead. See target-src/dcload/cdda.h.
         if self.cdda != 0 {
-            out.push(format!(
-                "cdda={:08x} (CD audio emulation; dcload serves data sectors only)",
-                self.cdda
-            ));
+            const CDDA_CH_FIXED: u32 = 0x0002_0000;
+            if self.cdda & CDDA_CH_FIXED == 0 {
+                out.push(format!(
+                    "cdda={:08x} asks for adaptive AICA channels; this loader always \
+                     uses the fixed pair (62/63)",
+                    self.cdda
+                ));
+            }
         }
         if self.bin_type != 0 {
             let name = match self.bin_type {
@@ -141,8 +155,12 @@ pub struct PresetDb {
     /// Title -> the row whose `memory` is the majority among presets sharing
     /// that title. Built once, so the answer does not depend on file order.
     by_title: HashMap<String, Preset>,
-    /// Titles whose presets disagree about `memory`, so a title match can say so.
-    ambiguous_titles: HashMap<String, usize>,
+    /// Titles whose presets disagree about `memory`, and the addresses they
+    /// disagree over. THE ADDRESSES, not just how many: a disagreement in which
+    /// one of the votes is below the BIOS syscall area is a different statement
+    /// from one between two high addresses, and only the votes themselves can
+    /// tell them apart. See `title_addresses`.
+    ambiguous_titles: HashMap<String, Vec<u32>>,
 }
 
 impl PresetDb {
@@ -208,7 +226,9 @@ impl PresetDb {
                 *votes.entry(r.memory).or_insert(0) += 1;
             }
             if votes.len() > 1 {
-                ambiguous_titles.insert(title.clone(), votes.len());
+                let mut addrs: Vec<u32> = votes.keys().copied().collect();
+                addrs.sort_unstable();
+                ambiguous_titles.insert(title.clone(), addrs);
             }
             // Most votes wins. A TIE BREAKS TOWARDS NOT MOVING: the stock base
             // first, then whatever the database as a whole prefers, then the
@@ -266,10 +286,25 @@ impl PresetDb {
     /// How many distinct `memory` values presets under this title carry. 1 (or
     /// 0, for an unknown title) means a title match is not actually ambiguous.
     pub fn title_ambiguity(&self, title: &str) -> usize {
-        *self
-            .ambiguous_titles
+        self.title_addresses(title).len()
+    }
+
+    /// The addresses presets under this title disagree over, lowest first, or
+    /// empty when they do not disagree at all.
+    ///
+    /// WHAT THE DISAGREEMENT IS ABOUT IS THE INFORMATION, and the count throws
+    /// it away. Two presets titled "SONIC ADVENTURE" ask for 0x8c004000 and
+    /// 0x8c000100: one vote for the stock base and one for below the BIOS
+    /// syscall area, which is DreamShell saying that for at least one dump of
+    /// this title even the stock base was not low enough. The tie-break above
+    /// keeps the loader still, and for isoldr's 13 KB that is the safe answer;
+    /// for an image four times the size it is the one address the other vote
+    /// argues against. `main::low_family_contested` is what reads this.
+    pub fn title_addresses(&self, title: &str) -> Vec<u32> {
+        self.ambiguous_titles
             .get(&normalise_title(title))
-            .unwrap_or(&0)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 

@@ -52,3 +52,10 @@ md5 = "0.8.0"
 miniz_oxide = { version = "0.9", features = ["block-boundary"] }
 polling = "3.11.0"
 pretty_env_logger = "0.5.0"
+
+# ONLY for putting the terminal back after the diagnostic panel (src/ui.rs).
+# `Term::read_key` holds the tty in raw mode across a blocking read, so a kill
+# that is not Ctrl-C can leave a shell in raw mode; this is what restores it.
+# Already in the lock file as console's own dependency, so it costs nothing new.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

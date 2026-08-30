@@ -41,6 +41,27 @@ pub fn check_read_len(num_sectors: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// One entry of the disc's table of contents, as the drive reports it.
+///
+/// `start_lba` is in the numbering `read_sector` takes, so a caller never has
+/// to know whether the format counts the 150-sector lead-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TocTrack {
+    pub number: u8,
+    pub start_lba: u32,
+    pub audio: bool,
+}
+
+/// Where the high-density area of a GD-ROM starts, in the lead-in-less
+/// numbering a `.gdi` records. A GETTOC asks for one AREA, and on this disc
+/// family the two are a different set of tracks: the CD part (1-2) and the GD
+/// part (3 onwards), which is where a title's CDDA lives.
+pub const HIGH_DENSITY_LBA: u32 = 45000;
+
+/// A raw CD sector. On an audio track all 2352 bytes are signed 16-bit
+/// little-endian stereo PCM at 44100 Hz -- 588 frames, exactly 1/75 second.
+pub const RAW_SECTOR_SIZE: usize = 2352;
+
 pub trait DiscFormat {
     fn read_sector(
         &self,
@@ -74,6 +95,32 @@ pub trait DiscFormat {
 
     fn num_sectors(&self) -> u32 {
         0
+    }
+
+    /// The disc's tracks, data and AUDIO alike.
+    ///
+    /// Empty by default, and `build_dc_toc` then answers exactly what it
+    /// always did -- a format that cannot enumerate its tracks must not have
+    /// its table of contents guessed at. A format that CAN is the only way a
+    /// title ever learns it has music: the TOC is where the track numbers,
+    /// their start LBAs and their audio/data flag come from, and a title told
+    /// there are two data tracks will never ask to play anything.
+    fn toc_tracks(&self) -> Vec<TocTrack> {
+        vec![]
+    }
+
+    /// Read `num_sectors` RAW 2352-byte sectors, for CDDA.
+    ///
+    /// Separate from `read_sector` because it is a different unit and a
+    /// different part of the disc: `read_sector` hands back the 2048 user
+    /// bytes of a data sector, which for an audio track is not a thing that
+    /// exists -- every one of its 2352 bytes is signed 16-bit stereo PCM.
+    fn read_audio(
+        &self,
+        _lba: u32,
+        _num_sectors: u32,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Err("this image cannot serve CDDA".into())
     }
 
     /// Where an LBA recorded INSIDE the disc's own ISO9660 structures lands in

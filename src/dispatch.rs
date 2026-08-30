@@ -19,7 +19,7 @@ use crate::{
         gdi::Gdi,
         iso::Iso,
         source::{Container, FileSource},
-        types::{DiscFormat, StubDisc, get_disc_format},
+        types::{DiscFormat, RAW_SECTOR_SIZE, StubDisc, get_disc_format},
         zip::{ZipArchive, ZipContainer},
     },
     fs::{self, FSSyscallState},
@@ -298,22 +298,114 @@ pub fn execute(
 /// has no basis on which to move anything.
 pub fn query_loader(
     conn: &mut impl ExternalDcIo,
-) -> std::result::Result<(String, Option<u32>), std::boxed::Box<dyn std::error::Error>> {
-    let replies = send_version(conn)?;
-    for reply in replies {
+) -> std::result::Result<crate::loaders::VersionReply, std::boxed::Box<dyn std::error::Error>> {
+    version_in(send_version(conn)?).ok_or_else(|| {
+        Box::new(Error::new(
+            ErrorKind::InvalidData,
+            "no VERS reply from the Dreamcast",
+        )) as std::boxed::Box<dyn std::error::Error>
+    })
+}
+
+/// The loader's answer, if one of these replies is it.
+fn version_in(replies: Vec<DCReturnCmd>) -> Option<crate::loaders::VersionReply> {
+    replies.into_iter().find_map(|reply| {
         if let Some(cmd) = reply.cmd
             && let DCLoadCmds::Version(Some(data)) = cmd.cmd
         {
-            return Ok(crate::loaders::parse_version_payload(
+            Some(crate::loaders::parse_version_payload(
                 data.as_ref(),
                 cmd.size as usize,
-            ));
+            ))
+        } else {
+            None
         }
-    }
-    Err(Box::new(Error::new(
-        ErrorKind::InvalidData,
-        "no VERS reply from the Dreamcast",
-    )))
+    })
+}
+
+/// Ask for a loader until one answers, however long that takes.
+///
+/// THIS IS A START-UP PATH AND NOTHING ELSE. What it waits out is a console
+/// that is not up yet -- still booting the CD, still being switched on, still
+/// bringing up a cold RTL8139 -- which is a state with no upper bound worth
+/// guessing at, and the reason it is opt-in (`--infinite`). Every command
+/// after this one keeps `call_command`'s five tries: once a loader has
+/// answered, silence means something has gone wrong, and waiting forever for
+/// it would turn a reportable failure into a hang.
+///
+/// It is deliberately NOT `query_loader` in a loop. `call_command` logs a
+/// warning per lost packet and `await_result` an error per timeout -- correct
+/// for a command that was expected to work, and ten lines every 2.5 s for a
+/// wait whose normal state is silence. So the question is asked directly here,
+/// quietly, and what a person watching gets instead is the spinner.
+///
+/// Distinct from `wait_for_loader`, which waits for a SPECIFIC base to come up
+/// after a chainload we ourselves started, and is bounded because we know
+/// something was there a moment ago.
+pub fn wait_for_any_loader(
+    conn: &mut impl ExternalDcIo,
+) -> std::result::Result<crate::loaders::VersionReply, std::boxed::Box<dyn std::error::Error>> {
+    /// How often the question is repeated. Also the poll window: nothing is
+    /// running on the console, so there is no cost here but this process's.
+    const ASK_EVERY: Duration = Duration::from_millis(500);
+    /// How often the wait says so in the log. The spinner covers a terminal;
+    /// this is what a redirected log gets, so it is rare on purpose.
+    const SAY_EVERY: Duration = Duration::from_secs(60);
+
+    let started = Instant::now();
+    let mut said = started;
+    let spinner = ui::wait_spinner("no answer yet");
+
+    let found = 'wait: loop {
+        // A SEND THAT FAILS IS PART OF WHAT IS BEING WAITED OUT, not a reason
+        // to stop: a connected UDP socket reports the last datagram's ICMP
+        // unreachable on the next call, and an address with no ARP entry can
+        // fail outright. Both mean "not there yet", which is the whole premise.
+        if let Err(e) = conn.send_command(version_command()) {
+            trace!("VERS could not be sent while waiting: {e}");
+        }
+
+        let deadline = Instant::now() + ASK_EVERY;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match conn.poll(Some(left)) {
+                Ok(events) if events.is_empty() => continue,
+                Ok(events) => match conn.handle_data(&events) {
+                    Ok(replies) => {
+                        if let Some(found) = version_in(replies) {
+                            break 'wait found;
+                        }
+                    }
+                    Err(e) => trace!("unparsed packet while waiting: {e}"),
+                },
+                Err(e) => {
+                    // Not a timeout -- `poll` reports that as no events. Sleep
+                    // out the window rather than spinning on whatever it is.
+                    debug!("poll failed while waiting for the Dreamcast: {e}");
+                    sleep(left);
+                    break;
+                }
+            }
+        }
+
+        if said.elapsed() >= SAY_EVERY {
+            said = Instant::now();
+            info!(
+                "still waiting for the Dreamcast ({} s)",
+                started.elapsed().as_secs()
+            );
+        }
+    };
+
+    drop(spinner);
+    info!(
+        "the Dreamcast answered after {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(found)
 }
 
 /// Poll for a loader at `expect` after a chainload.
@@ -331,16 +423,16 @@ fn wait_for_loader(
     let mut last = String::new();
     while Instant::now() < deadline {
         match query_loader(conn) {
-            Ok((version, Some(base))) if base == expect => {
-                debug!("loader at 0x{:08x} answered: {}", base, version);
-                return Ok(());
-            }
-            Ok((version, Some(base))) => {
-                last = format!("a loader at 0x{base:08x} answered instead ({version})");
-            }
-            Ok((version, None)) => {
-                last = format!("loader did not report its base ({version})");
-            }
+            Ok(r) => match r.base {
+                Some(base) if base == expect => {
+                    debug!("loader at 0x{:08x} answered: {}", base, r.text);
+                    return Ok(());
+                }
+                Some(base) => {
+                    last = format!("a loader at 0x{base:08x} answered instead ({})", r.text);
+                }
+                None => last = format!("loader did not report its base ({})", r.text),
+            },
             Err(e) => last = e.to_string(),
         }
     }
@@ -526,6 +618,7 @@ pub fn load_ip_bin(
     disc_path: &str,
     running_base: Option<u32>,
     full: bool,
+    vga: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     const IP_BIN_ADDR: u32 = 0x0c008000;
 
@@ -545,9 +638,15 @@ pub fn load_ip_bin(
     }
 
     if !full {
-        let sector = crate::disc_formats::types::find_ip_bin(disc).ok_or_else(|| {
+        let mut sector = crate::disc_formats::types::find_ip_bin(disc).ok_or_else(|| {
             std::io::Error::other(format!("{disc_path}: no IP.BIN header to load"))
         })?;
+        // In the buffer, not poked afterwards, for the same reason as the
+        // bootstrap patches below: bytes that travel with the upload cannot go
+        // missing in a cache line that is invalidated rather than purged.
+        if vga {
+            declare_vga_and_say_so(&mut sector);
+        }
 
         info!(
             "IP.BIN header -> 0x{IP_BIN_ADDR:08x} ({} bytes), as isoldr does on a direct boot",
@@ -579,6 +678,10 @@ pub fn load_ip_bin(
         .into());
     }
     image.truncate(want);
+
+    if vga {
+        declare_vga_and_say_so(&mut image);
+    }
 
     // PROVE THIS IS THE BOOTSTRAP, because the wrong track looks right.
     //
@@ -849,6 +952,27 @@ pub fn selftest_readback(conn: &mut impl ExternalDcIo) -> Result<bool, Box<dyn s
     Ok(phys_ok)
 }
 
+/// Which video cable the console that is answering right now is plugged into.
+///
+/// ASKED AT THE MOMENT IT IS NEEDED, not carried down from the first VERS of
+/// the session, and one round trip on an idle console is what that costs. The
+/// loader answering at the start is not necessarily the one that will run the
+/// title: a chainload replaces it, and the one that came off the CD may well
+/// predate this field while the one just uploaded reports it. Asking here
+/// removes the question.
+///
+/// `None` means the loader did not say -- an older build -- and a caller must
+/// read that as "unknown", never as "not VGA".
+pub fn query_cable(conn: &mut impl ExternalDcIo) -> Option<crate::loaders::Cable> {
+    match query_loader(conn) {
+        Ok(r) => r.cable,
+        Err(e) => {
+            warn!("could not ask the loader which video cable is plugged in: {e}");
+            None
+        }
+    }
+}
+
 /// Poke 32-bit words into the title's image after it is uploaded and before it
 /// runs -- DreamShell's `pa1`/`pv1` mechanism, driven from the command line.
 ///
@@ -877,6 +1001,30 @@ pub fn selftest_readback(conn: &mut impl ExternalDcIo) -> Result<bool, Box<dyn s
 /// full confidence (AGENTS.md 11, 14.19), and here that fiction would be
 /// "changing the title changed nothing" -- the single most misleading result
 /// this mechanism can produce.
+/// The bytes that will be in RAM, and the address each run of them lands at.
+///
+/// A raw binary lands whole at `address`; an ELF's sections land at their own.
+/// Every pass that looks for something in a title -- the GAPS probe, the
+/// constants naming the loader, the cable check -- has to agree about that, so
+/// they all ask here rather than each carrying its own copy.
+fn payload_spans(buf: &[u8], address: u32) -> Vec<(u32, &[u8])> {
+    let mut spans: Vec<(u32, &[u8])> = vec![];
+    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf) {
+        if let Some(headers) = elf.section_headers() {
+            for sh in headers.iter() {
+                if crate::loaders::is_uploadable(&sh)
+                    && let Ok((data, _)) = elf.section_data(&sh)
+                {
+                    spans.push((sh.sh_addr as u32, data));
+                }
+            }
+        }
+    } else {
+        spans.push((address, buf));
+    }
+    spans
+}
+
 /// The four G2 slot windows a Katana title probes for an expansion device.
 const GAPS_SLOT_WINDOWS: [u32; 4] = [0xa100_0400, 0xa100_0800, 0xa100_1400, 0xa100_1800];
 /// `"GAPS"` read back as a little-endian word -- the signature the probe compares against.
@@ -908,21 +1056,7 @@ const GAPS_CORROBORATION_SPAN: usize = 4096;
 /// Adventure's 6.7 MB there is neither; in Sonic Adventure 2's 1.5 MB there is
 /// exactly one of each.
 pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
-    // Raw binaries land whole at `address`; an ELF's sections land at their own.
-    let mut spans: Vec<(u32, &[u8])> = vec![];
-    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf) {
-        if let Some(headers) = elf.section_headers() {
-            for sh in headers.iter() {
-                if crate::loaders::is_uploadable(&sh)
-                    && let Ok((data, _)) = elf.section_data(&sh)
-                {
-                    spans.push((sh.sh_addr as u32, data));
-                }
-            }
-        }
-    } else {
-        spans.push((address, buf));
-    }
+    let spans = payload_spans(buf, address);
 
     let mut out = vec![];
     for (base, data) in spans {
@@ -957,6 +1091,196 @@ pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
     out
 }
 
+/// The SH4's port data register. Bits 8 and 9 are the video cable the console
+/// is plugged into: 0 = VGA, 2 = RGB (SCART), 3 = composite.
+const PDTRA: u32 = 0xff80_0030;
+
+/// How far past the load of that address the read of it may sit, in
+/// instructions. Two, in every title measured; eight leaves room for a
+/// compiler that scheduled something in between, and is short enough that the
+/// scan cannot wander into the next routine.
+const CABLE_READ_WINDOW: usize = 8;
+
+/// Make a title believe a VGA box is plugged in -- which is the whole of what
+/// a "VGA patch" is.
+///
+/// A Katana title asks the hardware which cable it is on, once, through the
+/// SDK's cable check, and everything downstream follows from the two bits it
+/// reads: 480p or interlace, and whether the VGA path is offered at all.
+/// Forcing that read to 0 therefore IS the patch, and it is one halfword.
+///
+/// FOUND BY CONTENT, like the GAPS probe above, because the alternative is a
+/// per-title table nobody can maintain. The register address is a literal in a
+/// pool, an `mov.l @(disp,PC),Rn` loads it, and the read follows a couple of
+/// instructions later. Measured on four PAL dumps -- Sonic Adventure, Sonic
+/// Adventure 2, Crazy Taxi and Snow Surfers -- each has EXACTLY ONE aligned
+/// occurrence of 0xff800030, exactly one instruction that loads it, and the
+/// same routine around it, byte for byte:
+///
+/// ```text
+///   d3 03   mov.l  @(3,PC),r3   ; 0xff800030
+///   92 03   mov.w  @(3,PC),r2   ; 0x0300
+///   64 31   mov.w  @r3,r4       <- becomes `mov #0,r4` (e4 00)
+///   60 4d   extu.w r4,r0
+///   00 0b   rts
+///   20 29   and    r2,r0
+/// ```
+///
+/// THE READ IS WHAT IS PATCHED, NOT THE EXTRACTION AFTER IT. The caller shifts
+/// and masks the result in its own way -- `shlr8` then `and #3` in all four,
+/// but a title is just as free to test the raw 0x300 -- and forcing the value
+/// that comes off the port to 0 answers every one of those with "VGA" while
+/// having to recognise none of them.
+///
+/// WHAT IT DOES NOT DO. It cannot make a title render 480p that has no code
+/// for it: a title declaring no VGA support may set an interlaced mode by
+/// hand, and that is a per-title patch no scan finds. And it is off by default
+/// for a reason no scan can settle -- nothing on this side of the wire can see
+/// which cable is plugged into the console, and a title forced to VGA on a TV
+/// is a black screen.
+pub fn vga_cable_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = vec![];
+    for (span_base, data) in payload_spans(buf, address) {
+        let word = |i: usize| u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        let half = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]);
+        let pool: Vec<usize> = (0..data.len().saturating_sub(3))
+            .step_by(4)
+            .filter(|&i| word(i) == PDTRA)
+            .collect();
+        if pool.is_empty() {
+            continue;
+        }
+        // Reported in the cached window, which is what a disassembly of the
+        // title shows, whatever window the payload was uploaded through.
+        let at_of = |i: usize| ((span_base & 0x1fff_ffff) | 0x8c00_0000).wrapping_add(i as u32);
+        for i in (0..data.len().saturating_sub(1)).step_by(2) {
+            let op = half(i);
+            if op & 0xf000 != 0xd000 {
+                continue;
+            }
+            let target = ((i + 4) & !3) + (op & 0xff) as usize * 4;
+            if !pool.contains(&target) {
+                continue;
+            }
+            let reg = (op >> 8) & 0xf;
+            let mut done = false;
+            // `rts` ends the routine one delay slot later; the read is before
+            // it in every title measured, and stopping there keeps a literal
+            // pool or the next function from being read as code.
+            let mut last = CABLE_READ_WINDOW;
+            for k in 1..=CABLE_READ_WINDOW {
+                let at = i + k * 2;
+                if at + 1 >= data.len() || k > last {
+                    break;
+                }
+                let op = half(at);
+                // `mov.w @Rm,Rn` (0x6mn1) and `mov.l @Rm,Rn` (0x6mn2) -- the
+                // two widths that can carry bits 8 and 9 in one instruction.
+                if matches!(op & 0xf00f, 0x6001 | 0x6002) && (op >> 4) & 0xf == reg {
+                    let dst = (op >> 8) & 0xf;
+                    let mov_imm0 = 0xe000u16 | (dst << 8);
+                    let aligned = at & !3;
+                    let before = word(aligned);
+                    let after = if at & 2 == 0 {
+                        (before & 0xffff_0000) | mov_imm0 as u32
+                    } else {
+                        (before & 0x0000_ffff) | ((mov_imm0 as u32) << 16)
+                    };
+                    info!(
+                        "this title reads the cable type at 0x{:08x} (0x{PDTRA:08x} loaded \
+                         into r{reg} at 0x{:08x}); it will read 0 -- VGA",
+                        at_of(at),
+                        at_of(i)
+                    );
+                    out.push((at_of(aligned), after));
+                    done = true;
+                    break;
+                }
+                if op == 0x000b {
+                    last = k + 1;
+                }
+            }
+            if !done {
+                warn!(
+                    "this title loads the cable-type register 0x{PDTRA:08x} at 0x{:08x} and \
+                     then reads it in a shape this host does not recognise -- NOTHING was \
+                     patched there, so it will see the cable that is really plugged in",
+                    at_of(i)
+                );
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// IP.BIN's peripheral field: seven ASCII hex digits at +0x38 holding the
+/// Katana peripheral word, of which bit 4 means "VGA box".
+///
+/// Measured on the four PAL dumps here: Sonic Adventure `0601A10`, Sonic
+/// Adventure 2 `0799A10` and Crazy Taxi `0799A10` all carry the bit; Snow
+/// Surfers is `0799A00` and does not -- which is the title that needs the
+/// patch, and the reason this is not judged from the cable check alone.
+const IP_BIN_PERIPHERALS: std::ops::Range<usize> = 0x38..0x40;
+
+/// Bit 4 of that word: "supports the VGA box".
+pub const PERIPHERAL_VGA: u32 = 0x10;
+
+/// What the header says the title can be played with, or `None` when that
+/// field is not the hex string it is supposed to be.
+pub fn ip_bin_peripherals(header: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(header.get(IP_BIN_PERIPHERALS)?).ok()?;
+    u32::from_str_radix(text.trim(), 16).ok()
+}
+
+/// Set the VGA bit in an IP.BIN header, in place, and say what it read before
+/// and after.
+///
+/// WHY BOTHER, when the cable check is what the title actually asks. Because
+/// neither of the two readers of this field is the title's own cable check:
+/// IP.BIN's bootstrap consults it, and `--boot-ipbin` runs that bootstrap; and
+/// the header stays in RAM at 0x8c008000, where a title can read it back --
+/// this host puts it there itself, exactly as isoldr does, precisely because
+/// nothing else on our path ever populates that region. A title that finds no
+/// VGA bit there can refuse the mode its patched cable check just asked for.
+///
+/// The field's width is preserved rather than assumed: every disc measured
+/// writes seven digits and a space, and a disc that writes eight is a disc
+/// this must not shorten.
+pub fn declare_vga_in_ip_bin(header: &mut [u8]) -> Option<(u32, u32)> {
+    let before = ip_bin_peripherals(header)?;
+    let after = before | PERIPHERAL_VGA;
+    let width = std::str::from_utf8(&header[IP_BIN_PERIPHERALS])
+        .ok()?
+        .trim()
+        .len();
+    let text = format!("{after:0width$X}");
+    if text.len() > IP_BIN_PERIPHERALS.len() {
+        return None;
+    }
+    let mut field = [b' '; IP_BIN_PERIPHERALS.end - IP_BIN_PERIPHERALS.start];
+    field[..text.len()].copy_from_slice(text.as_bytes());
+    header[IP_BIN_PERIPHERALS].copy_from_slice(&field);
+    Some((before, after))
+}
+
+/// The same thing, said out loud, so both IP.BIN paths report it identically.
+fn declare_vga_and_say_so(header: &mut [u8]) {
+    match declare_vga_in_ip_bin(header) {
+        Some((before, after)) if before != after => info!(
+            "--vga: IP.BIN peripherals 0x{before:07X} -> 0x{after:07X}, declaring VGA box support"
+        ),
+        Some((before, _)) => {
+            info!("--vga: IP.BIN already declares VGA box support (peripherals 0x{before:07X})")
+        }
+        None => warn!(
+            "--vga: IP.BIN's peripheral field is not the hex string it should be; \
+             leaving it as it is"
+        ),
+    }
+}
+
 /// Addresses the title loads as constants that land inside the running
 /// loader's memory -- reported BEFORE the title is started, because nothing
 /// can report them afterwards.
@@ -986,20 +1310,7 @@ pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
 /// actually loads it. On Sonic Adventure 2 that is the whole difference between
 /// eight occurrences of 0x0cff0000 and the two sites that use them.
 pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<(u32, u32)> {
-    let mut spans: Vec<(u32, &[u8])> = vec![];
-    if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf) {
-        if let Some(headers) = elf.section_headers() {
-            for sh in headers.iter() {
-                if crate::loaders::is_uploadable(&sh)
-                    && let Ok((data, _)) = elf.section_data(&sh)
-                {
-                    spans.push((sh.sh_addr as u32, data));
-                }
-            }
-        }
-    } else {
-        spans.push((address, buf));
-    }
+    let spans = payload_spans(buf, address);
 
     let ranges = crate::loaders::exclusive_footprint(base);
     if ranges.is_empty() {
@@ -1311,13 +1622,22 @@ pub fn reboot(
     Ok(0)
 }
 
+// Nine, and each one is a different thing the session already decided: the
+// disc, the mount, where the loader is, the guard to keep alive, whether to
+// serve audio, where to record what is learned, what to sample, and how close
+// the title's stack is getting. Bundling them into a struct would only move the
+// list somewhere the caller cannot see it while reading this signature.
+#[allow(clippy::too_many_arguments)]
 pub fn receive_syscalls(
     conn: &mut impl ExternalDcIo,
     cd_disc: Option<Box<dyn DiscFormat>>,
     mount: Option<String>,
     running_base: Option<u32>,
-    gaps_guard: &[(u32, u32)],
+    guards: &[(u32, u32)],
+    cdda: bool,
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
+    mut diag: Option<crate::diag::Probe>,
+    mut stack: Option<crate::stackwatch::StackWatch>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     // A disc that could not be opened is not a silent no-op: the title is
     // about to be started with CDFS redirection ON, so it will ask for sectors
@@ -1332,7 +1652,26 @@ pub fn receive_syscalls(
     // macros do not evaluate their arguments at the default verbosity.)
     let toc_start = disc.start_sector();
     let toc_sectors = disc.num_sectors();
+    // Enumerated ONCE, here, for the same reason as the two above: on a zipped
+    // GDI, opening a track can mean a full deflate index build, and this would
+    // otherwise happen inside the TOC syscall with the title frozen waiting.
+    let toc_all_tracks = disc.toc_tracks();
+    let mut cdda_reads: u64 = 0;
+    let mut cdda_started: Option<Instant> = None;
+    let mut cdda_errors: u64 = 0;
     debug!("CDFS source: start_sector={toc_start} num_sectors={toc_sectors}");
+    if toc_all_tracks.is_empty() {
+        debug!(
+            "this image does not enumerate its tracks: the table of contents will be \
+             the single-data-track one, and a title reading it cannot discover any CDDA"
+        );
+    } else {
+        let audio = toc_all_tracks.iter().filter(|t| t.audio).count();
+        info!(
+            "disc has {} tracks, {audio} of them audio",
+            toc_all_tracks.len()
+        );
+    }
     let base_path = mount.as_ref().map(Path::new);
     if let Some(base_path) = base_path
         && !base_path.exists()
@@ -1365,7 +1704,32 @@ pub fn receive_syscalls(
     // a burst is open so the bar can be taken down when the loading stops.
     let mut load = ui::LoadMonitor::new();
     loop {
-        match await_result(conn, load.poll_timeout()) {
+        // TOP OF THE ITERATION, AND ONLY HERE. The counter probe posts its own
+        // SendBinQ; doing that anywhere else would put an outgoing command in
+        // the middle of a transfer that owns the conversation. Nothing blocks:
+        // the replies are picked out of the ordinary flow below.
+        if let Some(d) = diag.as_mut() {
+            d.tick(conn);
+        }
+        // Same rule, same place: the stack watch posts its own SendBinQ, and
+        // the top of the loop is the one point where no transfer owns the
+        // conversation.
+        if let Some(s) = stack.as_mut() {
+            s.tick(conn);
+        }
+        // Whoever wants waking up soonest decides. `LoadMonitor` asks for
+        // nothing while no burst is open -- the normal state of a running
+        // title -- so without the panel this is still the block-forever it
+        // always was.
+        let timeout = [
+            load.poll_timeout(),
+            diag.as_ref().and_then(|d| d.poll_timeout()),
+            stack.as_ref().and_then(|s| s.poll_timeout()),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        match await_result(conn, timeout) {
             Err(e) => {
                 // A timeout is not a fault here: it is the burst having gone
                 // quiet, and the only reason we asked for one.
@@ -1379,6 +1743,10 @@ pub fn receive_syscalls(
             }
             Ok(cmds) => {
                 for cmd in cmds {
+                    // NOTHING TO FILTER HERE. The probe's replies are claimed
+                    // in the IO layer instead (`io::PacketSink`), because they
+                    // arrive inside whatever transfer happens to be polling --
+                    // never here. See `diag::SampleSink`.
                     if let Some(inner_cmd) = cmd.request {
                         match inner_cmd {
                             // Handle special cases
@@ -1387,14 +1755,23 @@ pub fn receive_syscalls(
                                     "Received ReadSector syscall: start=0x{:08x}, dc_address=0x{:08x}, size={}",
                                     start, dc_address, size
                                 );
-                                if size % 2048 != 0 {
-                                    return Err(Box::new(Error::new(
-                                        ErrorKind::InvalidData,
-                                        format!(
-                                            "ReadSector size is not a multiple of 2048: {}",
-                                            size
-                                        ),
-                                    )));
+                                // A REQUEST THIS MALFORMED IS EVIDENCE, NOT A
+                                // REASON TO DIE. dcload builds it out of its
+                                // own state, so a size that is not a sector
+                                // multiple means that state was overwritten --
+                                // and at a low base the thing that overwrites
+                                // it is the title's own stack descending past
+                                // `_end` (AGENTS.md §4.6). Ending the session
+                                // here loses the memory map and the counters,
+                                // which are the only two things that say where
+                                // to put the loader next time. Refuse the read
+                                // and stay up, exactly as an unanswered
+                                // transfer does.
+                                if size % 2048 != 0 || size > MAX_XFER as u32 {
+                                    warn!(
+                                        "ReadSector request is malformed (LBA 0x{start:08x} ->                                          0x{dc_address:08x}, size {size}). The loader's own state                                          has been overwritten -- at a low base, check                                          g_gd_sp_in_image with --diag, and see AGENTS.md 4.6.                                          Refusing this read and staying up."
+                                    );
+                                    continue;
                                 }
                                 let num_sectors = size / 2048;
                                 let mut buf = disc.read_sector(start, num_sectors)?;
@@ -1643,18 +2020,23 @@ pub fn receive_syscalls(
                                                 }
                                             }
                                         }
-                                        // THE GAPS GUARD HAS TO SURVIVE A RELOAD.
+                                        // A GUARD PATCH HAS TO SURVIVE A RELOAD.
                                         //
-                                        // What it neutralises is a word in the
-                                        // title's own image, and a title is free
-                                        // to read its image back off its disc.
-                                        // That would restore the probe's
-                                        // comparison constant and let it switch
-                                        // the adapter off, after which the loader
-                                        // is deaf with nothing logged at either
-                                        // end (AGENTS.md 4.12) -- the same silent
+                                        // What the GAPS guard and the VGA patch
+                                        // change is a word in the title's own
+                                        // image, and a title is free to read its
+                                        // image back off its disc. That would
+                                        // restore the probe's comparison constant
+                                        // and let it switch the adapter off,
+                                        // after which the loader is deaf with
+                                        // nothing logged at either end
+                                        // (AGENTS.md 4.12) -- the same silent
                                         // ending the guard exists to prevent,
-                                        // reached the long way round. Tested on
+                                        // reached the long way round; and it
+                                        // would put the cable check back, which
+                                        // is a title that changes video mode
+                                        // half way through its own start-up.
+                                        // Tested on
                                         // every read, paid for only by one that
                                         // actually covers a patched word, and
                                         // done HERE: after the read-back
@@ -1663,7 +2045,7 @@ pub fn receive_syscalls(
                                         // ReturnValue, which is the last moment
                                         // the title is still parked and cannot
                                         // yet run what was just delivered.
-                                        let reloaded: Vec<(u32, u32)> = gaps_guard
+                                        let reloaded: Vec<(u32, u32)> = guards
                                             .iter()
                                             .copied()
                                             .filter(|&(at, _)| {
@@ -1674,14 +2056,15 @@ pub fn receive_syscalls(
                                             .collect();
                                         if !reloaded.is_empty() {
                                             warn!(
-                                                "this read reloads the code the GAPS guard \
-                                                 patched (LBA 0x{start:08x} -> 0x{dc_address:08x}, \
-                                                 {} B); re-applying it before the title can run \
-                                                 the bytes just delivered",
+                                                "this read reloads {} patched word(s) \
+                                                 (LBA 0x{start:08x} -> 0x{dc_address:08x}, \
+                                                 {} B); re-applying them before the title can \
+                                                 run the bytes just delivered",
+                                                reloaded.len(),
                                                 buf.len()
                                             );
                                             if let Err(e) = apply_patches(conn, &reloaded) {
-                                                error!("could not re-apply the GAPS guard: {e}");
+                                                error!("could not re-apply the guard: {e}");
                                             }
                                         }
                                         conn.send_command(DCLoadCmd {
@@ -1705,8 +2088,115 @@ pub fn receive_syscalls(
                                     }
                                 }
                             }
-                            DCLoadClientCmds::ReadToc(_session, dc_address, _unused) => {
-                                let toc = build_dc_toc(toc_start, toc_sectors);
+                            // CDDA. Deliberately NOT recorded in the memory map:
+                            // the destination is dcload's own staging buffer,
+                            // inside the loader's footprint, and marking it
+                            // would teach the map that this title writes where
+                            // the loader lives -- the one thing the map exists
+                            // to answer, poisoned by our own traffic.
+                            DCLoadClientCmds::ReadAudio(start, dc_address, size) => {
+                                let answer = if !cdda {
+                                    Err("CDDA is off (--no-cdda)".to_string())
+                                } else if size % RAW_SECTOR_SIZE as u32 != 0 {
+                                    Err(format!(
+                                        "CDDA read size {size} is not a multiple of \
+                                         {RAW_SECTOR_SIZE}"
+                                    ))
+                                } else {
+                                    disc.read_audio(start, size / RAW_SECTOR_SIZE as u32)
+                                        .map_err(|e| e.to_string())
+                                };
+                                match answer {
+                                    Ok(buf) => {
+                                        if cdda_reads == 0 {
+                                            cdda_started = Some(Instant::now());
+                                            info!(
+                                                "CDDA: first audio read served (LBA \
+                                                 0x{start:08x}, {} bytes)",
+                                                buf.len()
+                                            );
+                                        }
+                                        cdda_reads += 1;
+                                        // THE RATE, PERIODICALLY, BECAUSE A
+                                        // RUNAWAY IS INVISIBLE OTHERWISE.
+                                        // Measured 2026-08-29: a flow-control
+                                        // bug on the console fetched 3.4x
+                                        // real time and starved the title,
+                                        // and at DEBUG it looked like a wall
+                                        // of identical lines nobody would
+                                        // read as a rate. One raw sector is
+                                        // 1/75 s of audio, so the ratio is
+                                        // arithmetic, and 1.0 is the answer.
+                                        if cdda_reads % 250 == 0 {
+                                            let secs = cdda_started
+                                                .get_or_insert_with(Instant::now)
+                                                .elapsed()
+                                                .as_secs_f64();
+                                            let audio = (cdda_reads
+                                                * (buf.len() / RAW_SECTOR_SIZE) as u64)
+                                                as f64
+                                                / 75.0;
+                                            let ratio = if secs > 0.0 { audio / secs } else { 0.0 };
+                                            if ratio > 1.5 {
+                                                warn!(
+                                                    "CDDA is streaming {ratio:.1}x faster than \
+                                                     real time ({cdda_reads} reads): the \
+                                                     loader's flow control is not holding, and \
+                                                     it will starve the title"
+                                                );
+                                            } else {
+                                                // THE LBA TOO, because "the
+                                                // stream is advancing" and
+                                                // "the stream is replaying
+                                                // the same three sectors at
+                                                // the right rate" look
+                                                // identical from a count.
+                                                info!(
+                                                    "CDDA: {cdda_reads} reads, {ratio:.2}x real \
+                                                     time, at LBA 0x{start:08x}"
+                                                );
+                                            }
+                                        }
+                                        if let Err(e) = send_data(conn, &buf, dc_address, None) {
+                                            warn!("CDDA read transfer failed: {e}");
+                                            let _ = conn.send_command(DCLoadCmd {
+                                                cmd: DCLoadCmds::ReturnValue(),
+                                                address: u32::MAX,
+                                                size: u32::MAX,
+                                            });
+                                            continue;
+                                        }
+                                        conn.send_command(DCLoadCmd {
+                                            cmd: DCLoadCmds::ReturnValue(),
+                                            address: 0,
+                                            size: 0,
+                                        })?;
+                                    }
+                                    // NOT fatal to the session. A title that
+                                    // asks for audio this image cannot serve
+                                    // should lose its music, not its disc: the
+                                    // loader turns a refusal into silence and
+                                    // the game goes on reading data.
+                                    Err(e) => {
+                                        if cdda_errors == 0 {
+                                            warn!(
+                                                "CDDA read refused (LBA 0x{start:08x}): {e}. \
+                                                 The title will get silence; further \
+                                                 refusals are not logged."
+                                            );
+                                        }
+                                        cdda_errors += 1;
+                                        conn.send_command(DCLoadCmd {
+                                            cmd: DCLoadCmds::ReturnValue(),
+                                            address: u32::MAX,
+                                            size: u32::MAX,
+                                        })?;
+                                    }
+                                }
+                            }
+                            DCLoadClientCmds::ReadToc(area, dc_address, _unused) => {
+                                let toc =
+                                    build_dc_toc(toc_start, toc_sectors, &toc_all_tracks, area);
                                 if let Err(e) = send_data(conn, &toc, dc_address, None) {
                                     warn!("Failed to send CDFS TOC data: {}", e);
                                     let _ = conn.send_command(DCLoadCmd {
@@ -1753,25 +2243,34 @@ pub fn receive_syscalls(
                 // output, a file syscall -- after it stops loading would keep
                 // the poll returning promptly and leave the bar up.
                 load.settle();
+                // Picks up a repaint the display throttled away between two of
+                // its own frames -- a keypress, most often. Cheap: indicatif
+                // decides whether it is due, and drops it if it is not.
+                if let Some(d) = diag.as_ref() {
+                    d.repaint();
+                }
             }
         }
+    }
+}
+
+/// The version handshake, as it goes on the wire: our protocol version stuffed
+/// into the address field, which is where dcload reads it from.
+fn version_command() -> DCLoadCmd {
+    let protocol_version = protocol_version();
+    DCLoadCmd {
+        cmd: DCLoadCmds::Version(None),
+        address: ((protocol_version[0] as u32) << 16)
+            | ((protocol_version[1] as u32) << 8)
+            | protocol_version[2] as u32,
+        size: 0,
     }
 }
 
 pub fn send_version(
     conn: &mut impl ExternalDcIo,
 ) -> std::result::Result<Vec<DCReturnCmd>, std::boxed::Box<dyn std::error::Error>> {
-    let protocol_version = protocol_version();
-    call_command(
-        conn,
-        DCLoadCmd {
-            cmd: DCLoadCmds::Version(None),
-            address: ((protocol_version[0] as u32) << 16)
-                | ((protocol_version[1] as u32) << 8)
-                | protocol_version[2] as u32,
-            size: 0,
-        },
-    )
+    call_command(conn, version_command())
 }
 
 /*
@@ -2917,5 +3416,110 @@ mod tests {
         let p = raw_ops(0x1000, &[(0x200, 0x0cff_0000)], &[mov_l_pc(0x100, 0x200, 1)]);
         let got = literals_in_loader_footprint(&p, 0x0c01_0000, 0x8c00_4000);
         assert!(got.is_empty(), "the low base reported a high-RAM constant: {got:?}");
+    }
+    use super::{PDTRA, declare_vga_in_ip_bin, ip_bin_peripherals, vga_cable_patches};
+
+    /// The cable check every Katana title measured carries, byte for byte --
+    /// the literal, the load that reads it, and the `mov.w @r3,r4` that reads
+    /// the port. `at` only has to be 2-aligned, which is all an instruction is.
+    fn cable_check(len: usize, at: usize) -> Vec<u8> {
+        let pool = ((at + 4) & !3) + 12;
+        let (_, load) = mov_l_pc(at, pool, 3);
+        raw_ops(
+            len,
+            &[(pool, PDTRA)],
+            &[
+                (at, load),        // mov.l  @(3,PC),r3
+                (at + 2, 0x9203),  // mov.w  @(3,PC),r2   ; 0x0300
+                (at + 4, 0x6431),  // mov.w  @r3,r4
+                (at + 6, 0x604d),  // extu.w r4,r0
+                (at + 8, 0x000b),  // rts
+                (at + 10, 0x2029), // and    r2,r0
+            ],
+        )
+    }
+
+    #[test]
+    fn the_cable_read_becomes_mov_zero() {
+        // The read is at 0x104, the low half of its word: `mov.w @r3,r4`
+        // (0x6431) becomes `mov #0,r4` (0xe400) and `extu.w r4,r0` above it is
+        // left exactly as it was.
+        let p = cable_check(0x1000, 0x100);
+        let got = vga_cable_patches(&p, 0x0c01_0000);
+        assert_eq!(got, vec![(0x8c01_0104, 0x604d_e400)]);
+    }
+
+    #[test]
+    fn a_read_in_the_high_half_of_a_word_keeps_the_low_one() {
+        // The same routine two bytes along, so the instruction to replace is
+        // the second one in its word. Getting this backwards would rewrite the
+        // wrong instruction and still report a verified patch.
+        let p = cable_check(0x1000, 0x102);
+        let got = vga_cable_patches(&p, 0x0c01_0000);
+        assert_eq!(got, vec![(0x8c01_0104, 0xe400_9203)]);
+    }
+
+    #[test]
+    fn a_port_address_nothing_loads_is_left_alone() {
+        // 0xff800030 as a plain number in data. Without this the scan would
+        // patch whatever instruction happened to follow it.
+        let p = raw(0x1000, &[(0x200, PDTRA)]);
+        let got = vga_cable_patches(&p, 0x0c01_0000);
+        assert!(got.is_empty(), "patched on the literal alone: {got:?}");
+    }
+
+    #[test]
+    fn a_load_with_no_read_after_it_patches_nothing() {
+        // A shape this host does not recognise must come back empty -- and
+        // say so, which is the whole point: a title that was never patched and
+        // a title that ignored the patch look identical afterwards.
+        let pool = 0x110;
+        let p = raw_ops(0x1000, &[(pool, PDTRA)], &[mov_l_pc(0x100, pool, 3)]);
+        let got = vga_cable_patches(&p, 0x0c01_0000);
+        assert!(got.is_empty(), "patched without finding the read: {got:?}");
+    }
+
+    #[test]
+    fn the_read_must_use_the_register_the_address_went_into() {
+        // Same routine, but the read is of r5 -- another pointer entirely.
+        let mut p = cable_check(0x1000, 0x100);
+        p[0x104..0x106].copy_from_slice(&0x6451u16.to_le_bytes()); // mov.w @r5,r4
+        let got = vga_cable_patches(&p, 0x0c01_0000);
+        assert!(got.is_empty(), "patched a read of another register: {got:?}");
+    }
+
+    /// An IP.BIN header whose peripheral field reads `text`.
+    fn header_with(text: &[u8]) -> Vec<u8> {
+        let mut h = vec![b' '; 0x100];
+        h[..16].copy_from_slice(b"SEGA SEGAKATANA ");
+        h[0x38..0x38 + text.len()].copy_from_slice(text);
+        h
+    }
+
+    #[test]
+    fn the_vga_bit_is_set_and_the_field_keeps_its_width() {
+        // Snow Surfers' field, the one title of the four measured that does
+        // not declare VGA support.
+        let mut h = header_with(b"0799A00");
+        assert_eq!(declare_vga_in_ip_bin(&mut h), Some((0x0079_9A00, 0x0079_9A10)));
+        assert_eq!(&h[0x38..0x40], b"0799A10 ");
+    }
+
+    #[test]
+    fn a_title_that_already_declares_vga_is_unchanged() {
+        // Sonic Adventure's field. Setting a bit that is set must not rewrite
+        // the field into a different spelling of the same number.
+        let mut h = header_with(b"0601A10");
+        let before = h[0x38..0x40].to_vec();
+        assert_eq!(declare_vga_in_ip_bin(&mut h), Some((0x0060_1A10, 0x0060_1A10)));
+        assert_eq!(h[0x38..0x40], before[..]);
+    }
+
+    #[test]
+    fn a_field_that_is_not_hex_is_refused() {
+        let mut h = header_with(b"NOT HEX");
+        assert_eq!(ip_bin_peripherals(&h), None);
+        assert_eq!(declare_vga_in_ip_bin(&mut h), None);
+        assert_eq!(&h[0x38..0x40], b"NOT HEX ");
     }
 }

@@ -53,7 +53,9 @@
 
 use crate::disc_formats::source::ImageSource;
 use crate::disc_formats::iso9660;
-use crate::disc_formats::types::{DiscFormat, HARDWARE_ID, check_read_len};
+use crate::disc_formats::types::{
+    DiscFormat, HARDWARE_ID, RAW_SECTOR_SIZE, TocTrack, check_read_len,
+};
 
 const V2: u32 = 0x8000_0004;
 const V3: u32 = 0x8000_0005;
@@ -405,6 +407,65 @@ impl DiscFormat for Cdi {
 
     fn start_sector(&self) -> u32 {
         self.tracks[self.boot].start_lba
+    }
+
+    /// Every track the descriptor block declares, audio included.
+    ///
+    /// A CDI track's `mode` is the disc's own: 0 is audio, 1 and 2 are the
+    /// data modes. The numbering is positional -- the descriptor stores tracks
+    /// in disc order (see `parse_tracks`) -- and `start_lba` already counts the
+    /// lead-in, so unlike a `.gdi` there is nothing to add.
+    fn toc_tracks(&self) -> Vec<TocTrack> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TocTrack {
+                number: (i + 1) as u8,
+                start_lba: t.start_lba,
+                audio: t.mode == 0,
+            })
+            .collect()
+    }
+
+    /// Raw 2352-byte sectors out of an audio track. See the trait, and the
+    /// GDI implementation for why a data track is refused rather than served.
+    fn read_audio(
+        &self,
+        lba: u32,
+        num_sectors: u32,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        check_read_len(num_sectors)?;
+        if num_sectors == 0 {
+            return Ok(vec![]);
+        }
+        let mut out = vec![0u8; (num_sectors as usize) * RAW_SECTOR_SIZE];
+        for (i, chunk) in out.chunks_mut(RAW_SECTOR_SIZE).enumerate() {
+            let want = lba.saturating_add(i as u32);
+            let track = self
+                .tracks
+                .iter()
+                .find(|t| t.contains(want))
+                .ok_or_else(|| format!("CDDA LBA {want} is in no track of this CDI"))?;
+            if track.mode != 0 {
+                return Err(format!(
+                    "CDDA read at LBA {want} lands on a data track (mode {})",
+                    track.mode
+                )
+                .into());
+            }
+            if track.sector_size as usize != RAW_SECTOR_SIZE {
+                return Err(format!(
+                    "audio track at LBA {} has {}-byte sectors, not {RAW_SECTOR_SIZE}",
+                    track.start_lba, track.sector_size
+                )
+                .into());
+            }
+            // No `data_offset`: on an audio track every byte is a sample.
+            let at = track.file_offset
+                + ((want - track.start_lba) as u64) * (RAW_SECTOR_SIZE as u64);
+            self.source.read_at(at, chunk)?;
+        }
+        Ok(out)
     }
 
     fn num_sectors(&self) -> u32 {

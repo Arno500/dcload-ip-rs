@@ -9,11 +9,17 @@
 # has, commit the row, and everyone's placement gets better. A row is only ever
 # incomplete, never wrong -- a bit is set because a read really landed there.
 #
-# md5	title	blocks	sessions
-001329bf709ddff3f23a7615409ff4ac	CRAZY TAXI 2	000000877f20fefefffffff3f0ffffffffffffffffffc3ffffffff0300020000	1
-10896faa3e1de5dc5ce7777e5fed492a	JET SET RADIO	4000000000083000f007000000000000ffffffffffefffffffffffffffffffff	1
-3de0864371f8794acdc46969484f318c	CRAZY TAXI	000000807f08fffeffffffdfffffffffffffffffffffffffffffffff3f020000	1
-752b24f3b041e14d75c37a22b23036ce	SONIC ADVENTURE 2	000000040042ffffffff000000000008000000f0000000000000f000f8010070	1
-9d7c156e132d74ab5c82352e02b91876	SONIC ADVENTURE	0800000000000000000000000006007c024000ff0000f0000078ffffffff0000	1
-b167c57c29f1589610d3967a14fffc64	BOMBERMAN ONLINE	000000000004000100fc0700e0030000000ef80f000000000000000000000000	1
-c93489606766647da2a0ccd7404043e5	BUZZ 2000	0000020000000000000000000000000000000000000000f09fffffff0f600080	1
+# `sp_min` is the lowest stack pointer the title was seen entering a GD syscall
+# with, read out of the running loader. It merges by MINIMUM, and it is what
+# says whether a loader may sit under that stack at all -- no disc read can show
+# that, because nothing is ever read INTO a stack. Blank means never measured.
+#
+# md5	title	blocks	sessions	sp_min
+001329bf709ddff3f23a7615409ff4ac	CRAZY TAXI 2	000000877f20fefefffffff3ffffffffffffffffffffc3ffffffffff7f020000	1	0x0c1750ec
+10896faa3e1de5dc5ce7777e5fed492a	JET SET RADIO	4000000000083000f007000000000000ffffffffffefffffffffffffffffffff	1	
+1aae36b0c58051ed3f9c3190a2927dbd	SNOW SURFERS	0000004400000000f8ffffffffffffffffffffffffffff7f0400000000000000	1	
+3de0864371f8794acdc46969484f318c	CRAZY TAXI	000000807f08fffeffffffdfffffffffffffffffffffffffffffffff3f020000	1	
+752b24f3b041e14d75c37a22b23036ce	SONIC ADVENTURE 2	000000040042ffffffff000000000008000000f0000000000000f000f8010070	1	
+9d7c156e132d74ab5c82352e02b91876	SONIC ADVENTURE	0800000000000000000000000006007c024000ff0000f0400078ffffffff0000	1	0x8c00b91c
+b167c57c29f1589610d3967a14fffc64	BOMBERMAN ONLINE	000000000004000100fc0700e0030000000ef80f000000000000000000000000	1	
+c93489606766647da2a0ccd7404043e5	BUZZ 2000	0000020000000000000000000000000000000000000000f09fffffff0f600080	1	

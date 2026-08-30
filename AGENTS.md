@@ -32,7 +32,23 @@ A typical `u-exec` session, end-to-end, is roughly:
    `polling` crate.
 2. Send a `Version` (`VERS`) command. The DC replies with its protocol
    version and (optionally) a build identifier string. We refuse to
-   continue if the DC doesn't answer.
+   continue if the DC doesn't answer -- five tries, then out, and the failure
+   names `--infinite`.
+
+   **`--infinite` (`-i`) waits for the console instead** (`dispatch::wait_for_any_loader`),
+   which is what a session started before the Dreamcast has finished booting
+   needs: it asks twice a second, forever, and picks the loader up the moment
+   it answers. It is a START-UP option and covers this exchange only -- every
+   command afterwards keeps its five tries, because a console that goes silent
+   mid-session is a failure worth reporting rather than something to wait out.
+   Deliberately not `query_loader` in a loop: `call_command` logs a warning per
+   lost packet and `await_result` an error per timeout, which is ten lines
+   every 2.5 s for a wait whose normal state is silence. So the question is
+   asked directly, quietly, and a spinner (`ui::wait_spinner`) says it is still
+   trying. For the same reason `io.rs` logs "nobody is listening there"
+   (WSAECONNRESET on Windows, ECONNREFUSED on Linux -- a connected UDP socket's
+   way of reporting an ICMP unreachable) at debug rather than error: with the
+   console off, that is one line per poll.
 3. **Loader placement** (`src/presets.rs`, `src/loaders.rs`, driven from
    `main.rs::wanted_loader_base`). Only on `u-exec` with a disc image, and only
    before anything else is uploaded.
@@ -79,6 +95,29 @@ A typical `u-exec` session, end-to-end, is roughly:
      first. It compares PHYSICAL addresses, because a title goes to
      0x0c010000 while the loader sits at 0x8c004000 and those are the same RAM;
      the alias is the whole reason the check is not a two-line one.
+   - **A base is judged by three tests, and the third one is not an address
+     collision.** The constant scan asks what the title NAMES and the learned
+     map asks where its reads have LANDED; both look for an overlap. A title's
+     STACK is neither: it descends from 0x8c00f400 into whatever a low loader
+     left below it, is named by no constant, and no read is ever served into
+     it. `low_base_has_stack_headroom` is that test —
+     `sp_min - _end >= LOW_BASE_MIN_MARGIN` — and Sonic Adventure at the stock
+     base is the case it exists for: it passes the other two and corrupts the
+     loader. The threshold sits between the two measurements in AGENTS.md 4.6
+     (5240 bytes booted and played, 2444 corrupted), because a guard that
+     rejects the configuration measured to work guards nothing. `sp_min` comes
+     from `game-memory.tsv`; with none recorded the test passes, since assuming
+     a depth would reject the base 593 presets ask for on one game's evidence.
+   - **A disagreement in the database is information when one of the votes is
+     unbuildable.** A title match is ambiguous when several dumps share a name
+     and got different addresses; the tie-break keeps the loader still. But a
+     vote below 0x8c004000 is DreamShell saying low RAM was too tight for that
+     title — for a loader a quarter of this one's size — so keeping a 56 KB
+     image at the stock base picks the one address the disagreement argues
+     against. `low_family_contested` reads it, `base_off_the_low_family` answers
+     from `ISOLDR_HIGH_ADDR` (checked like any other candidate, since Sonic
+     Adventure 2's preset is that very address and its Maple DMA list rules it
+     out). 8 of the database's 1026 rows reach this, Sonic Adventure among them.
    - `--no-relocate` runs whatever is on the console; `--loader-base 0x…` pins
      one. Both exist so a relocation can be ruled in or out as the cause of a
      title's behaviour in one run.
@@ -145,6 +184,8 @@ it does not work against a normal game.
     own log. The CLI lets you pass `-c` on its own, but `-d` and `-m`
     silently turn it on too — there is no "CDFS without console"
     mode.
+  - `--vga auto|always|never` — make the title believe a VGA box is plugged
+    in. `auto` (the default) asks the console; see "Forcing VGA" below.
 - `cargo run -- upload --host <DC_IP> <file>` — upload only. Useful for
   inspecting a payload without booting it. Takes a disc image too.
 - `cargo run -- identify <disc image>` — what the image is, which loader base
@@ -169,7 +210,8 @@ There is no `make`, no `xtask`, no installer. Everything happens through
 
 Unit tests live in `src/presets.rs`, `src/loaders.rs`, `src/dispatch.rs` and
 across `src/disc_formats/` -- the lookup rules, the chainload plan, the GAPS
-probe, and everything that turns bytes on disk into sectors. That last group is
+probe, the VGA cable check, and everything that turns bytes on disk into
+sectors. That last group is
 testable precisely because it never touches the network. Everything past
 `EXEC` still needs real hardware or an emulator. `cargo test` runs them; there
 is no `[lib]` target and no integration-test directory.
@@ -227,7 +269,34 @@ dispatcher". The longer version, module by module:
   other: records are printed from inside `MultiProgress::suspend`. If you
   create a `ProgressBar` anywhere else, it is outside that arrangement
   and will be shredded by the next log line. It also holds `LoadMonitor`,
-  which aggregates a running title's disc reads into "loading" bursts.
+  which aggregates a running title's disc reads into "loading" bursts, and
+  `DiagPanel`, the counter panel described further down.
+
+- **`src/diag.rs`** — dcload's own always-compiled counters, read off the
+  console with `SendBinQ` while a title runs and shown in a panel (`--diag`,
+  off by default). Holds the table of what to read and how to format it, the
+  symbol lookup, and the sampling state machine. Unit-tested for the parts that
+  are pure (grouping, deltas, the table having no duplicates).
+
+- **`src/stackwatch.rs`** — how close the running title's stack is coming to
+  the loader, read off the console while it plays. One `SendBinQ` for eight
+  bytes every ten seconds (`g_gd_sp_min` / `g_gd_sp_in_image`, which dcload
+  latches for free on every GD syscall), claimed through `io::PacketSink` like
+  the counter panel's samples and posted only from the top of the syscall loop.
+  ON IN EVERY SESSION, unlike `--diag`: it is the only thing that can see the
+  one failure the placement tests are blind to, and the value is latched on the
+  title's FIRST GD syscall — so the verdict arrives seconds into a boot, long
+  before the freeze it predicts. What it measures is written to
+  `game-memory.tsv`, so a session at a base that works teaches as much as one
+  at a base that does not.
+
+- **`src/memmap.rs`** — what earlier sessions measured about a title, keyed on
+  the same boot-sector MD5 the presets use: a 256-bit bitmap of the 64 KB blocks
+  its disc reads landed in (merged by OR) and `sp_min`, the lowest stack pointer
+  it was seen entering a GD syscall with (merged by MINIMUM). Written by a
+  ticker thread rather than by the read path, because a session normally ends in
+  a way no handler is told about and no disc read should pay for a file write.
+  Meant to be committed and shared: a row is only ever incomplete, never wrong.
 
 - **`src/presets.rs`** — the per-game settings table carried over from
   DreamShell's isoldr presets, and the disc identity (IP.BIN fields plus the
@@ -291,11 +360,23 @@ dispatcher". The longer version, module by module:
   little-endian — the DC expects network byte order.
 
 - **`src/io.rs`** — networking. `ExternalDcIo` is a small trait
-  (`poll`, `handle_data`, `send_command`) with a single implementation
-  `DcIoUDP` that wraps a non-blocking `UdpSocket` registered with the
-  `polling` crate. There is no other transport, no loopback, no
+  (`poll`, `handle_data`, `send_command`, `set_sink`) with a single
+  implementation `DcIoUDP` that wraps a non-blocking `UdpSocket` registered
+  with the `polling` crate. There is no other transport, no loopback, no
   test-only implementation — anything you want to test has to go
   through a real UDP socket or a DC.
+
+  **`handle_data` drains the socket, one wakeup at a time.** The poller is
+  one-shot, so it used to take exactly one datagram per wakeup however many
+  were queued — under a runtime CDFS load that is a backlog that only grows,
+  and whatever a caller is waiting for surfaces some number of wakeups after it
+  actually arrived. Tested, and the test fails when the drain is removed.
+
+  **`set_sink` installs a `PacketSink`**, which claims packets before any caller
+  sees them. It exists because a reply to a command issued out of band arrives
+  wherever the host happens to be polling — inside `send_data`, most of the
+  time, which discards what it did not ask for. A sink must claim only what it
+  asked for; eating somebody else's reply is a transfer that never completes.
 
 - **`src/fs.rs`** — host-side filesystem. The full set of KOS-style
   FS commands is implemented in `handle_fs_syscall`, with one function
@@ -415,6 +496,93 @@ dispatcher". The longer version, module by module:
   `NotImplemented` is a small `Display` + `Error` type used when an
   unknown client command tag arrives.
 
+## Forcing VGA
+
+`--vga` makes a title believe a VGA box is plugged in. Two changes, both found
+in the image by content -- no per-game table -- and both applied before the
+title runs:
+
+- **The cable check in the title's own code** (`dispatch::vga_cable_patches`).
+  A Katana title asks the hardware which cable it is on exactly once, by
+  reading the SH4's port data register `0xff800030` and taking bits 8 and 9
+  (0 = VGA, 2 = RGB, 3 = composite). Everything downstream follows from those
+  two bits, so forcing that read to 0 IS the patch, and it is one halfword.
+- **The IP.BIN peripheral field** (`dispatch::declare_vga_in_ip_bin`), bit 4 of
+  the hex string at +0x38. A different reader, which is why it is not
+  redundant: IP.BIN's own bootstrap consults it and `--boot-ipbin` runs that
+  bootstrap, and the header stays in RAM at 0x8c008000 where the title can read
+  it back -- this host puts it there itself, exactly as isoldr does, precisely
+  because nothing else on our path ever populates that region.
+
+Measured on four PAL dumps. Each has EXACTLY ONE aligned occurrence of
+0xff800030, exactly one instruction that loads it, and the same routine around
+it, byte for byte:
+
+| title | cable check | IP.BIN peripherals |
+| --- | --- | --- |
+| Sonic Adventure | 0x8c10d866 | `0601A10` -- declares VGA |
+| Sonic Adventure 2 | 0x8c137276 | `0799A10` -- declares VGA |
+| Crazy Taxi | 0x8c162dee | `0799A10` -- declares VGA |
+| Snow Surfers | 0x8c0e9026 | `0799A00` -- **does not** |
+
+```text
+  d3 03   mov.l  @(3,PC),r3   ; 0xff800030
+  92 03   mov.w  @(3,PC),r2   ; 0x0300
+  64 31   mov.w  @r3,r4       <- becomes `mov #0,r4` (e4 00)
+  60 4d   extu.w r4,r0
+  00 0b   rts
+  20 29   and    r2,r0
+```
+
+**The read is what is patched, not the extraction after it.** The caller shifts
+and masks the result in its own way -- `shlr8` then `and #3` in all four, and a
+title is just as free to test the raw 0x300 -- so forcing the value that comes
+off the port answers every one of those shapes while having to recognise none
+of them. The scan is anchored the same way the GAPS probe is: the literal
+alone proves nothing, an `mov.l @(disp,PC),Rn` must load it, and the read must
+use the register it went into.
+
+**`auto` asks the console, and that is the whole point of the option.** Nothing
+on this side of the wire can see which cable is plugged in, so dcload reads it
+off PDTRA and reports it in its VERS reply, after the base
+(`loaders::parse_version_payload`, `Cable`). The host then patches only when
+there really is a VGA box on the other end — forcing VGA on a television is a
+black screen. `--vga always` covers the case the console cannot report: an
+adapter that does not ground the detect pins (some VGA cables, some HDMI
+boxes), where the title is told composite while the display wants 480p.
+`--vga never` disables it.
+
+**Unknown is not "not VGA", and it is not "VGA" either.** A loader too old to
+report the cable, or a VERS that does not come back, leaves the title alone and
+says so in the log. That asymmetry is deliberate: the code for VGA is 0, so
+every loose decode — trailing zero padding, a short reply, a missing field —
+lands on the one answer that would patch a title on a television. There is a
+test for the padding case.
+
+**The question is asked when the decision is made, not once at start-up.** A
+chainload replaces the loader, so the one that answered first is not
+necessarily the one that will run the title: the loader that came off the CD
+may predate the field while the one just uploaded reports it
+(`dispatch::query_cable`). One round trip on an idle console.
+
+`identify` prints what `--vga` can do to an image, with no console attached:
+
+```
+vga      : IP.BIN does NOT declare VGA box support; 1 cable check(s) --vga would force to VGA
+```
+
+**What it cannot do** is give a title a 480p path it was never built with: one
+that declares no VGA support may set an interlaced mode by hand, and that is a
+per-title patch no scan finds. When the scan comes up empty `--vga` says so
+loudly rather than leaving it to be discovered on the console -- afterwards, a
+title that ignored the patch and a title that was never patched look exactly
+the same.
+
+Like the GAPS guard, the patch **survives a reload**: it changes a word in the
+title's own image, and a title is free to read that image back off its disc, so
+`receive_syscalls` re-applies any patched word a disc read covers before the
+title can run the bytes just delivered.
+
 ## Protocol modes
 
 `CHUNK_SIZE` in `src/main.rs` is a single `usize` that toggles two things
@@ -473,6 +641,135 @@ plus `-vv` is the deepest verbosity, and `dispatch::send_data` /
   whole 1440-byte payload of a `PartBinary`.
 - Transfers under 10 KB get no bar at all (`ui::BAR_MIN_BYTES`).
 
+**The counter panel (`--diag`)** is a debug aid and off by default. What is
+worth knowing before touching it:
+
+- **Where it draws is not a style choice.** The requirement was that selecting
+  the log copies the log and not the panel, and a terminal selection returns
+  whatever is in the cell grid: a full-height column down the right-hand side
+  shares every physical line with a log line and goes into the scrollback with
+  it. No escape sequence makes a region unselectable, and left/right margins
+  (DECSLRM) make it worse — terminals that support them save only full-width
+  lines to scrollback. So the panel is a right-aligned block inside indicatif's
+  live region, which `suspend` erases before every log record: it never enters
+  the scrollback at all. Measured: 54 log records interleaved with panel
+  repaints, none of them carrying a box glyph.
+- **The panel is a grid, not a slot.** One column of at most 24 rows showed a
+  third of the set beside 140 empty columns. `compose` fills every column the
+  terminal's width allows — never more than there is content for, and never
+  more than fits, since a box wider than the screen wraps every line and shreds
+  the display it is drawn into. The height is then the tallest column's, not
+  the cap. One column reduces to exactly the old geometry, and there is a test
+  for each.
+- **It pages, it does not scroll, and that is forced.** In a column-major grid
+  a cell's column is `(slot - offset) / body`: move the offset by less than a
+  whole column and every entry changes column, move it by exactly one and every
+  entry moves one column left. **Reading down a column and nothing jumping
+  between columns cannot both hold while a flat list slides through a grid** —
+  the first arrangement was column-major with the keys stepping one entry, which
+  walks every counter across the panel and reads as numbers duplicating
+  themselves from one column into the next; the second was row-major with the
+  keys stepping a whole grid row, which pins each counter to a column at the
+  price of reading every group across. The way out is that the content is never
+  slid, it is replaced: a page is a screenful, every movement key moves a page,
+  and the fill inside a page is column-major again. `page 1/1` is not printed —
+  one page is not a control — which is the state the panel is normally in while
+  a title runs.
+- **Columns are filled like a newspaper, and every one of them is titled.** A
+  section flows down the current column and starts a fresh one when what is left
+  will not hold it, *unless* a whole column would not hold it either, in which
+  case moving it gains nothing — with a widow rule (`MIN_KEEP = 3`) so a heading
+  never lands alone at the foot of a column. A section that does spill is
+  titled again at the top of each column it continues into (`Slot::Cont`,
+  dimmed with an ellipsis). Both together make "a column starts with a heading
+  or a continuation" **structural**, and there is a test for it: with `show all`
+  the GD group is 79 of the 135 rows and fills three columns on its own, so a
+  page of bare `CMD_…` names is otherwise exactly what a reader gets. The whole
+  set is two pages of four columns on a 130-column terminal, which is also a
+  test.
+- **The image is verified before a single number is decoded** (`verify_image`).
+  Matching the loader's base is not enough: two builds of the same base put the
+  same counter at different addresses, and the values then come back believable
+  and wrong. 256 bytes of the first loadable segment are compared against the
+  very ELF this host uploaded — including one `loaders::relocate` moved in
+  memory, for which there is no file on disk to aim `scripts/dc-counters.py` at.
+- **It never blocks the syscall loop.** One `SendBinQ` is posted from the top of
+  an iteration; nothing waits for the answer.
+- **The answer is claimed in the IO layer, and there is nowhere else it could
+  be.** `diag::SampleSink` implements `io::PacketSink` and is registered on the
+  connection, so `DcIoUDP::handle_data` — the one funnel every poll site shares
+  — takes our replies out before anybody sees them. Filtering in the syscall
+  loop instead, which is what this did first, claims **nothing at all**:
+  dcload answers a `SendBinQ` only from inside `bb->loop()`, and it is only
+  inside `bb->loop()` while it waits for a host transfer to land
+  (`cdfs_syscalls.c`: *"bb->loop() is reached from the READ PATH ONLY"*), so the
+  reply arrives, every time, in the middle of `send_data`'s own polling — which
+  discards what it did not ask for. Measured on a title streaming CD-DA: 43
+  samples posted, 43 timed out, the panel permanently empty.
+- **What the sink claims is decided by the ADDRESS, for both kinds of packet,
+  and getting that wrong breaks the disc read the title is blocked on.** The
+  `SendBinary` half was always right — eating somebody else's is a transfer that
+  never completes. The `DoneBinary` half was a heuristic ("some of our data has
+  landed"), which is true for essentially the whole life of a sample, and it
+  failed in **both** directions at once. Measured 2026-08-30 on Sonic Adventure:
+  the game stopped for about ten seconds every two seconds, once per sample.
+  A sector transfer's `DoneBinary` was swallowed, so `request_donebin` timed out
+  (`No DoneBinary response received`), the host abandoned the read and the
+  loader sat out its own 6 s timeout before re-requesting; and our terminator
+  leaked the other way once a sample had completed on its last `SendBinary`
+  (`pending` is `None` by then, so the old rule refused it) — and `cmd_sendbinq`
+  used to close with `address = 0, size = 0`, which is byte for byte what a
+  **complete** LoadBinary window answers. The host read that as "nothing missing
+  anywhere: done" and credited a sector read that still had holes in it.
+  dcload now names the range it served in that terminator (loader's AGENTS.md
+  §8), so the rule here is one line: a packet is ours if its address is inside
+  the range we asked about. The two cannot collide — a transfer's `DoneBinary`
+  names a game buffer or nothing, ours names loader RAM, and the footprint rule
+  is precisely that a title's buffers are not where the loader is. **The
+  terminator is claimed whether or not a sample is still open**, because that is
+  the case that leaked. This needs a loader built from the current tree
+  (`loaders-diag/`); an older one closes with 0/0 and the leak comes back, and
+  the image check cannot see it — it compares each loader against its own ELF.
+- **A title that has stopped reading answers nothing**, because dcload is then
+  not looking at the wire at all. That is the normal state of a freeze, which is
+  also when the counters would say the most; the panel says so after three
+  missed samples rather than showing an empty box. **There is no good answer to
+  this yet.** The DC-side flag that exists for it,
+  `GD_SERVICE_EVERY_SYSCALL=1`, kills Sonic Adventure — measured, isolated, and
+  written up at the flag in `cdfs_syscalls.c` and in the loader's AGENTS.md
+  §4.5. So the counters are readable while a title still reads its disc, and go
+  quiet exactly when it stops; treat the last sample before the silence as the
+  measurement.
+- **The read is asked for ONE PACKET AT A TIME, and every ask is
+  retransmitted.** Measured on a console running Snow Surfers: a 1456-byte
+  `SendBinQ` — three frames back to back, emitted from inside a nested
+  `bb->loop()` — was answered **zero times out of three**, while
+  `verify_image`'s 256-byte read of the same loader, one `SendBinary` plus one
+  `DoneBinary`, succeeded moments earlier and the title's own `LoadBinary`
+  echoes kept coming from that same loop. So the in-game read is now the shape
+  of the read that is known to work, and it is re-sent every 300 ms until it
+  lands: one datagram with no acknowledgement, on a link where the RX ring
+  overflowing is documented as normal back-pressure, was the one request in
+  this host that never retried.
+- **On the first miss the probe runs a CONTROL read** of the exact range
+  `verify_image` already read back, and says which side is at fault: answered
+  means the counter range is the problem, unanswered means the console does not
+  answer `SendBinQ` while that title runs, whatever the address. It runs once.
+- **A missed sample is two different faults and the panel cannot tell them
+  apart**, so `-vv` says which: `diag: sample timed out -- N/M bytes landed`.
+  Zero bytes means dcload never answered (it looks at the wire only from inside
+  `bb->loop()`); some bytes means the run was spliced, which is a transport
+  problem. `SAMPLE_TIMEOUT` is 5 s and generous on purpose — it bounds how long
+  a reply may sit behind other traffic before this host reaches it, not the
+  console's turnaround, and at 1.5 s it abandoned replies that then arrived.
+- **The interval is the whole cost.** 2 s by default, `+`/`-` in the panel,
+  floored at 250 ms. Measured against the same session with no panel: nothing
+  measurable at 2 s, 0.5 % of one core at the floor.
+- Raw mode belongs to `console::Term::read_key`, which raises SIGINT itself
+  rather than handing us `Key::CtrlC` — so the Ctrl-C report still happens. Do
+  not swap in `read_key_raw`. `ui::restore_terminal` covers the endings that do
+  not go through it.
+
 **In-game loading has its own bar** (`ui::LoadMonitor`), and its shape is
 dictated by the protocol:
 
@@ -505,6 +802,21 @@ code. There is no way to run the host side against a simulated DC
 without writing one.
 
 ## Gotchas
+
+- **A region the relocator classifies by a fixed page goes stale when a buffer
+  grows, and it fails CLOSED.** `relocate` sorts every relocation into one of
+  the loader's four regions by the value of the symbol it names, and refuses
+  what it cannot place rather than guessing -- which is right. But `.hiram` was
+  classified by one 4 KB page while the layout reserves `HIRAM_RESERVED`
+  (12 KB), and CD-DA's 7 KB staging buffer took the section to ~10 KB. From
+  that commit on, `__hiram_end` (0x2790 past the start, named by `crt0`'s
+  zeroing loop) belonged to no region and **the relocatable loader would not
+  relocate to any base at all**. Found by
+  `relocating_reproduces_every_native_link_byte_for_byte` -- run it against a
+  freshly built set, `DCLOAD_LOADER_DIR=…/target-src/dcload/loaders cargo test
+  relocating_reproduces`, because the set in `loaders/` is whatever was
+  deployed and can be older than the tree. Nothing on a console would have
+  found it: the failure is a message before the upload.
 
 - **An LBA inside a disc's filesystem is NOT an LBA `read_sector` takes.**
   `DiscFormat::fs_lba` converts, and the difference is 150 on a `.gdi` and a

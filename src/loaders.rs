@@ -93,9 +93,11 @@ pub fn live_footprint(base: u32) -> Vec<(u32, u32)> {
         vec![
             // Image, BSS, and the stack descending from the BIOS VBR.
             (l.image, l.stack),
-            // Maple DMA buffer (2 KB) and the .hiram packet buffers (3 KB), a
-            // page apart in high RAM, as one range.
-            (l.maple, l.hiram + LAYOUT_PAGE),
+            // Maple DMA buffer (2 KB) and the .hiram buffers, in high RAM,
+            // as one range. .hiram is 12 KB reserved (packet buffers plus the
+            // CDDA staging buffer) -- see the layout table in
+            // target-src/dcload/Makefile, which this mirrors.
+            (l.maple, l.hiram + HIRAM_RESERVED),
         ]
     }
 }
@@ -127,12 +129,71 @@ pub struct Layout {
     pub maple: u32,
 }
 
-/// The width the layout gives each of the two buffers, in both families.
+/// The width the layout gives the Maple DMA buffer, in both families.
 ///
-/// They are 3 KB and 2 KB, so a page is loose enough to contain `__hiram_end`
+/// It is 2 KB, so a page is loose enough to contain `_maple_dma_buffer_end`
 /// -- one past the last byte, and named by a relocation like any other symbol
 /// -- and tight enough never to reach the neighbouring region.
+///
+/// NOT `.hiram`, which is `HIRAM_RESERVED` wide and was measured at 4 KB only
+/// before CD-DA put a 7 KB staging buffer in it. Classifying `.hiram` by a
+/// page meant `__hiram_end` (0x2790 past the start of the section) belonged to
+/// no region, and `relocate` refuses what it cannot classify rather than
+/// guessing -- so the relocatable loader stopped relocating AT ALL, at every
+/// base, the moment that buffer was added. The unit test caught it; nothing on
+/// a console would have, because the failure is a message before the upload.
 pub const LAYOUT_PAGE: u32 = 0x1000;
+
+/// How much high RAM `.hiram` reserves, whatever the build put in it.
+///
+/// RESERVED UNCONDITIONALLY, not measured from an ELF. The loader has build
+/// flags that change what lands there -- `WITH_CDDA` alone is 7 KB of audio
+/// staging -- and this host cannot see which flags a running loader was built
+/// with. Reserving the maximum makes the table right for every build; sizing
+/// it to one build makes it silently wrong for the others, and being wrong
+/// here means placing the next loader on top of the running one's buffers,
+/// which reports nothing at either end (AGENTS.md 4.11 item 4).
+pub const HIRAM_RESERVED: u32 = 0x3000;
+
+/// dcload's own worst-case stack excursion BELOW the SP a GD syscall is
+/// entered with.
+///
+/// The emulated GD driver runs on the GAME'S stack, on purpose and by design:
+/// `cdfs_redir.s` parks the inactive coroutine's frame in `saved_regs[]`
+/// instead of giving the loader a second stack, precisely so the network path
+/// keeps running where it is known to fit. So every byte dcload's read path
+/// uses is a byte taken off the title's own stack, below the deepest point the
+/// title ever reaches on its own.
+///
+/// 1352 bytes, measured over `dcload-0x8c004000.elf` by summing the frame of
+/// every function reachable from `gdGdcReqCmd` along the deepest chain
+/// (prologue `add #-N,r15` plus each register pushed with `@-r15`). Rounded up
+/// to 2 KB, because the number is a property of one build and this constant has
+/// to hold for the next one.
+pub const GD_STACK_WORST_CASE: u32 = 2048;
+
+/// How much room a LOW base must leave between the loader's `_end` and the
+/// lowest SP the title has been seen entering a GD syscall with.
+///
+/// THIS IS THE THIRD PLACEMENT TEST, and the only one that can see the failure
+/// it is named for. The other two -- the constant scan and the learned map --
+/// look for an address COLLISION: RAM the title names, or RAM its disc reads
+/// have landed in. A stack is neither. It is not named by any constant, no read
+/// ever lands in it, and it arrives from above, growing down into whatever the
+/// loader left below `0x8c00f400`.
+///
+/// The two measurements that fix the value, both on Sonic Adventure at the
+/// stock base, both from AGENTS.md 4.6:
+///
+///   margin 5240 bytes (`_end` 0x8c00a558) -- booted and played, 1624 reads
+///   margin 2444 bytes (`_end` 0x8c00b044) -- the title corrupted the loader
+///
+/// CD-DA is what moved it: 2 KB of code in an image whose remaining headroom
+/// was 5 KB. 4096 sits between the two, and the reason it is not larger is
+/// AGENTS.md 14.9 -- a guard that rejects the one configuration measured to
+/// work guards nothing. `GD_STACK_WORST_CASE` is most of what it has to cover;
+/// the rest is the title's own frames below the point this can see.
+pub const LOW_BASE_MIN_MARGIN: u32 = 4096;
 
 pub fn layout(base: u32) -> Layout {
     if is_high(base) {
@@ -140,7 +201,7 @@ pub fn layout(base: u32) -> Layout {
             image: base,
             stack: base + 0xb000,
             hiram: base + 0xc000,
-            maple: base + 0xd000,
+            maple: base + 0xf000,
         }
     } else {
         Layout {
@@ -322,7 +383,7 @@ pub fn search_free_base_above(
 /// How wide a loader's own span is, from its base. Mirrors the HIGH layout in
 /// target-src/dcload/Makefile: stack at +0xb000, .hiram at +0xc000, Maple DMA
 /// at +0xd000.
-pub const LOADER_SPAN: u32 = 0xe000;
+pub const LOADER_SPAN: u32 = 0x10000;
 
 /// How big the loader image is allowed to be for the CHEAP feasibility test
 /// below. Measured `_end - base = 0x65f8` on the build this was written
@@ -441,7 +502,7 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
     let region_of_section = |a: u32| -> Option<Region> {
         if a >= src.image && a < src.stack {
             Some(Region::Image)
-        } else if a >= src.hiram && a < src.hiram + LAYOUT_PAGE {
+        } else if a >= src.hiram && a < src.hiram + HIRAM_RESERVED {
             Some(Region::Hiram)
         } else if a >= src.maple && a < src.maple + LAYOUT_PAGE {
             Some(Region::Maple)
@@ -732,12 +793,62 @@ pub fn nearest_clear_base(wanted: u32, candidates: &[u32]) -> Option<u32> {
         .min_by_key(|&b| b.abs_diff(wanted))
 }
 
-/// The four bytes dcload appends to its VERS payload, after the NUL that ends
-/// the version string. Returns the printable part and the base, when present.
+/// What the console is plugged into, as dcload read it off PDTRA -- the same
+/// two bits the BootROM and every Katana title read, in the same numbering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cable {
+    Vga,
+    Rgb,
+    Composite,
+}
+
+impl Cable {
+    /// 1 is not a cable any Dreamcast reports, so it is "no answer" rather
+    /// than a guess. Which matters in one direction only: 0 means VGA, so
+    /// anything decoded loosely ends up claiming a VGA box that is not there.
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Vga),
+            2 => Some(Self::Rgb),
+            3 => Some(Self::Composite),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vga => "VGA box",
+            Self::Rgb => "RGB / SCART",
+            Self::Composite => "composite or S-video",
+        }
+    }
+}
+
+/// A VERS reply: the printable string, and the fields dcload appends after the
+/// NUL that ends it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VersionReply {
+    pub text: String,
+    /// Where this loader was linked. `None` on any build from before it was
+    /// reported, which is not an error -- the caller then has no basis to move
+    /// anything and leaves the loader where it is.
+    pub base: Option<u32>,
+    /// Which video cable the console is on. `None` likewise on an older build,
+    /// and the caller must treat that as "unknown", never as "not VGA".
+    pub cable: Option<Cable>,
+}
+
+/// The 4-byte fields dcload appends to its VERS payload, in order: the base it
+/// was linked at, then the video cable it measured.
 ///
-/// Absent on any loader built before this existed, which is not an error: the
-/// caller then has no basis to move anything and leaves the loader alone.
-pub fn parse_version_payload(data: &[u8], size: usize) -> (String, Option<u32>) {
+/// READ FORWARD FROM THE STRING'S NUL, NOT BACKWARDS FROM THE END. Taking the
+/// last four bytes as the base was right while there was exactly one field and
+/// silently wrong the moment a second appeared: the cable word would be read
+/// as the base, judged implausible, and the host would stop relocating
+/// anything -- with the log saying only "does not report its load address",
+/// which is also what an old loader says. The order here is the loader's, and
+/// a field that is not there is simply `None`.
+pub fn parse_version_payload(data: &[u8], size: usize) -> VersionReply {
     let size = size.min(data.len());
     let payload = &data[..size];
     let text = String::from_utf8_lossy(payload)
@@ -747,16 +858,22 @@ pub fn parse_version_payload(data: &[u8], size: usize) -> (String, Option<u32>) 
         .unwrap_or("")
         .to_string();
 
-    if size < 4 {
-        return (text, None);
-    }
-    let base = u32::from_be_bytes(payload[size - 4..size].try_into().unwrap());
-    // The string and its NUL must actually end before those four bytes,
-    // otherwise what we just read is the tail of the adapter name.
-    if payload[..size - 4].iter().any(|b| *b == 0) && plausible_base(base) {
-        (text, Some(base))
-    } else {
-        (text, None)
+    let Some(nul) = payload.iter().position(|b| *b == 0) else {
+        return VersionReply {
+            text,
+            ..Default::default()
+        };
+    };
+    let fields = &payload[nul + 1..];
+    let field = |i: usize| {
+        fields
+            .get(i * 4..i * 4 + 4)
+            .map(|w| u32::from_be_bytes(w.try_into().unwrap()))
+    };
+    VersionReply {
+        text,
+        base: field(0).filter(|b| plausible_base(*b)),
+        cable: field(1).and_then(Cable::from_code),
     }
 }
 
@@ -1043,6 +1160,36 @@ impl LoaderSet {
         Ok((moved, format!("{} relocated to 0x{base:08x}", p.display())))
     }
 
+    /// Where `_end` would fall for a loader at `base`.
+    ///
+    /// FROM THE IMAGE'S SIZE, not by relocating one and reading it back. Every
+    /// address in the image moves with the base by the same delta, so
+    /// `_end - _dcload_base` is the same number for every build of the set and
+    /// for the relocatable one -- and reading it costs one file and no
+    /// relocation, which matters because the caller asks this of candidate
+    /// bases it is about to reject.
+    ///
+    /// `_end` is the SYMBOL, never `image_extent_bytes`: `.hiram` is an
+    /// allocated NOLOAD section at 0x8cfe9000 for every LOW build, so the
+    /// highest loadable section of a loader based at 0x8c004000 is twelve
+    /// megabytes above its image. `_end` is what `dcload.x` puts at the top of
+    /// the image and what AGENTS.md 4.6 measures margins against.
+    ///
+    /// `None` when there is no image to read or it carries no symbols: the
+    /// caller must then skip the test rather than assume either answer.
+    pub fn image_end_for(&self, base: u32) -> Option<u32> {
+        let path = self
+            .available()
+            .first()
+            .map(|&b| self.path_for(b))
+            .or_else(|| self.relocatable())?;
+        let bytes = std::fs::read(path).ok()?;
+        let syms = symbols(&bytes).ok()?;
+        let end = syms.get("end")?.0;
+        let linked_at = syms.get("dcload_base")?.0;
+        base.checked_add(end.checked_sub(linked_at)?)
+    }
+
     /// Which bases are actually on disk, for a diagnostic that tells the user
     /// what to build rather than only what is missing.
     pub fn available(&self) -> Vec<u32> {
@@ -1061,6 +1208,34 @@ impl LoaderSet {
         out.sort_unstable();
         out
     }
+}
+
+/// `{name: (address, size)}` for an ELF's symbols, with the leading underscore
+/// the SH toolchain adds taken off -- so the names here read like the C ones.
+///
+/// Lives here rather than in `diag`, which was its first caller, because the
+/// answer is a property of a loader image and two other things now need it:
+/// the stack-headroom test wants `end`, and the stack watch wants
+/// `g_gd_sp_min`. One parser, one naming convention.
+pub fn symbols(bytes: &[u8]) -> Result<std::collections::HashMap<String, (u32, u32)>, String> {
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(bytes)
+        .map_err(|e| format!("cannot parse the loader ELF: {e}"))?;
+    let (symtab, strtab) = elf
+        .symbol_table()
+        .map_err(|e| format!("cannot read the loader's symbol table: {e}"))?
+        .ok_or("the loader ELF carries no symbol table (was it stripped?)")?;
+    let mut out = std::collections::HashMap::new();
+    for sym in symtab.iter() {
+        let Ok(name) = strtab.get(sym.st_name as usize) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let name = name.strip_prefix('_').unwrap_or(name);
+        out.insert(name.to_string(), (sym.st_value as u32, sym.st_size as u32));
+    }
+    Ok(out)
 }
 
 /// The highest address an ELF's loadable sections reach, ignoring the guest
@@ -1392,6 +1567,26 @@ mod tests {
     }
 
     #[test]
+    fn a_symbol_at_the_far_end_of_hiram_is_still_hiram() {
+        // `__hiram_end` is one past the last byte of a section CD-DA takes to
+        // about 10 KB, and `dcload-crt0.s` names it to zero the region. A
+        // classifier that gave `.hiram` a single 4 KB page could not place
+        // that symbol, and `relocate` refuses what it cannot classify rather
+        // than guessing -- so the relocatable image stopped relocating AT ALL,
+        // at every base, the moment that buffer was added. Nothing on a
+        // console would have found it: the failure is a message before the
+        // upload.
+        //
+        // Low to high on purpose, so `.hiram` moves by a different delta from
+        // the image and a misclassification cannot pass by coincidence.
+        let (from, to) = (0x8c00_4000u32, 0x8cef_8000u32);
+        let sym = layout(from).hiram + 0x2790; // measured, WITH_CDDA=1
+        let e = tiny_elf_named(from, sym, sym);
+        let moved = relocate(&e, to).expect("a symbol in .hiram must be classifiable");
+        assert_eq!(word_of(&moved), layout(to).hiram + 0x2790);
+    }
+
+    #[test]
     fn relocating_adds_the_delta_to_every_named_word() {
         let e = tiny_elf(0x8ce0_0000, 0x8ce0_1234);
         let moved = relocate(&e, 0x8cef_8000).unwrap();
@@ -1609,10 +1804,15 @@ mod tests {
     fn a_title_large_enough_to_reach_the_packet_buffers_is_a_collision() {
         // 0x0c010000 + 15.9 MB runs into the buffers at 0x8cfe8000 that the
         // upload is arriving in. Written as P0, caught against a P1 range.
+        //
+        // The range's TOP is the reservation, not what one build happens to
+        // put there: .hiram holds the packet buffers and, with WITH_CDDA, the
+        // audio staging buffer, and this host cannot see which flags the
+        // running loader was built with. See HIRAM_RESERVED.
         let huge = (0x0c01_0000u32, 0x0cff_0000);
         assert_eq!(
             overlapping_range(DEFAULT_BASE, huge),
-            Some((0x8cfe_8000, 0x8cfe_a000))
+            Some((0x8cfe_8000, 0x8cfe_9000 + HIRAM_RESERVED))
         );
     }
 
@@ -1828,13 +2028,44 @@ mod tests {
 
     #[test]
     fn version_payload_carries_the_base() {
+        // The shape of the loader that reported a base and nothing else. It
+        // still has to parse, or every such build stops being relocatable the
+        // day a second field is added.
         let mut payload = b"dcload-ip 2.0.4 using RTL8139\0".to_vec();
         payload.extend_from_slice(&0x8cfe_8000u32.to_be_bytes());
         let size = payload.len();
         payload.resize(1440, 0);
-        let (text, base) = parse_version_payload(&payload, size);
-        assert_eq!(text, "dcload-ip 2.0.4 using RTL8139");
-        assert_eq!(base, Some(0x8cfe_8000));
+        let got = parse_version_payload(&payload, size);
+        assert_eq!(got.text, "dcload-ip 2.0.4 using RTL8139");
+        assert_eq!(got.base, Some(0x8cfe_8000));
+        assert_eq!(got.cable, None);
+    }
+
+    #[test]
+    fn version_payload_carries_the_cable_after_the_base() {
+        for (code, want) in [(0u32, Cable::Vga), (2, Cable::Rgb), (3, Cable::Composite)] {
+            let mut payload = b"dcload-ip 2.0.4 using RTL8139\0".to_vec();
+            payload.extend_from_slice(&0x8c00_4000u32.to_be_bytes());
+            payload.extend_from_slice(&code.to_be_bytes());
+            let size = payload.len();
+            payload.resize(1440, 0);
+            let got = parse_version_payload(&payload, size);
+            assert_eq!(got.base, Some(0x8c00_4000), "code {code}");
+            assert_eq!(got.cable, Some(want), "code {code}");
+        }
+    }
+
+    #[test]
+    fn zero_padding_is_not_read_as_a_vga_box() {
+        // `size` is what the loader said it sent; the buffer behind it is 1440
+        // bytes of whatever. Reading past `size` would decode a 0 -- which is
+        // the code for VGA, i.e. the one wrong answer that would make the host
+        // patch a title on a console plugged into a television.
+        let mut payload = b"dcload-ip 2.0.4 using RTL8139\0".to_vec();
+        payload.extend_from_slice(&0x8c00_4000u32.to_be_bytes());
+        let size = payload.len();
+        payload.resize(1440, 0);
+        assert_eq!(parse_version_payload(&payload, size).cable, None);
     }
 
     #[test]
@@ -1842,8 +2073,9 @@ mod tests {
         // What an older loader sends: string, NUL, nothing else.
         let payload = b"dcload-ip 2.0.3 using RTL8139\0".to_vec();
         let size = payload.len();
-        let (text, base) = parse_version_payload(&payload, size);
-        assert_eq!(text, "dcload-ip 2.0.3 using RTL8139");
-        assert_eq!(base, None);
+        let got = parse_version_payload(&payload, size);
+        assert_eq!(got.text, "dcload-ip 2.0.3 using RTL8139");
+        assert_eq!(got.base, None);
+        assert_eq!(got.cable, None);
     }
 }

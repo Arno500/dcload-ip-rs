@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use crate::disc_formats::source::{Container, DirContainer, ImageSource};
-use crate::disc_formats::types::{DiscFormat, Track, check_read_len};
+use crate::disc_formats::types::{
+    DiscFormat, RAW_SECTOR_SIZE, Track, TocTrack, check_read_len,
+};
 
 pub struct Gdi {
     tracks: RefCell<Vec<Track>>,
@@ -210,6 +212,108 @@ impl DiscFormat for Gdi {
 
     fn start_sector(&self) -> u32 {
         self.data_track_edge(false)
+    }
+
+    /// Every track the `.gdi` names, audio included.
+    ///
+    /// A `.gdi` has always listed its audio tracks and nothing ever read them
+    /// (see `Track::source`). They are the whole content of a disc's music:
+    /// track type 0 is audio, 4 is data, and the lead-in the reader adds to
+    /// every data track start is added here too so the numbers are the ones
+    /// `read_sector` and `read_audio` take.
+    fn toc_tracks(&self) -> Vec<TocTrack> {
+        let mut out: Vec<TocTrack> = self
+            .tracks
+            .borrow()
+            .iter()
+            .map(|t| TocTrack {
+                number: t.track_number,
+                start_lba: t.start_lba.saturating_add(150),
+                audio: t.track_type == 0,
+            })
+            .collect();
+        out.sort_by_key(|t| t.start_lba);
+        out
+    }
+
+    /// Raw 2352-byte sectors out of an AUDIO track.
+    ///
+    /// Deliberately refuses a data track rather than handing back its sync
+    /// bytes and ECC as if they were samples: a CDDA read landing on a data
+    /// track means the title was told the wrong TOC, and silence is a much
+    /// better symptom than full-scale noise into the speakers.
+    fn read_audio(
+        &self,
+        lba: u32,
+        num_sectors: u32,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        check_read_len(num_sectors)?;
+        if num_sectors == 0 {
+            return Ok(vec![]);
+        }
+        let mut tracks = self.tracks.borrow_mut();
+        let mut buffer = vec![0_u8; (num_sectors as usize) * RAW_SECTOR_SIZE];
+
+        let mut done = 0usize;
+        while done < num_sectors as usize {
+            let req_lba = lba.saturating_add(done as u32);
+            let idx = tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.start_lba.saturating_add(150) <= req_lba)
+                .max_by_key(|(_, t)| t.start_lba)
+                .map(|(i, _)| i)
+                .ok_or_else(|| format!("No track found for CDDA LBA 0x{req_lba:08x}"))?;
+
+            if tracks[idx].track_type != 0 {
+                return Err(format!(
+                    "CDDA read at LBA 0x{req_lba:08x} lands on data track {} -- \
+                     the title was given a table of contents it cannot have come from",
+                    tracks[idx].track_number
+                )
+                .into());
+            }
+            if tracks[idx].sector_size as usize != RAW_SECTOR_SIZE {
+                return Err(format!(
+                    "audio track {} has {}-byte sectors, not {RAW_SECTOR_SIZE}",
+                    tracks[idx].track_number, tracks[idx].sector_size
+                )
+                .into());
+            }
+            if tracks[idx].source.is_none() {
+                let opened = self.container.open(&tracks[idx].track).map_err(|e| {
+                    format!(
+                        "cannot open audio track '{}' in {}: {e}",
+                        tracks[idx].track,
+                        self.container.describe()
+                    )
+                })?;
+                tracks[idx].source = Some(opened);
+            }
+
+            let track_start = tracks[idx].start_lba.saturating_add(150);
+            let next_start = tracks
+                .iter()
+                .filter(|t| t.start_lba.saturating_add(150) > track_start)
+                .map(|t| t.start_lba.saturating_add(150))
+                .min();
+            let left = num_sectors as usize - done;
+            let run = match next_start {
+                Some(n) => left.min((n - req_lba) as usize),
+                None => left,
+            };
+
+            let track = &tracks[idx];
+            let at = (track.offset as u64)
+                + ((req_lba - track_start) as u64) * (RAW_SECTOR_SIZE as u64);
+            let out = &mut buffer[done * RAW_SECTOR_SIZE..(done + run) * RAW_SECTOR_SIZE];
+            // One read for the whole run: an audio track is raw all the way
+            // through, so unlike a data track there is nothing to skip
+            // between sectors.
+            track.source.as_ref().unwrap().read_at(at, out)?;
+            done += run;
+        }
+        Ok(buffer)
     }
 
     /// The start of the high-density area -- see `high_density_start()` for why

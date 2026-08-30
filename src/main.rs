@@ -10,6 +10,7 @@ extern crate log;
 
 mod cmds;
 mod cd;
+mod diag;
 mod fs;
 mod disc_formats;
 mod dispatch;
@@ -17,6 +18,7 @@ mod io;
 mod loaders;
 mod memmap;
 mod presets;
+mod stackwatch;
 mod types;
 mod ui;
 
@@ -48,6 +50,19 @@ struct Args {
     /// Host to connect to
     #[arg(short = 'H', long, default_value = "", value_hint = clap::ValueHint::Hostname)]
     host: String,
+
+    /// Keep asking for the loader's version until the console answers, instead
+    /// of giving up after five tries.
+    ///
+    /// A START-UP option, and only that: it covers the first VERS exchange --
+    /// the one that has to succeed before anything can be uploaded -- so a
+    /// session can be launched at a console that is still booting, or not yet
+    /// switched on. Once a loader has answered it has no further effect:
+    /// every command after that keeps its five tries, because a console that
+    /// goes silent mid-session is a failure worth reporting rather than
+    /// something to wait out. Ctrl-C ends the wait.
+    #[arg(short = 'i', long)]
+    infinite: bool,
 
     /// Address to execute code at
     #[arg(short, long, default_value_t = 0x0c010000, default_value = "0x0c010000", value_parser = maybe_hex::<u32>)]
@@ -99,6 +114,39 @@ struct Args {
     #[arg(long)]
     no_gaps_guard: bool,
 
+    /// Make the title believe a VGA box is plugged in.
+    ///
+    /// Two things, both found in the image and both applied before it runs:
+    /// the cable check in the title's own code is forced to read "VGA"
+    /// (`dispatch::vga_cable_patches`), and the IP.BIN header the loader puts
+    /// in RAM is made to declare VGA box support. That is the whole of what a
+    /// VGA patch is for a Katana title -- what it cannot do is give a title a
+    /// 480p path it was never built with.
+    ///
+    /// `auto` (the default) ASKS THE CONSOLE. dcload reads the cable off
+    /// PDTRA and reports it in its VERS reply, so the host patches only when
+    /// there really is a VGA box on the other end -- forcing VGA on a
+    /// television is a black screen, and nothing on this side of the wire can
+    /// see which is plugged in. A loader too old to report it counts as
+    /// unknown, and unknown means "leave the title alone".
+    ///
+    /// `always` is for the case the console cannot report: an adapter that
+    /// does not ground the detect pins (some VGA cables, some HDMI boxes), so
+    /// the title is told composite while the display wants 480p.
+    #[arg(long, value_enum, default_value_t = VgaArg::Auto, value_name = "auto|always|never")]
+    vga: VgaArg,
+
+    /// Refuse the title's CD audio reads, so the game runs without music.
+    ///
+    /// The engine is on the console (target-src/dcload/cdda.h) and starts by
+    /// itself when a title asks to play a track, which it only does when the
+    /// table of contents says the disc has audio. This is the A/B switch: a
+    /// refused read is answered -1, the loader stops that stream, and the
+    /// title keeps its data path -- so "does the music path explain this
+    /// behaviour" costs one run and changes nothing else.
+    #[arg(long)]
+    no_cdda: bool,
+
     /// Place a "phone home" probe at ADDR that reports through dcload's own
     /// syscall trampoline: `--probe 0x8c110bec=37` makes the console log
     /// `Write(1, .., 37)` the moment that address is executed. ID is 1..127
@@ -149,8 +197,45 @@ struct Args {
     #[arg(long)]
     boot_ipbin: bool,
 
+    /// Watch dcload's own counters in a panel at the bottom of the screen.
+    ///
+    /// A DEBUG AID, off by default. The loader keeps a set of always-compiled
+    /// counters -- the RX ring's polls and misses, which GD syscalls the title
+    /// is making, the CD-DA fetches, the upload accounting -- and this reads
+    /// them straight off the console with SendBinQ while the game runs,
+    /// highlighting whatever moved since the previous sample. Symbols come from
+    /// the very loader image this host uploaded, and the image on the console is
+    /// compared against it before a single number is decoded: a mismatch is
+    /// refused rather than shown, because counter values from the wrong build
+    /// are believable and wrong.
+    ///
+    /// The panel pages with the arrow keys and PgUp/PgDn -- it pages rather
+    /// than scrolls so that a counter never moves between columns; `a` shows
+    /// the counters still at zero, `+`/`-` change the sampling rate and `d`
+    /// folds it away. It never enters the terminal's scrollback, so selecting
+    /// the log above it copies the log alone.
+    #[arg(long)]
+    diag: bool,
+
+    /// How often --diag re-reads the counters, in seconds.
+    ///
+    /// Every sample is a UDP round trip that dcload answers from inside the same
+    /// loop that serves the title's disc reads, so this is deliberately slow.
+    /// Adjustable live from the panel with `+` and `-`.
+    #[arg(long, default_value_t = 2.0, value_name = "SECONDS")]
+    diag_interval: f64,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+/// When to force a title to VGA. `Auto` asks the console -- see the flag.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VgaArg {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -287,6 +372,7 @@ fn pick_clear_base(
     address: u32,
     wanted: u32,
     seen: Option<&memmap::MemoryMap>,
+    sp_min: Option<u32>,
 ) -> Option<u32> {
     // WHAT THE TITLE HAS BEEN SEEN USING BEATS WHAT IT MENTIONS.
     //
@@ -297,7 +383,7 @@ fn pick_clear_base(
     // then without, then not at all -- a rich map must narrow the choice, never
     // empty it.
     for margin in [0x4_0000u32, 0] {
-        let strict = |b: u32| base_is_clear(boot, address, b, seen, margin);
+        let strict = |b: u32| base_is_clear(loaders, boot, address, b, seen, sp_min, margin);
         if let Some(found) = choose(loaders, wanted, &strict) {
             if margin == 0 {
                 warn!(
@@ -316,24 +402,155 @@ fn pick_clear_base(
             m.blocks_marked()
         );
     }
-    let is_clear = |b: u32| dispatch::literals_in_loader_footprint(boot, address, b).is_empty();
+    // The constants alone -- but never without the stack test, which is not a
+    // heuristic about where a title might allocate. It is a measurement of
+    // where its stack has already been, and a base that fails it is one this
+    // loader is known not to fit under.
+    let is_clear = |b: u32| {
+        dispatch::literals_in_loader_footprint(boot, address, b).is_empty()
+            && low_base_has_stack_headroom(loaders, b, sp_min)
+    };
     choose(loaders, wanted, &is_clear)
 }
 
-/// The two tests that decide whether a base is safe for a title: what the title
-/// NAMES (constants in its binary) and where its reads have LANDED (the learned
-/// map). One definition, because it is asked in three places -- of the base a
-/// preset wants, of each alternative, and of the base the loader is already at
-/// -- and an answer that differed between them would be worse than no answer.
+/// The three tests that decide whether a base is safe for a title: what the
+/// title NAMES (constants in its binary), where its reads have LANDED (the
+/// learned map), and how deep its STACK has been seen going (the learned
+/// low-water mark). One definition, because it is asked in three places -- of
+/// the base a preset wants, of each alternative, and of the base the loader is
+/// already at -- and an answer that differed between them would be worse than
+/// no answer.
+#[allow(clippy::too_many_arguments)]
 fn base_is_clear(
+    loaders: &loaders::LoaderSet,
     boot: &[u8],
     address: u32,
     base: u32,
     seen: Option<&memmap::MemoryMap>,
+    sp_min: Option<u32>,
     margin: u32,
 ) -> bool {
     dispatch::literals_in_loader_footprint(boot, address, base).is_empty()
         && !map_hits_loader(base, seen, margin)
+        && low_base_has_stack_headroom(loaders, base, sp_min)
+}
+
+/// Does a loader at `base` fit under this title's stack?
+///
+/// THE THIRD TEST, AND THE ONLY ONE THAT SEES A STACK. The other two look for
+/// an address collision -- RAM the title names, RAM its reads have landed in --
+/// and a stack is neither: it descends from 0x8c00f400 into whatever the loader
+/// left below it, is named by no constant, and no read is ever served into it.
+/// Sonic Adventure at the stock base is the measured case, and it passes both
+/// of the other tests (AGENTS.md 4.6, and `loaders::LOW_BASE_MIN_MARGIN` for
+/// the two numbers that fix the threshold).
+///
+/// Three ways to answer "yes" without measuring anything, and each is
+/// deliberate:
+///
+/// - a HIGH base is nowhere near the BIOS work area, so the title has the whole
+///   0x8c004000..0x8c00f400 hole to itself;
+/// - no `sp_min` recorded means no session has ever read one back. Assuming a
+///   depth would reject the stock base for every title on the strength of one
+///   game's measurement -- 593 presets ask for that base;
+/// - no readable loader image means `_end` is unknown, and a test that cannot
+///   be computed must not decide anything.
+fn low_base_has_stack_headroom(
+    loaders: &loaders::LoaderSet,
+    base: u32,
+    sp_min: Option<u32>,
+) -> bool {
+    stack_headroom_ok(base, loaders.image_end_for(base), sp_min)
+}
+
+/// The arithmetic on its own, so the two measurements it stands on can be a
+/// test rather than a comment.
+fn stack_headroom_ok(base: u32, image_end: Option<u32>, sp_min: Option<u32>) -> bool {
+    if loaders::is_high(base) {
+        return true;
+    }
+    let (Some(sp), Some(end)) = (sp_min, image_end) else {
+        return true;
+    };
+    sp.saturating_sub(end) >= loaders::LOW_BASE_MIN_MARGIN
+}
+
+/// Is the low family contested for this title BY THE DATABASE ITSELF?
+///
+/// Returns the addresses its presets disagree over, when they disagree and at
+/// least one of the votes is below what this host can build.
+///
+/// WHY THAT COMBINATION IS THE SIGNAL. A title match is ambiguous when several
+/// dumps carry the same name and DreamShell gave them different addresses; the
+/// tie-break in `presets.rs` then keeps the loader still, which for isoldr's
+/// 13 KB is the safe answer. But a vote below 0x8c004000 is not one more
+/// opinion: DreamShell reaches `_MIN` only after its default and its high
+/// option have BOTH been rejected for a title, so it is that title saying low
+/// RAM was too tight -- for a loader a quarter of this one's size. Keeping a
+/// 56 KB image at the stock base on the strength of the other vote is choosing
+/// the one address the disagreement argues against.
+///
+/// Measured: 8 titles of the database's 1026 reach this, Sonic Adventure among
+/// them -- whose two votes are 0x8c004000 and 0x8c000100, and which corrupts the
+/// loader at the first of them.
+fn low_family_contested(
+    db: &presets::PresetDb,
+    identity: &presets::DiscIdentity,
+    preset: &presets::Preset,
+) -> Option<Vec<u32>> {
+    if loaders::is_high(preset.memory) {
+        return None;
+    }
+    let votes = db.title_addresses(&identity.title);
+    votes
+        .iter()
+        .any(|&m| loaders::known_unsupported(m).is_some())
+        .then_some(votes)
+}
+
+/// Where to put the loader when the LOW FAMILY as a whole is the problem.
+///
+/// Not `base_for_low_preset`, and the difference is what the preset said. That
+/// one answers for a preset this host cannot build, where DreamShell has
+/// positively rejected 0x8ce00000 and 0x8cfe8000 for the title and both are
+/// therefore struck out. Here the database's own answer for this dump is a
+/// SUPPORTED low base -- it is our image's size, or this title's measured
+/// stack, that rules it out -- so nothing has been said against the high
+/// options at all.
+///
+/// So the seed is `ISOLDR_HIGH_ADDR`: DreamShell's own second choice, the
+/// address it moves isoldr to when low RAM is not workable, and the one 119
+/// presets use. It is checked like any other candidate -- Sonic Adventure 2's
+/// preset is that very address and its Maple DMA list rules it out.
+fn base_off_the_low_family(
+    loaders: &loaders::LoaderSet,
+    boot: &[u8],
+    address: u32,
+    seen: Option<&memmap::MemoryMap>,
+    sp_min: Option<u32>,
+) -> Option<u32> {
+    let high = loaders::ISOLDR_HIGH_ADDR;
+    // SAY WHY THE SEED WAS NOT TAKEN. It is the one address in this branch that
+    // anybody has an opinion about -- DreamShell's, and 119 presets' -- so
+    // "something else was used instead" without a reason is the line a reader
+    // would have to reconstruct by hand.
+    if !loaders.can_provide(high) {
+        debug!("0x{high:08x} is not an address this loader set can produce");
+    } else if !base_is_clear(loaders, boot, address, high, seen, sp_min, 0x4_0000) {
+        let hits = dispatch::literals_in_loader_footprint(boot, address, high);
+        debug!(
+            "0x{high:08x} is ruled out for this title: {} constant(s) point into it{}",
+            hits.len(),
+            if map_hits_loader(high, seen, 0x4_0000) {
+                ", and its reads have landed within 256 KB of it"
+            } else {
+                ""
+            }
+        );
+    } else {
+        return Some(high);
+    }
+    pick_clear_base(loaders, boot, address, high, seen, sp_min)
 }
 
 /// Has this title been seen reading into RAM a loader at `base` would be using?
@@ -370,6 +587,7 @@ fn base_for_low_preset(
     boot: &[u8],
     address: u32,
     seen: Option<&memmap::MemoryMap>,
+    sp_min: Option<u32>,
 ) -> Option<u32> {
     // FROM THE END OF THIS TITLE'S OWN IMAGE, not from the constant floor. For a
     // title whose preset cannot be honoured, that constant is exactly what has
@@ -390,7 +608,8 @@ fn base_for_low_preset(
     );
     for margin in [0x4_0000u32, 0] {
         let is_clear = |b: u32| {
-            !loaders::ruled_out_by_low_preset(b) && base_is_clear(boot, address, b, seen, margin)
+            !loaders::ruled_out_by_low_preset(b)
+                && base_is_clear(loaders, boot, address, b, seen, sp_min, margin)
         };
         let clear: Vec<u32> = loaders
             .available()
@@ -643,6 +862,17 @@ fn wanted_loader_base(
     let memory_path = memory_db_path(args, &loaders);
     let seen_db = memmap::MemoryDb::load(&memory_path);
     let seen = seen_db.get(&identity.md5).map(|r| r.map);
+    // THE OTHER HALF OF WHAT EARLIER SESSIONS MEASURED. The bitmap says where
+    // this title's reads landed; this says how deep its stack went, which is
+    // the only evidence there is about whether a loader may sit under it.
+    // `None` until some session has read it back off the console.
+    let sp_min = seen_db.get(&identity.md5).and_then(|r| r.sp_min);
+    if let Some(sp) = sp_min {
+        info!(
+            "this title has been seen entering GD syscalls with a stack pointer as low \
+             as 0x{sp:08x}"
+        );
+    }
     match seen.as_ref() {
         Some(m) => info!(
             "memory map: this title has been seen using {} of 256 blocks of RAM ({}, {} games)",
@@ -665,7 +895,15 @@ fn wanted_loader_base(
     // where every chainload passes through.
     let Some((preset, _)) = &found else {
         let running = running?;
-        if base_is_clear(&boot, args.address, running, seen.as_ref(), 0x4_0000) {
+        if base_is_clear(
+            &loaders,
+            &boot,
+            args.address,
+            running,
+            seen.as_ref(),
+            sp_min,
+            0x4_0000,
+        ) {
             info!("keeping the loader where it is, at 0x{running:08x}");
             return None;
         }
@@ -675,7 +913,14 @@ fn wanted_loader_base(
              Looking for somewhere else.",
             identity.title
         );
-        return pick_clear_base(&loaders, &boot, args.address, running, seen.as_ref());
+        return pick_clear_base(
+            &loaders,
+            &boot,
+            args.address,
+            running,
+            seen.as_ref(),
+            sp_min,
+        );
     };
 
     // A PRESET THIS HOST CANNOT BUILD IS THE STRONGEST STATEMENT IN THE
@@ -702,7 +947,7 @@ fn wanted_loader_base(
             loaders::ISOLDR_DEFAULT_ADDR,
             loaders::ISOLDR_HIGH_ADDR,
         );
-        return match base_for_low_preset(&loaders, &boot, args.address, seen.as_ref()) {
+        return match base_for_low_preset(&loaders, &boot, args.address, seen.as_ref(), sp_min) {
             Some(alt) => {
                 warn!(
                     "'{}': using 0x{alt:08x}, the address furthest from anything this \
@@ -741,8 +986,83 @@ fn wanted_loader_base(
     // about a flat span, and so ruled out the stock base for every title that
     // uses low RAM -- all of them.
     let seen_hits_preset = map_hits_loader(preset.memory, seen.as_ref(), 0x4_0000);
-    if hits.is_empty() && !seen_hits_preset {
+    // TWO MORE WAYS A LOW PRESET CAN BE WRONG FOR THIS LOADER, neither of which
+    // is an address collision and neither of which the two tests above can see.
+    // The first is what the database says about the title; the second is what
+    // the console said about it last time. See `low_family_contested` and
+    // `low_base_has_stack_headroom`.
+    let contested = low_family_contested(&db, &identity, preset);
+    let no_headroom = !low_base_has_stack_headroom(&loaders, preset.memory, sp_min);
+    if hits.is_empty() && !seen_hits_preset && contested.is_none() && !no_headroom {
         return Some(preset.memory);
+    }
+
+    // A LOW BASE REFUSED FOR A STACK REASON IS A VERDICT ON THE FAMILY, NOT ON
+    // AN ADDRESS. Every base this host can build below 0x8c010000 shares the
+    // same 0x8c004000..0x8c00f400 hole with the title's stack, so moving a few
+    // kilobytes inside it buys nothing -- which is exactly what the ordinary
+    // search would try, since it never crosses families on purpose.
+    if contested.is_some() || no_headroom {
+        if let Some(votes) = contested.as_ref() {
+            warn!(
+                "'{}': the database's presets for this title disagree -- {} -- and one of \
+                 them is below the BIOS syscall area. DreamShell only goes there after its \
+                 default and its high option have both failed for a title, so that vote is \
+                 it saying low RAM was too tight for a loader a quarter of this one's size. \
+                 The tie-break picked 0x{:08x} anyway; leaving the low family instead.",
+                preset.title,
+                votes
+                    .iter()
+                    .map(|m| format!("0x{m:08x}"))
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                preset.memory,
+            );
+        }
+        if no_headroom {
+            let end = loaders.image_end_for(preset.memory);
+            warn!(
+                "'{}': this title's stack has been measured reaching 0x{}, and a loader at \
+                 0x{:08x} ends at 0x{} -- {} bytes, under the {} this loader's own disc-read \
+                 path plus the title's deeper frames need. Nothing here is a guess: the \
+                 depth was read off the console in an earlier session. Leaving the low \
+                 family.",
+                preset.title,
+                sp_min.map_or_else(|| "?".into(), |sp| format!("{sp:08x}")),
+                preset.memory,
+                end.map_or_else(|| "?".into(), |e| format!("{e:08x}")),
+                match (sp_min, end) {
+                    (Some(sp), Some(e)) => sp.saturating_sub(e).to_string(),
+                    _ => "?".to_string(),
+                },
+                loaders::LOW_BASE_MIN_MARGIN,
+            );
+        }
+        return match base_off_the_low_family(
+            &loaders,
+            &boot,
+            args.address,
+            seen.as_ref(),
+            sp_min,
+        ) {
+            Some(alt) => {
+                warn!(
+                    "'{}': using 0x{alt:08x} instead of the preset's 0x{:08x}; pin it with \
+                     --loader-base to override.",
+                    preset.title, preset.memory
+                );
+                Some(alt)
+            }
+            None => {
+                error!(
+                    "'{}': the low family is ruled out for this title and nothing clear of \
+                     it could be produced either. Going ahead at 0x{:08x} anyway: if the \
+                     loader stops answering part-way through, this is why.",
+                    preset.title, preset.memory
+                );
+                Some(preset.memory)
+            }
+        };
     }
     if hits.is_empty() {
         warn!(
@@ -751,7 +1071,14 @@ fn wanted_loader_base(
             preset.title, preset.memory
         );
     }
-    match pick_clear_base(&loaders, &boot, args.address, preset.memory, seen.as_ref()) {
+    match pick_clear_base(
+        &loaders,
+        &boot,
+        args.address,
+        preset.memory,
+        seen.as_ref(),
+        sp_min,
+    ) {
         Some(alt) => {
             if hits.is_empty() {
                 warn!(
@@ -875,6 +1202,129 @@ enum Commands {
 }
 
 /// `identify`: everything the loader-placement pass would work out, printed.
+/// Bring up the counter panel, or say why there is none.
+///
+/// EVERY FAILURE HERE IS A WARNING. This is an instrument bolted onto a session
+/// whose actual job is running a game; refusing to start the title because the
+/// loader ELF could not be found would be the instrument deciding the outcome
+/// of the measurement, which is the trap AGENTS.md 11 keeps coming back to.
+///
+/// Run BEFORE the title is executed, where a blocking round trip costs nothing
+/// and where the log lines it prints are still readable above the panel.
+fn start_diag(
+    args: &Args,
+    conn: &mut DcIoUDP,
+    running_base: Option<u32>,
+    recorder: Option<std::sync::Arc<std::sync::Mutex<memmap::MemoryRecorder>>>,
+) -> Option<diag::Probe> {
+    let Some(base) = running_base else {
+        warn!(
+            "--diag needs a loader that reports its own load address, and this one \
+             does not: without it there is no way to know which ELF the counters \
+             live in. Rebuild dcload-ip and re-burn its boot image."
+        );
+        return None;
+    };
+    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
+    // The SAME image the host would upload for this base -- a pre-linked ELF
+    // when the set has one, otherwise the relocatable one moved in memory,
+    // which reproduces a native link byte for byte. That is what makes the
+    // comparison below meaningful for a relocated loader, where there is no ELF
+    // on disk to aim an external tool at.
+    let (elf, label) = match loaders.image_for(base) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("--diag: no loader ELF to read the counter addresses out of: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = diag::verify_image(conn, &elf, &label) {
+        warn!("--diag disabled: {e}");
+        return None;
+    }
+    let interval = std::time::Duration::from_secs_f64(args.diag_interval.clamp(0.25, 30.0));
+    match diag::Probe::new(&elf, label, interval) {
+        Ok(mut probe) => {
+            // The panel's range contains the two stack counters, so it is the
+            // one that reads them while it is up -- see `Probe::stack`.
+            match stackwatch::StackVerdict::from_elf(&elf, base, recorder) {
+                Ok(v) => probe.watch_stack(v),
+                Err(e) => debug!("--diag: no stack verdict from this loader: {e}"),
+            }
+            // The connection claims the replies, not the syscall loop: they
+            // arrive inside whatever transfer is polling at the time. See
+            // `diag::SampleSink`.
+            probe.install(conn);
+            let (lo, span) = probe.span();
+            info!(
+                "diag: {} counters from {} (image verified), {span} bytes at \
+                 0x{lo:08x} every {:.1} s",
+                probe.counter_count(),
+                probe.label(),
+                interval.as_secs_f64(),
+            );
+            Some(probe)
+        }
+        Err(e) => {
+            warn!("--diag disabled: {e}");
+            None
+        }
+    }
+}
+
+/// Bring up the stack watch, or say why there is none.
+///
+/// EVERY FAILURE IS A WARNING, never a refusal to run the title -- the same
+/// rule as the counter panel. This is an instrument, and an instrument that
+/// decides whether the session happens is the trap AGENTS.md 11 keeps coming
+/// back to.
+///
+/// The image is verified against the running loader first, and that check is
+/// not a formality: two builds at the same base put the same counter at
+/// different addresses (AGENTS.md 14.19), so an unverified watch reports a
+/// believable number about the wrong memory. Run before `execute`, where a
+/// blocking round trip costs nothing.
+fn start_stack_watch(
+    args: &Args,
+    conn: &mut DcIoUDP,
+    running_base: Option<u32>,
+    recorder: Option<std::sync::Arc<std::sync::Mutex<memmap::MemoryRecorder>>>,
+) -> Option<stackwatch::StackWatch> {
+    let Some(base) = running_base else {
+        // An older loader that does not report where it was linked. Nothing to
+        // aim at, and probing for it would cost more round trips than the
+        // measurement is worth here.
+        debug!("no stack watch: this loader does not report its own load address");
+        return None;
+    };
+    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
+    let (elf, label) = match loaders.image_for(base) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("no stack watch: no loader ELF to read the counter addresses out of: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = diag::verify_image(conn, &elf, &label) {
+        warn!(
+            "no stack watch: {e}. This session cannot tell how close this title's stack \
+             comes to the loader, and nothing will be learned for the next one."
+        );
+        return None;
+    }
+    match stackwatch::StackWatch::new(&elf, base, recorder) {
+        Ok(watch) => {
+            watch.install(conn);
+            debug!("stack watch: reading the GD stack counters out of {label}");
+            Some(watch)
+        }
+        Err(e) => {
+            debug!("no stack watch: {e}");
+            None
+        }
+    }
+}
+
 fn identify_only(args: &Args, disc: &str) -> ExitCode {
     let reader = match dispatch::open_disc(disc) {
         Ok(d) => d,
@@ -894,6 +1344,30 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     println!("product  : {} {}", identity.product, identity.version);
     println!("region   : {}", identity.region);
     println!("boot md5 : {}", identity.md5);
+    // WHAT THE DISC CAN PLAY, which is not derivable from anything else printed
+    // here. A title only ever learns it has music from the table of contents,
+    // so "how many audio tracks does this image have" is the first thing worth
+    // knowing about a title that is supposed to have a soundtrack and does not.
+    let tracks = reader.toc_tracks();
+    if tracks.is_empty() {
+        println!("tracks   : this image does not enumerate its tracks -- no CDDA possible");
+    } else {
+        let audio: Vec<u8> = tracks.iter().filter(|t| t.audio).map(|t| t.number).collect();
+        if audio.is_empty() {
+            println!("tracks   : {} tracks, none of them audio", tracks.len());
+        } else {
+            println!(
+                "tracks   : {} tracks, {} audio ({})",
+                tracks.len(),
+                audio.len(),
+                audio
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+    }
     let boot_bytes = match disc_formats::boot::extract(reader.as_ref(), args.descramble.into()) {
         Ok(b) => {
             println!(
@@ -916,6 +1390,30 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         }
     };
 
+    // WHAT --vga WOULD DO, answered where it costs no console. "The cable check
+    // was not found" is the one thing worth knowing BEFORE such a run: after
+    // it, a title that ignored the patch and a title that was never patched
+    // look exactly the same from here.
+    let declared = disc_formats::types::find_ip_bin(reader.as_ref())
+        .and_then(|sector| dispatch::ip_bin_peripherals(&sector))
+        .map(|p| p & dispatch::PERIPHERAL_VGA != 0);
+    let cable = boot_bytes
+        .as_deref()
+        .map(|b| dispatch::vga_cable_patches(b, args.address))
+        .unwrap_or_default();
+    println!(
+        "vga      : IP.BIN {}; {}",
+        match declared {
+            Some(true) => "declares VGA box support",
+            Some(false) => "does NOT declare VGA box support",
+            None => "has no readable peripheral field",
+        },
+        match cable.len() {
+            0 => "no cable check found, so --vga can patch no code".to_string(),
+            n => format!("{n} cable check(s) --vga can force to VGA"),
+        }
+    );
+
     let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
 
     // Does the title address the RAM the loader would be sitting in? Answered
@@ -927,6 +1425,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     // what a run would actually pick.
     let seen_db = memmap::MemoryDb::load(&memory_db_path(args, &loaders));
     let seen = seen_db.get(&identity.md5).map(|r| r.map);
+    let sp_min = seen_db.get(&identity.md5).and_then(|r| r.sp_min);
     match seen.as_ref() {
         Some(m) => println!(
             "seen     : {} of 256 blocks of 64 KB used in earlier sessions \
@@ -937,6 +1436,29 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         None => println!(
             "seen     : nothing recorded for this game yet (of {} games recorded)",
             seen_db.len()
+        ),
+    }
+    // The third placement test, and the one nothing else here can stand in for:
+    // how deep this title's stack has been measured going. See
+    // `low_base_has_stack_headroom`.
+    match sp_min {
+        Some(sp) => {
+            let end = loaders.image_end_for(loaders::DEFAULT_BASE);
+            println!(
+                "stack    : enters GD syscalls as low as 0x{sp:08x}; a loader at \
+                 0x{:08x} ends at 0x{} -- {} (needs {})",
+                loaders::DEFAULT_BASE,
+                end.map_or_else(|| "?".into(), |e| format!("{e:08x}")),
+                match end {
+                    Some(e) => format!("{} bytes under it", sp.saturating_sub(e)),
+                    None => "no loader image to measure against".to_string(),
+                },
+                loaders::LOW_BASE_MIN_MARGIN,
+            )
+        }
+        None => println!(
+            "stack    : never measured -- no session has read this title's GD stack \
+             pointer back off the console"
         ),
     }
     let report_collisions = |base: u32| {
@@ -968,7 +1490,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         // cannot drift from what a run would actually do. The answer is what
         // the reader actually needs; without it "pick another base" is an
         // invitation to guess, and a guess costs a session per attempt.
-        match pick_clear_base(&loaders, bytes, args.address, base, seen.as_ref()) {
+        match pick_clear_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min) {
             Some(alt) => println!(
                 "           uexec would use 0x{alt:08x} instead ({}).",
                 if loaders.has(alt) {
@@ -1041,11 +1563,12 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 // drift from what a run would do -- including for a preset this
                 // host cannot build, where "would stay put" was the old answer
                 // and is the one the preset rules out.
+                let contested = low_family_contested(&db, &identity, &p);
+                let no_headroom = !low_base_has_stack_headroom(&loaders, p.memory, sp_min);
                 if loaders::known_unsupported(p.memory).is_some() {
-                    match boot_bytes
-                        .as_deref()
-                        .and_then(|b| base_for_low_preset(&loaders, b, args.address, seen.as_ref()))
-                    {
+                    match boot_bytes.as_deref().and_then(|b| {
+                        base_for_low_preset(&loaders, b, args.address, seen.as_ref(), sp_min)
+                    }) {
                         Some(alt) => {
                             println!(
                                 "would use: 0x{alt:08x} -- 0x{:08x} and 0x{:08x} are ruled out \
@@ -1059,6 +1582,51 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             "would use: nothing clear of this title could be produced; the \
                              loader would stay where it is"
                         ),
+                    }
+                } else if contested.is_some() || no_headroom {
+                    // THE SAME TWO PREDICATES `uexec` APPLIES, so the offline
+                    // report cannot come to a different answer than a run.
+                    if let Some(votes) = contested.as_ref() {
+                        println!(
+                            "contested: presets under this title disagree ({}) and one is \
+                             below 0x{:08x} -- DreamShell only goes there once its default \
+                             and its high option have failed",
+                            votes
+                                .iter()
+                                .map(|m| format!("0x{m:08x}"))
+                                .collect::<Vec<_>>()
+                                .join(" and "),
+                            loaders::DEFAULT_BASE,
+                        );
+                    }
+                    if no_headroom {
+                        println!(
+                            "no room  : this title's measured stack leaves less than {} bytes \
+                             under a loader at 0x{:08x}",
+                            loaders::LOW_BASE_MIN_MARGIN,
+                            p.memory,
+                        );
+                    }
+                    match boot_bytes.as_deref().and_then(|b| {
+                        base_off_the_low_family(&loaders, b, args.address, seen.as_ref(), sp_min)
+                    }) {
+                        Some(alt) => {
+                            println!(
+                                "would use: 0x{alt:08x} -- off the low family, seeded from \
+                                 0x{:08x}, DreamShell's own answer when low RAM is not \
+                                 workable",
+                                loaders::ISOLDR_HIGH_ADDR
+                            );
+                            report_collisions(alt);
+                        }
+                        None => {
+                            println!(
+                                "would use: nothing clear of the low family could be produced; \
+                                 the preset's 0x{:08x} would be used anyway",
+                                p.memory
+                            );
+                            report_collisions(p.memory);
+                        }
                     }
                 } else {
                     report_collisions(p.memory);
@@ -1243,17 +1811,42 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let remote_port = if legacy_mode { 31313 } else { args.port };
     let local_port = if legacy_mode { Some(31313) } else { None };
     let mut udpsender = DcIoUDP::new(args.host.clone(), remote_port, local_port)?;
-    let (version_text, mut running_base) = match dispatch::query_loader(&mut udpsender) {
+    let contact = if args.infinite {
+        // Said here rather than inside the wait, because this is where the
+        // address being polled is known -- and in a redirected log, where no
+        // spinner is drawn, this line is the only thing between the command
+        // and a minute of silence.
+        info!(
+            "waiting for dcload-ip on host {} port {} to answer (Ctrl-C to give up)",
+            args.host, remote_port
+        );
+        dispatch::wait_for_any_loader(&mut udpsender)
+    } else {
+        dispatch::query_loader(&mut udpsender)
+    };
+    let reply = match contact {
         Err(err) => {
             error!("Failed to contact the client: {}", err);
+            error!(
+                "if the console is not up yet, --infinite waits for it instead \
+                 of giving up here"
+            );
             return Ok(ExitCode::FAILURE);
         }
         Ok(v) => v,
     };
+    let version_text = reply.text;
+    let mut running_base = reply.base;
     info!(
         "Successfully connected to dcload-ip on host {} using port {}",
         args.host, args.port
     );
+    match reply.cable {
+        Some(cable) => info!("video cable: {}", cable.name()),
+        // Not a warning: it only matters if --vga auto is asked for something,
+        // and the decision itself says so when it is.
+        None => debug!("this loader does not report which video cable is plugged in"),
+    }
     match running_base {
         Some(base) => info!("dcload-ip version: {} (loaded at 0x{:08x})", version_text, base),
         None => info!(
@@ -1359,6 +1952,45 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // where execution starts; if the load fails there is no
                 // bootstrap in RAM, so fall back to entering the binary rather
                 // than jumping into whatever was there before.
+                // WHETHER TO FORCE VGA, decided here because IP.BIN leaves in
+                // the next few lines and carries half of it.
+                //
+                // `auto` asks the console instead of the user, because only
+                // the console can answer: dcload reads the cable off PDTRA and
+                // reports it, and forcing a title to VGA is exactly right with
+                // a VGA box on the other end and a black screen with a
+                // television. An older loader says nothing, and unknown is
+                // read as "leave it alone" -- the only safe reading, since the
+                // code for VGA is 0 and every loose decode lands on it.
+                let vga = match args.vga {
+                    VgaArg::Never => false,
+                    VgaArg::Always => {
+                        info!("--vga always: forcing VGA whatever the console reports");
+                        true
+                    }
+                    VgaArg::Auto => match dispatch::query_cable(&mut udpsender) {
+                        Some(loaders::Cable::Vga) => {
+                            info!("the console reports a VGA box; patching this title for it");
+                            true
+                        }
+                        Some(other) => {
+                            info!(
+                                "the console reports {}, so the title is left as shipped \
+                                 (--vga always overrides this)",
+                                other.name()
+                            );
+                            false
+                        }
+                        None => {
+                            info!(
+                                "this loader does not report which cable is plugged in, so the \
+                                 title is left as shipped -- rebuild the loaders for --vga auto \
+                                 to decide, or pass --vga always"
+                            );
+                            false
+                        }
+                    },
+                };
                 let mut entry = addr;
                 if let (Some(reader), Some(d)) = (disc_reader.as_deref(), redirect_disc.as_ref()) {
                     match dispatch::load_ip_bin(
@@ -1367,6 +1999,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         d,
                         running_base,
                         args.boot_ipbin,
+                        vga,
                     ) {
                         Ok(true) if args.boot_ipbin => {
                             entry = dispatch::IP_BIN_BOOTSTRAP_2_EXEC;
@@ -1449,6 +2082,23 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         warn!("could not neutralise the GAPS probe: {e}");
                     }
                 }
+                // Same mechanism, same reason for surviving a reload: what
+                // this changes is one halfword of the title's own image, and a
+                // title that reloads that code reads its cable again.
+                let mut vga_guard: Vec<(u32, u32)> = vec![];
+                if vga {
+                    vga_guard = dispatch::vga_cable_patches(&payload, args.address);
+                    if vga_guard.is_empty() {
+                        warn!(
+                            "--vga: no cable check found in this image -- NOTHING was \
+                             patched, and the title will see the cable that is really \
+                             plugged in. `identify` reports this without a console."
+                        );
+                    } else if let Err(e) = dispatch::apply_patches(&mut udpsender, &vga_guard) {
+                        warn!("could not force the cable check to VGA: {e}");
+                    }
+                }
+                let guards = [gaps_guard, vga_guard].concat();
                 // Last, so a patch always wins over the bytes it replaces --
                 // whether they came from the title, from IP.BIN, or from both.
                 if !args.patch.is_empty()
@@ -1489,6 +2139,37 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // From here the ticker installed at the top of main has
                 // something to write, and a Ctrl-C has something to report.
                 memmap::set_active(memory_recorder.clone());
+                // Before `execute`: the identity check is a blocking round trip
+                // and the console is idle right now, which it will not be again
+                // until the session ends.
+                let diag = args
+                    .diag
+                    .then(|| {
+                        start_diag(
+                            &args,
+                            &mut udpsender,
+                            running_base,
+                            memory_recorder.clone(),
+                        )
+                    })
+                    .flatten();
+                // ON IN EVERY SESSION THE PANEL IS NOT, and here for the same
+                // reason as the panel: its one blocking check belongs in the
+                // seconds before the title starts. It costs eight bytes every
+                // ten seconds and it is the only thing that can see a title's
+                // stack coming (see `stackwatch`). Not alongside `--diag`: that
+                // panel samples a range containing the same two counters, and
+                // two sinks claiming by address would eat each other's replies.
+                let stack = (!args.diag)
+                    .then(|| {
+                        start_stack_watch(
+                            &args,
+                            &mut udpsender,
+                            running_base,
+                            memory_recorder.clone(),
+                        )
+                    })
+                    .flatten();
                 info!("Upload complete, executing at 0x{:08x}", entry);
                 // The title is on the console now; the host's copy is only
                 // holding up to 16 MiB for the length of the session.
@@ -1502,8 +2183,11 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 disc_reader,
                                 mount.clone(),
                                 running_base,
-                                &gaps_guard,
+                                &guards,
+                                !args.no_cdda,
                                 memory_recorder,
+                                diag,
+                                stack,
                             )?;
                             return Ok(ExitCode::SUCCESS);
                         }
@@ -1656,7 +2340,7 @@ mod tests {
             "the fixture does not rule out the base it is about"
         );
         assert_eq!(
-            pick_clear_base(&set, &boot, 0x0c01_0000, loaders::DEFAULT_BASE, Some(&map)),
+            pick_clear_base(&set, &boot, 0x0c01_0000, loaders::DEFAULT_BASE, Some(&map), None),
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1690,7 +2374,7 @@ mod tests {
         // against 30, and against the single block Jet Set Radio's finished map
         // leaves above 0x8ce00000.
         assert_eq!(
-            base_for_low_preset(&set, &boot, 0x0c01_0000, Some(&map)),
+            base_for_low_preset(&set, &boot, 0x0c01_0000, Some(&map), None),
             Some(0x8c69_0000)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1714,9 +2398,130 @@ mod tests {
         // 1ST_READ.BIN as the disc holds it: 341696 bytes at 0x8c010000.
         let boot = vec![0u8; 341_696];
         assert_eq!(
-            base_for_low_preset(&set, &boot, 0x0c01_0000, Some(&map)),
+            base_for_low_preset(&set, &boot, 0x0c01_0000, Some(&map), None),
             Some(0x8c6a_0000)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One preset row, in the database's own 17-column shape.
+    fn preset_row(md5: &str, title: &str, memory: u32) -> String {
+        format!(
+            "{md5}\t{title}\t0x{memory:08x}\t0\t1\t0\t00000000\t00000000\t0\t0\t0\t0\t0\
+             \t00000000\t00000000\t00000000\t00000000"
+        )
+    }
+
+    fn disc(title: &str) -> presets::DiscIdentity {
+        presets::DiscIdentity {
+            md5: "nothing this database has ever seen".into(),
+            title: title.into(),
+            product: String::new(),
+            version: String::new(),
+            region: String::new(),
+        }
+    }
+
+    /// THE TWO MEASUREMENTS THE THRESHOLD STANDS ON, from AGENTS.md 4.6, both
+    /// on Sonic Adventure at the stock base with `SP = 0x8c00b9d0`.
+    ///
+    /// The first is the configuration that booted and played; the second is the
+    /// same loader with CD-DA in it, which corrupts itself. A threshold that
+    /// rejected the first would be a guard firing on the one thing known to
+    /// work (AGENTS.md 14.9), and one that accepted the second would not be a
+    /// guard at all.
+    #[test]
+    fn the_threshold_sits_between_the_build_that_worked_and_the_one_that_did_not() {
+        const SP: u32 = 0x8c00_b9d0;
+        assert!(
+            stack_headroom_ok(loaders::DEFAULT_BASE, Some(0x8c00_a558), Some(SP)),
+            "5240 bytes: measured booting and playing, 1624 reads served"
+        );
+        assert!(
+            !stack_headroom_ok(loaders::DEFAULT_BASE, Some(0x8c00_b044), Some(SP)),
+            "2444 bytes: measured corrupting the loader"
+        );
+    }
+
+    /// A test that cannot be computed decides nothing, and neither does one
+    /// about a base that is not in the race.
+    #[test]
+    fn an_unmeasured_stack_moves_nothing() {
+        // No session has ever read a stack pointer back for this title. The
+        // stock base is what 593 presets ask for; refusing it on one other
+        // game's measurement would be worse than having no test.
+        assert!(stack_headroom_ok(loaders::DEFAULT_BASE, Some(0x8c00_b044), None));
+        // No loader image to measure against.
+        assert!(stack_headroom_ok(loaders::DEFAULT_BASE, None, Some(0x8c00_b9d0)));
+        // A high loader is nowhere near the BIOS work area, so the title has
+        // the whole hole to descend through -- even a stack this deep.
+        assert!(stack_headroom_ok(
+            loaders::ISOLDR_HIGH_ADDR,
+            Some(0x8cff_3000),
+            Some(0x8c00_b9d0)
+        ));
+    }
+
+    /// Sonic Adventure's two votes are 0x8c004000 and 0x8c000100, and the
+    /// tie-break keeps the loader at the first. The second is DreamShell saying
+    /// low RAM was too tight for a loader a quarter of this one's size.
+    #[test]
+    fn a_split_vote_with_one_below_the_syscall_area_leaves_the_low_family() {
+        let db = presets::PresetDb::parse(&format!(
+            "{}\n{}\n",
+            preset_row("aaa", "SONIC ADVENTURE", 0x8c00_4000),
+            preset_row("bbb", "SONIC ADVENTURE", 0x8c00_0100),
+        ));
+        let id = disc("SONIC ADVENTURE");
+        let (preset, kind) = db.lookup(&id).expect("matched by title");
+        assert_eq!(kind, presets::MatchKind::Title);
+        assert_eq!(preset.memory, loaders::DEFAULT_BASE, "the tie-break stands");
+        assert_eq!(
+            low_family_contested(&db, &id, &preset),
+            Some(vec![0x8c00_0100, 0x8c00_4000])
+        );
+    }
+
+    /// ...and a disagreement this host can build every side of is just a
+    /// disagreement. The tie-break's answer stands, as it always did.
+    #[test]
+    fn a_split_vote_between_buildable_addresses_is_not_contested() {
+        let db = presets::PresetDb::parse(&format!(
+            "{}\n{}\n",
+            preset_row("aaa", "SOME GAME", 0x8c00_4000),
+            preset_row("bbb", "SOME GAME", 0x8cfe_8000),
+        ));
+        let id = disc("SOME GAME");
+        let (preset, _) = db.lookup(&id).expect("matched by title");
+        assert_eq!(low_family_contested(&db, &id, &preset), None);
+        // Nor is a title the database agrees about.
+        let db = presets::PresetDb::parse(&preset_row("aaa", "AGREED", 0x8c00_4000));
+        let id = disc("AGREED");
+        let (preset, _) = db.lookup(&id).expect("matched by title");
+        assert_eq!(low_family_contested(&db, &id, &preset), None);
+    }
+
+    /// Leaving the low family lands on DreamShell's own second choice -- and is
+    /// still checked there like any other candidate.
+    #[test]
+    fn off_the_low_family_means_isoldrs_high_option_unless_the_title_is_there() {
+        let dir = fake_loader_dir("dcload-offlow", &[loaders::ISOLDR_HIGH_ADDR]);
+        let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
+        let boot = vec![0u8; 0x1000];
+        assert_eq!(
+            base_off_the_low_family(&set, &boot, 0x0c01_0000, None, Some(0x8c00_b9d0)),
+            Some(loaders::ISOLDR_HIGH_ADDR)
+        );
+
+        // Sonic Adventure 2's failure, which is at that very address: its Maple
+        // DMA list is at 0x8cff0000, inside the span. The seed is not a
+        // shortcut past the tests.
+        let mut map = memmap::MemoryMap::new();
+        map.mark(0x8cff_0000, 0x1000);
+        let got = base_off_the_low_family(&set, &boot, 0x0c01_0000, Some(&map), None)
+            .expect("somewhere else high");
+        assert_ne!(got, loaders::ISOLDR_HIGH_ADDR);
+        assert!(loaders::is_high(got));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1728,7 +2533,7 @@ mod tests {
         // loader is sitting, is still excluded rather than kept by default.
         let dir = fake_loader_dir("dcload-lowpreset-blank", &[loaders::ISOLDR_DEFAULT_ADDR]);
         let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
-        let got = base_for_low_preset(&set, &vec![0u8; 0x1000], 0x0c01_0000, None);
+        let got = base_for_low_preset(&set, &vec![0u8; 0x1000], 0x0c01_0000, None, None);
         assert_eq!(got, Some(0x8c81_0000));
         assert!(!loaders::ruled_out_by_low_preset(got.unwrap()));
         let _ = std::fs::remove_dir_all(&dir);

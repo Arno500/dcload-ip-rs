@@ -177,6 +177,21 @@ pub struct Row {
     pub title: String,
     pub map: MemoryMap,
     pub sessions: u32,
+    /// The lowest stack pointer this title has been seen entering a GD syscall
+    /// with (`g_gd_sp_min`), or `None` if no session ever read it back.
+    ///
+    /// WHY THE MAP ALONE CANNOT ANSWER WHERE A LOW LOADER GOES. Every other
+    /// column here records an address the title WROTE, learned from a disc read
+    /// the host served. A stack is written by no read and named by no constant:
+    /// it descends from 0x8c00f400 into whatever the loader left below it, and
+    /// the first sign of it is the loader's own state coming back wrong.
+    ///
+    /// So this one number is measured instead of inferred, and it merges by
+    /// MINIMUM rather than by OR -- deeper is what a placement has to survive.
+    /// It is a property of the title, not of the base, so a session at a high
+    /// base (where it costs nothing) teaches it just as well as one at a low
+    /// base (where it is already too late).
+    pub sp_min: Option<u32>,
 }
 
 /// One row per boot-sector md5 -- the same key `presets.rs` uses, so a game
@@ -198,7 +213,12 @@ const HEADER: &str = "\
 # has, commit the row, and everyone's placement gets better. A row is only ever
 # incomplete, never wrong -- a bit is set because a read really landed there.
 #
-# md5\ttitle\tblocks\tsessions
+# `sp_min` is the lowest stack pointer the title was seen entering a GD syscall
+# with, read out of the running loader. It merges by MINIMUM, and it is what
+# says whether a loader may sit under that stack at all -- no disc read can show
+# that, because nothing is ever read INTO a stack. Blank means never measured.
+#
+# md5\ttitle\tblocks\tsessions\tsp_min
 ";
 
 impl MemoryDb {
@@ -220,12 +240,20 @@ impl MemoryDb {
                 continue;
             };
             let sessions = f.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+            // Absent on every row written before this column existed, and
+            // absent on any row whose sessions never got an answer out of the
+            // loader. Both mean the same thing here: not measured.
+            let sp_min = f.next().and_then(|s| {
+                let s = s.trim();
+                u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+            });
             db.rows.insert(
                 md5.trim().to_string(),
                 Row {
                     title: title.trim().to_string(),
                     map,
                     sessions,
+                    sp_min,
                 },
             );
         }
@@ -241,10 +269,25 @@ impl MemoryDb {
     }
 
     /// Fold one observation in, counting a session only the first time.
-    pub fn record(&mut self, md5: &str, title: &str, map: &MemoryMap, new_session: bool) {
+    ///
+    /// The map merges by OR and `sp_min` by MINIMUM: both directions are the
+    /// conservative one for what the value is used for, so folding a partial
+    /// observation in can never make a placement bolder than it was.
+    pub fn record(
+        &mut self,
+        md5: &str,
+        title: &str,
+        map: &MemoryMap,
+        sp_min: Option<u32>,
+        new_session: bool,
+    ) {
         match self.rows.get_mut(md5) {
             Some(row) => {
                 row.map.merge(map);
+                row.sp_min = match (row.sp_min, sp_min) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 if new_session {
                     row.sessions = row.sessions.saturating_add(1);
                 }
@@ -256,6 +299,7 @@ impl MemoryDb {
                         title: title.to_string(),
                         map: *map,
                         sessions: 1,
+                        sp_min,
                     },
                 );
             }
@@ -271,7 +315,7 @@ impl MemoryDb {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut merged = MemoryDb::load(path);
         for (md5, row) in &self.rows {
-            merged.record(md5, &row.title, &row.map, false);
+            merged.record(md5, &row.title, &row.map, row.sp_min, false);
             if let Some(dst) = merged.rows.get_mut(md5) {
                 dst.sessions = dst.sessions.max(row.sessions);
             }
@@ -279,10 +323,14 @@ impl MemoryDb {
         let mut out = String::from(HEADER);
         for (md5, row) in &merged.rows {
             out.push_str(&format!(
-                "{md5}\t{}\t{}\t{}\n",
+                "{md5}\t{}\t{}\t{}\t{}\n",
                 row.title,
                 row.map.to_hex(),
-                row.sessions
+                row.sessions,
+                match row.sp_min {
+                    Some(sp) => format!("0x{sp:08x}"),
+                    None => String::new(),
+                }
             ));
         }
         // Written beside the target and renamed, so an interrupted run cannot
@@ -321,6 +369,11 @@ pub struct MemoryRecorder {
     title: String,
     map: MemoryMap,
     saved: MemoryMap,
+    /// Lowest GD-syscall stack pointer seen this session, and what of it is
+    /// already on disk. See `Row::sp_min` for why this is measured rather than
+    /// derived from anything else recorded here.
+    sp_min: Option<u32>,
+    saved_sp_min: Option<u32>,
     /// What was already known about this game when the session started. The
     /// difference against `map` is what this session TAUGHT, which is the only
     /// number worth telling anyone at the end.
@@ -356,6 +409,8 @@ impl MemoryRecorder {
             title: title.to_string(),
             map: MemoryMap::new(),
             saved: MemoryMap::new(),
+            sp_min: None,
+            saved_sp_min: None,
             baseline,
             last_save: std::time::Instant::now(),
             first: true,
@@ -403,11 +458,22 @@ impl MemoryRecorder {
         }
     }
 
+    /// Note the lowest stack pointer a GD syscall was entered with.
+    ///
+    /// Called from the stack watch, which is off the read path like everything
+    /// else here: this only takes a minimum, and the ticker does the writing.
+    pub fn note_stack(&mut self, sp: u32) {
+        if self.sp_min.is_none_or(|had| sp < had) {
+            self.sp_min = Some(sp);
+        }
+    }
+
     /// Write, if there is anything to write and enough time has passed.
     /// Called from the ticker, never from the read path.
     pub fn flush_if_due(&mut self) {
         let due = if self.first { Self::FIRST } else { Self::EVERY };
-        if self.map == self.saved || self.last_save.elapsed() < due {
+        let nothing_new = self.map == self.saved && self.sp_min == self.saved_sp_min;
+        if nothing_new || self.last_save.elapsed() < due {
             return;
         }
         self.flush();
@@ -415,10 +481,11 @@ impl MemoryRecorder {
 
     pub fn flush(&mut self) {
         let mut db = MemoryDb::default();
-        db.record(&self.md5, &self.title, &self.map, self.first);
+        db.record(&self.md5, &self.title, &self.map, self.sp_min, self.first);
         match db.save(&self.path) {
             Ok(()) => {
                 self.saved = self.map;
+                self.saved_sp_min = self.sp_min;
                 self.first = false;
                 self.last_save = std::time::Instant::now();
             }
@@ -509,8 +576,12 @@ pub fn install_signal_handler() {
 /// and it is a waste of a session.
 pub fn report_and_exit(recorder: Option<&std::sync::Mutex<MemoryRecorder>>) -> ! {
     // The bars own the cursor and hide it while they draw; exiting through
-    // them leaves a terminal with no cursor in it.
+    // them leaves a terminal with no cursor in it. And the diagnostic panel's
+    // key reader holds the tty in raw mode while it waits, so a shell that
+    // outlives this process wants its settings back -- a no-op unless the
+    // panel was actually started.
     let _ = crate::ui::multi().clear();
+    crate::ui::restore_terminal();
     if let Some(lock) = recorder {
         // A poisoned lock means the main thread panicked while holding it; the
         // map is then not trustworthy and there is nothing to report.
@@ -715,6 +786,56 @@ mod tests {
         assert_eq!(MemoryMap::from_hex(&"z".repeat(64)), None);
     }
 
+    /// `sp_min` merges by MINIMUM, and a row that never had one keeps whatever
+    /// the first measurement brings.
+    ///
+    /// The direction is the whole point: the number is used to decide whether a
+    /// loader fits under this title's stack, so folding two partial
+    /// observations together must never produce a shallower answer than either
+    /// of them.
+    #[test]
+    fn the_stack_low_water_mark_merges_downwards() {
+        let m = MemoryMap::new();
+        let mut db = MemoryDb::default();
+        db.record("aaa", "GAME", &m, None, true);
+        assert_eq!(db.get("aaa").unwrap().sp_min, None, "nothing measured yet");
+        db.record("aaa", "GAME", &m, Some(0x8c00_b9d0), false);
+        assert_eq!(db.get("aaa").unwrap().sp_min, Some(0x8c00_b9d0));
+        // A shallower session must not raise it...
+        db.record("aaa", "GAME", &m, Some(0x8c00_c000), false);
+        assert_eq!(db.get("aaa").unwrap().sp_min, Some(0x8c00_b9d0));
+        // ...and a deeper one must.
+        db.record("aaa", "GAME", &m, Some(0x8c00_b000), false);
+        assert_eq!(db.get("aaa").unwrap().sp_min, Some(0x8c00_b000));
+    }
+
+    /// A row written before this column existed reads back as "not measured",
+    /// not as a stack pointer of zero -- which would rule out every low base
+    /// for every game already in the file.
+    #[test]
+    fn a_row_without_the_column_is_unmeasured_not_zero() {
+        let dir = std::env::temp_dir().join("dcload-memmap-spmin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("game-memory.tsv");
+        let blocks = MemoryMap::new().to_hex();
+        std::fs::write(&path, format!("aaa\tOLD ROW\t{blocks}\t3\n")).unwrap();
+        let db = MemoryDb::load(&path);
+        let row = db.get("aaa").expect("the old row still parses");
+        assert_eq!(row.sessions, 3);
+        assert_eq!(row.sp_min, None);
+
+        // And it round-trips once something has been measured.
+        let mut db = MemoryDb::default();
+        db.record("aaa", "OLD ROW", &MemoryMap::new(), Some(0x8c00_b9d0), false);
+        db.save(&path).unwrap();
+        assert_eq!(
+            MemoryDb::load(&path).get("aaa").unwrap().sp_min,
+            Some(0x8c00_b9d0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn saving_keeps_rows_another_session_added() {
         let dir = std::env::temp_dir().join("dcload-memmap-test");
@@ -725,14 +846,14 @@ mod tests {
         let mut theirs = MemoryDb::default();
         let mut m = MemoryMap::new();
         m.mark(0x8ce0_0000, 16);
-        theirs.record("aaa", "THEIR GAME", &m, true);
+        theirs.record("aaa", "THEIR GAME", &m, None, true);
         theirs.save(&path).unwrap();
 
         // Ours knows nothing of "aaa" and must not drop it.
         let mut ours = MemoryDb::default();
         let mut n = MemoryMap::new();
         n.mark(0x8cfc_0000, 16);
-        ours.record("bbb", "OUR GAME", &n, true);
+        ours.record("bbb", "OUR GAME", &n, None, true);
         ours.save(&path).unwrap();
 
         let back = MemoryDb::load(&path);
