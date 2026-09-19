@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, FileTimes, FileType, Metadata, OpenOptions, ReadDir},
+    fs::{self, File, FileTimes, FileType, OpenOptions, ReadDir},
     io::{Read, Seek, SeekFrom, Write},
     path::{self, Component, Path, PathBuf},
     time::{Duration, SystemTime},
@@ -599,7 +599,10 @@ fn dirent_filetype_to_int(filetype: FileType) -> u8 {
     0
 }
 
-fn filemeta_to_int(file_meta: &Metadata) -> i32 {
+/// `st_mode` where the platform has none to give (Unix reads it from the
+/// metadata directly).
+#[cfg(not(target_family = "unix"))]
+fn filemeta_to_int(file_meta: &std::fs::Metadata) -> i32 {
     if file_meta.is_dir() {
         return 0o040755;
     }

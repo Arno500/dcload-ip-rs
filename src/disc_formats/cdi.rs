@@ -441,11 +441,15 @@ impl DiscFormat for Cdi {
         let mut out = vec![0u8; (num_sectors as usize) * RAW_SECTOR_SIZE];
         for (i, chunk) in out.chunks_mut(RAW_SECTOR_SIZE).enumerate() {
             let want = lba.saturating_add(i as u32);
-            let track = self
-                .tracks
-                .iter()
-                .find(|t| t.contains(want))
-                .ok_or_else(|| format!("CDDA LBA {want} is in no track of this CDI"))?;
+            let Some(track) = self.tracks.iter().find(|t| t.contains(want)) else {
+                // Between two tracks: the next one's pregap, which a play range
+                // running to that track's start covers. Silence, as in the GDI
+                // reader; only past the last track is it an error.
+                if self.tracks.iter().any(|t| t.start_lba > want) {
+                    continue;
+                }
+                return Err(format!("CDDA LBA {want} is in no track of this CDI").into());
+            };
             if track.mode != 0 {
                 return Err(format!(
                     "CDDA read at LBA {want} lands on a data track (mode {})",

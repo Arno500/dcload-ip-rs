@@ -9,6 +9,7 @@ use clap_num::maybe_hex;
 extern crate log;
 
 mod cmds;
+mod adpcm;
 mod cd;
 mod diag;
 mod fs;
@@ -17,6 +18,8 @@ mod dispatch;
 mod io;
 mod loaders;
 mod memmap;
+mod patchdb;
+mod ppf;
 mod presets;
 mod stackwatch;
 mod types;
@@ -104,6 +107,38 @@ struct Args {
     #[arg(long, value_parser = parse_patch)]
     patch: Vec<(u32, u32)>,
 
+    /// Apply this PPF patch to the boot binary before uploading it.
+    /// Repeatable, and it works on a plain binary as well as on a disc image.
+    ///
+    /// A PPF is how the scene ships a patch nobody can derive from the code --
+    /// a 60 Hz or VGA path a PAL release was built without, say, which is a
+    /// different piece of work in every title and so is the one thing `--vga`
+    /// cannot do for you. The bytes go into the payload before it is uploaded,
+    /// so what runs is what was verified on the way over, and the changed words
+    /// join the reload guard in case the title reads its own image back off the
+    /// disc.
+    ///
+    /// A patch that carries a blockcheck and does not match this image is
+    /// REFUSED: its offsets mean something else here, and applying it would
+    /// write correct bytes into the wrong instructions.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    ppf: Vec<String>,
+
+    /// Do not apply the shipped patch library (`patches/patches.tsv`).
+    ///
+    /// The A/B switch: a title that misbehaves patched and behaves unpatched
+    /// costs one run to tell apart. `--ppf` still works -- an off-switch for
+    /// the mapping list has no business discarding a file named by hand.
+    #[arg(long)]
+    no_ppf: bool,
+
+    /// Directory of shipped PPF patches and their `patches.tsv` mapping list.
+    /// Defaults to $DCLOAD_PATCH_DIR, else `patches/` beside the loaders, else
+    /// in this project's root -- the same search as game-presets.tsv, so the
+    /// whole set is one deployment.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    patch_dir: Option<String>,
+
     /// Do not neutralise a title's GAPS-bridge probe.
     ///
     /// By default the host looks in the uploaded image for the signature a
@@ -147,6 +182,15 @@ struct Args {
     #[arg(long)]
     no_cdda: bool,
 
+    /// Serve a synthetic two-tone triangle instead of the disc's audio tracks:
+    /// 344.5 Hz in the left ear, 689.1 Hz in the right.
+    ///
+    /// Replaces only the disc read: the encoder, the network and the loader
+    /// still run. A clean tone clears all of those and leaves this host's
+    /// reading of the image as the suspect.
+    #[arg(long, conflicts_with = "no_cdda")]
+    cdda_tone: bool,
+
     /// Place a "phone home" probe at ADDR that reports through dcload's own
     /// syscall trampoline: `--probe 0x8c110bec=37` makes the console log
     /// `Write(1, .., 37)` the moment that address is executed. ID is 1..127
@@ -157,12 +201,12 @@ struct Args {
     /// "the probe fired" and "the probe was never reached" are the same dead
     /// console. This path belongs to the loader, needs no vector table, and
     /// says so in the log. The stub destroys 28 bytes at ADDR and parks there.
-    /// Where to read and write the learned memory map (game-memory.tsv)
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    memory_db: Option<String>,
-
     #[arg(long, value_parser = parse_probe)]
     probe: Vec<(u32, u8, Option<u32>)>,
+
+    /// Where to read and write the learned memory map (game-memory.tsv).
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    memory_db: Option<String>,
 
     /// What to do about a SCRAMBLED boot binary.
     ///
@@ -211,9 +255,26 @@ struct Args {
     ///
     /// The panel pages with the arrow keys and PgUp/PgDn -- it pages rather
     /// than scrolls so that a counter never moves between columns; `a` shows
-    /// the counters still at zero, `+`/`-` change the sampling rate and `d`
-    /// folds it away. It never enters the terminal's scrollback, so selecting
-    /// the log above it copies the log alone.
+    /// the counters still at zero and `+`/`-` change the sampling rate. It
+    /// never enters the terminal's scrollback, so selecting the log above it
+    /// copies the log alone.
+    ///
+    /// `w` WRITES A SNAPSHOT, and it is the only sane way to get the numbers
+    /// off the machine. The panel is redrawn on every sample and again before
+    /// every log record, and a terminal drops a selection whenever the cells
+    /// under it change -- so selecting it is a race nobody wins. `w` prints the
+    /// whole set as plain text above the live region, where it never moves
+    /// again, and appends the same text to `dcload-diag.txt`. Zeros included:
+    /// in a paste of the panel, "absent" and "zero" look identical.
+    ///
+    /// `d` TURNS THE WHOLE THING ON AND OFF, AT ANY MOMENT, and this flag only
+    /// decides which state a session starts in -- so it is not needed to get
+    /// the panel, only to have it up from the first second. Off means off: no
+    /// sample is asked for, which matters because each one is a round trip
+    /// dcload answers from inside `bb->loop()`, i.e. from inside the very
+    /// window anyone measuring a title's stutter is trying to measure. While
+    /// the panel is off the stack watch has the wire instead, as it does in a
+    /// session that never asks for either.
     #[arg(long)]
     diag: bool,
 
@@ -409,6 +470,7 @@ fn pick_clear_base(
     let is_clear = |b: u32| {
         dispatch::literals_in_loader_footprint(boot, address, b).is_empty()
             && low_base_has_stack_headroom(loaders, b, sp_min)
+            && low_loader_painted_by_title(loaders, boot, address, b).is_none()
     };
     choose(loaders, wanted, &is_clear)
 }
@@ -433,6 +495,7 @@ fn base_is_clear(
     dispatch::literals_in_loader_footprint(boot, address, base).is_empty()
         && !map_hits_loader(base, seen, margin)
         && low_base_has_stack_headroom(loaders, base, sp_min)
+        && low_loader_painted_by_title(loaders, boot, address, base).is_none()
 }
 
 /// Does a loader at `base` fit under this title's stack?
@@ -473,6 +536,50 @@ fn stack_headroom_ok(base: u32, image_end: Option<u32>, sp_min: Option<u32>) -> 
         return true;
     };
     sp.saturating_sub(end) >= loaders::LOW_BASE_MIN_MARGIN
+}
+
+/// Does the title's own code fill RAM a LOW loader's image sits in?
+/// `(lo, hi, site, image_end)` of the first fill that does.
+///
+/// THE STACK TEST'S BLIND SPOT, AND A WORSE ONE THAN DEPTH. `sp_min` is where
+/// the title's stack pointer was when it called the GD driver; a Katana title
+/// paints its whole BIOS stack, 0x8c00c000..0x8c00f400, before it calls
+/// anything (`dispatch::constant_range_fills`). Snow Surfers entered GD
+/// syscalls no lower than 0x8c00e460 -- 6424 bytes over a loader at 0x8c004000,
+/// a pass -- and had already written "SEGA" over that loader's `.data` and
+/// `.bss`, so the run ended in the BIOS menu (2026-09-17).
+///
+/// Only the image counts, `base.._end`: everything a low loader keeps above
+/// `_end` is its own stack, which the title owns from EXEC on anyway. A high
+/// base is answered by `literals_in_loader_footprint`, which does not skip its
+/// footprint; this scan is only asked where that one looks away, which also
+/// keeps it off the relocation walk's dozens of high candidates.
+fn low_loader_painted_by_title(
+    loaders: &loaders::LoaderSet,
+    boot: &[u8],
+    address: u32,
+    base: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if loaders::is_high(base) {
+        return None;
+    }
+    let end = loaders.image_end_for(base)?;
+    fill_over_image(base, end, &dispatch::constant_range_fills(boot, address))
+        .map(|(lo, hi, site)| (lo, hi, site, end))
+}
+
+/// The overlap on its own, so the Snow Surfers numbers can be a test.
+fn fill_over_image(base: u32, end: u32, fills: &[(u32, u32, u32)]) -> Option<(u32, u32, u32)> {
+    fills.iter().copied().find(|&(lo, hi, _)| lo < end && base < hi)
+}
+
+/// `low_loader_painted_by_title`'s finding as the clause every caller logs.
+fn painted_reason(base: u32, (lo, hi, site, end): (u32, u32, u32, u32)) -> String {
+    format!(
+        "its startup code fills 0x{lo:08x}..0x{hi:08x} (the loop at 0x{site:08x}), while a \
+         loader at 0x{base:08x} ends at 0x{end:08x}: the loader's data would be overwritten \
+         before the title's first disc read"
+    )
 }
 
 /// Is the low family contested for this title BY THE DATABASE ITSELF?
@@ -518,18 +625,25 @@ fn low_family_contested(
 /// stack, that rules it out -- so nothing has been said against the high
 /// options at all.
 ///
-/// So the seed is `ISOLDR_HIGH_ADDR`: DreamShell's own second choice, the
-/// address it moves isoldr to when low RAM is not workable, and the one 119
-/// presets use. It is checked like any other candidate -- Sonic Adventure 2's
-/// preset is that very address and its Maple DMA list rules it out.
+/// So for a title in the database the seed is `ISOLDR_HIGH_ADDR`: DreamShell's
+/// own second choice, the address it moves isoldr to when low RAM is not
+/// workable, and the one 119 presets use. It is checked like any other
+/// candidate -- Sonic Adventure 2's preset is that very address and its Maple
+/// DMA list rules it out.
+///
+/// A title the database does not know has no such opinion behind it, and is
+/// seeded from `SCRATCH_BASE` instead: one chainload from the disc's stock
+/// base, and where Snow Surfers ran every CD-DA session on the console. From
+/// `ISOLDR_HIGH_ADDR` its search landed on 0x8cfd0000, which nobody has run.
 fn base_off_the_low_family(
     loaders: &loaders::LoaderSet,
     boot: &[u8],
     address: u32,
     seen: Option<&memmap::MemoryMap>,
     sp_min: Option<u32>,
+    seed: u32,
 ) -> Option<u32> {
-    let high = loaders::ISOLDR_HIGH_ADDR;
+    let high = seed;
     // SAY WHY THE SEED WAS NOT TAKEN. It is the one address in this branch that
     // anybody has an opinion about -- DreamShell's, and 119 presets' -- so
     // "something else was used instead" without a reason is the line a reader
@@ -845,20 +959,30 @@ fn wanted_loader_base(
     // log gave no way to tell. The set is deployed by hand (AGENTS.md 16), so
     // "which loaders were actually there" is a real question with a silent
     // wrong answer.
-    info!(
-        "loader candidates in {}: {}",
-        loaders.dir().display(),
-        if loaders.available().is_empty() {
-            "none".to_string()
-        } else {
-            loaders
-                .available()
-                .iter()
-                .map(|b| format!("0x{b:08x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+    //
+    // AND IT MUST COUNT THE RELOCATABLE IMAGE, which is the whole set today.
+    // This listed pre-linked `dcload-0x<base>.elf` files only, so once
+    // LOADER_BASES was emptied (2026-09-04) it reported "none" for every
+    // directory including the ones it was about to load from -- a line whose
+    // entire purpose is to answer "which loaders were actually there" giving
+    // the one answer that is never right. "none" now means nothing is there.
+    info!("loader candidates in {}: {}", loaders.dir().display(), {
+        let mut parts: Vec<String> = loaders
+            .available()
+            .iter()
+            .map(|b| format!("0x{b:08x}"))
+            .collect();
+        if loaders.relocatable().is_some() {
+            parts.push("relocatable (any base)".to_string());
         }
-    );
+        if parts.is_empty() {
+            "none -- no dcload-0x<base>.elf and no dcload-relocatable.elf; \
+             run `make loaders` and copy them here"
+                .to_string()
+        } else {
+            parts.join(", ")
+        }
+    });
     let memory_path = memory_db_path(args, &loaders);
     let seen_db = memmap::MemoryDb::load(&memory_path);
     let seen = seen_db.get(&identity.md5).map(|r| r.map);
@@ -906,6 +1030,42 @@ fn wanted_loader_base(
         ) {
             info!("keeping the loader where it is, at 0x{running:08x}");
             return None;
+        }
+        // A LOW-FAMILY VERDICT GOES TO THE HIGH FAMILY, as it does for a preset.
+        // `pick_clear_base` never crosses families, so from the stock base it
+        // found nothing and the loader stayed where Snow Surfers paints its
+        // stack (2026-09-17).
+        let painted = low_loader_painted_by_title(&loaders, &boot, args.address, running);
+        if painted.is_some() || !low_base_has_stack_headroom(&loaders, running, sp_min) {
+            match painted {
+                Some(p) => warn!(
+                    "'{}' is not in the database, and {}. Leaving the low family.",
+                    identity.title,
+                    painted_reason(running, p)
+                ),
+                None => warn!(
+                    "'{}' is not in the database, and its stack has been measured coming \
+                     within {} bytes of a loader at 0x{running:08x}. Leaving the low family.",
+                    identity.title,
+                    loaders::LOW_BASE_MIN_MARGIN
+                ),
+            }
+            let alt = base_off_the_low_family(
+                &loaders,
+                &boot,
+                args.address,
+                seen.as_ref(),
+                sp_min,
+                loaders::SCRATCH_BASE,
+            );
+            if alt.is_none() {
+                error!(
+                    "'{}': nothing clear of the low family could be produced, so the loader \
+                     stays at 0x{running:08x}, where this title overwrites it.",
+                    identity.title
+                );
+            }
+            return alt;
         }
         warn!(
             "'{}' is not in the database, and 0x{running:08x} -- where the loader \
@@ -993,7 +1153,13 @@ fn wanted_loader_base(
     // `low_base_has_stack_headroom`.
     let contested = low_family_contested(&db, &identity, preset);
     let no_headroom = !low_base_has_stack_headroom(&loaders, preset.memory, sp_min);
-    if hits.is_empty() && !seen_hits_preset && contested.is_none() && !no_headroom {
+    let painted = low_loader_painted_by_title(&loaders, &boot, args.address, preset.memory);
+    if hits.is_empty()
+        && !seen_hits_preset
+        && contested.is_none()
+        && !no_headroom
+        && painted.is_none()
+    {
         return Some(preset.memory);
     }
 
@@ -1002,7 +1168,14 @@ fn wanted_loader_base(
     // same 0x8c004000..0x8c00f400 hole with the title's stack, so moving a few
     // kilobytes inside it buys nothing -- which is exactly what the ordinary
     // search would try, since it never crosses families on purpose.
-    if contested.is_some() || no_headroom {
+    if contested.is_some() || no_headroom || painted.is_some() {
+        if let Some(p) = painted {
+            warn!(
+                "'{}': {}. Leaving the low family.",
+                preset.title,
+                painted_reason(preset.memory, p)
+            );
+        }
         if let Some(votes) = contested.as_ref() {
             warn!(
                 "'{}': the database's presets for this title disagree -- {} -- and one of \
@@ -1044,6 +1217,7 @@ fn wanted_loader_base(
             args.address,
             seen.as_ref(),
             sp_min,
+            loaders::ISOLDR_HIGH_ADDR,
         ) {
             Some(alt) => {
                 warn!(
@@ -1151,6 +1325,22 @@ enum Commands {
         #[arg(value_hint = clap::ValueHint::FilePath)]
         file: String,
     },
+    /// Scan a disc image's audio tracks for discontinuities. Touches no network.
+    ///
+    /// Prints the track table, then checks every audio track for large
+    /// sample-to-sample steps. Loud music has many, spread evenly; a defect in
+    /// the dump or the reader puts them at one offset inside a sector, and only
+    /// that is reported as a problem, with the bands of LBAs it occurs in.
+    AuditAudio {
+        /// Disc image (.gdi / .cdi / .iso / .zip)
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        disc: String,
+
+        /// Scan only this track number. Default: every audio track, which on a
+        /// GD-ROM is most of the disc and takes a while.
+        #[arg(long)]
+        track: Option<u8>,
+    },
     /// Write a disc image's boot binary out to a file.
     ///
     /// Touches no network. Mostly a way to check what `uexec <image>` is going
@@ -1201,7 +1391,72 @@ enum Commands {
     },
 }
 
-/// `identify`: everything the loader-placement pass would work out, printed.
+/// The link's own round-trip time, measured on an idle console.
+///
+/// The baseline other latencies are read against: the host times its own half
+/// of a disc or audio request, and this says what the link adds. One SendBinQ
+/// of four bytes, out and back, while the console is idle (after the upload,
+/// before EXEC).
+///
+/// `ping` cannot do this job even though dcload answers ICMP (`net.c`,
+/// `process_icmp`): the loader only looks at the wire from inside `bb->loop()`,
+/// so once a title is running a reply waits for the next disc or audio fetch --
+/// up to 40 ms of the loader's own scheduling, reported as though it were the
+/// link.
+///
+/// FIVE, AND THE MINIMUM IS REPORTED. A UDP round trip has a floor and a tail;
+/// the floor is what the link is capable of, and it is the floor a per-fetch
+/// cost should be compared with.
+fn measure_rtt(conn: &mut DcIoUDP, base: u32) -> Option<std::time::Duration> {
+    let mut best: Option<std::time::Duration> = None;
+
+    // START FROM AN EMPTY SOCKET. The console is idle here -- this runs after
+    // the upload and the patches and before EXEC, so nothing is waiting on an
+    // answer and anything already buffered is a leftover. It is not
+    // hypothetical: the PPF patch verification logs "Received non-DBIN packets
+    // while waiting for DoneBinary response" immediately before this, and that
+    // straggler used to be consumed by the first of these reads, putting all
+    // five one answer out of phase and leaving one more behind for whoever read
+    // next -- which was verify_image(), and which is what disabled --diag.
+    //
+    // Draining is safe HERE and nowhere else on this path: while a title runs,
+    // a packet from the Dreamcast is a syscall request it is blocked waiting to
+    // have answered, and discarding one would freeze it.
+    for _ in 0..32 {
+        use crate::io::ExternalDcIo as _;
+        match conn.poll(Some(std::time::Duration::ZERO)) {
+            Ok(evt) if !evt.is_empty() => {
+                let _ = conn.handle_data(&evt);
+            }
+            _ => break,
+        }
+    }
+
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        if dispatch::receive_data(conn, Some(std::time::Duration::from_millis(500)), base, 4, true)
+            .is_err()
+        {
+            continue;
+        }
+        let dt = t0.elapsed();
+        best = Some(best.map_or(dt, |b: std::time::Duration| b.min(dt)));
+    }
+    best
+}
+
+/// Loud when the session asked for the instrument, quiet when it did not.
+///
+/// `start_diag` runs in every session now, so its "could not" lines would
+/// otherwise be a warning about something nobody requested.
+fn note(loud: bool, msg: String) {
+    if loud {
+        warn!("{msg}");
+    } else {
+        debug!("{msg}");
+    }
+}
+
 /// Bring up the counter panel, or say why there is none.
 ///
 /// EVERY FAILURE HERE IS A WARNING. This is an instrument bolted onto a session
@@ -1211,17 +1466,27 @@ enum Commands {
 ///
 /// Run BEFORE the title is executed, where a blocking round trip costs nothing
 /// and where the log lines it prints are still readable above the panel.
+///
+/// BUILT IN EVERY SESSION, not only under `--diag`, because `d` can ask for the
+/// panel at any moment and none of this can be done once a title is running:
+/// the image check below is a blocking round trip, and the console stops
+/// answering promptly the moment it has something better to do. Without
+/// `--diag` it starts switched off, and every failure here drops to `debug`:
+/// nobody asked, so nothing is missing.
 fn start_diag(
     args: &Args,
     conn: &mut DcIoUDP,
     running_base: Option<u32>,
     recorder: Option<std::sync::Arc<std::sync::Mutex<memmap::MemoryRecorder>>>,
 ) -> Option<diag::Probe> {
+    let asked = args.diag;
     let Some(base) = running_base else {
-        warn!(
+        note(
+            asked,
             "--diag needs a loader that reports its own load address, and this one \
              does not: without it there is no way to know which ELF the counters \
              live in. Rebuild dcload-ip and re-burn its boot image."
+                .into(),
         );
         return None;
     };
@@ -1234,16 +1499,19 @@ fn start_diag(
     let (elf, label) = match loaders.image_for(base) {
         Ok(v) => v,
         Err(e) => {
-            warn!("--diag: no loader ELF to read the counter addresses out of: {e}");
+            note(
+                asked,
+                format!("--diag: no loader ELF to read the counter addresses out of: {e}"),
+            );
             return None;
         }
     };
     if let Err(e) = diag::verify_image(conn, &elf, &label) {
-        warn!("--diag disabled: {e}");
+        note(asked, format!("--diag disabled: {e}"));
         return None;
     }
     let interval = std::time::Duration::from_secs_f64(args.diag_interval.clamp(0.25, 30.0));
-    match diag::Probe::new(&elf, label, interval) {
+    match diag::Probe::new(&elf, label, interval, asked) {
         Ok(mut probe) => {
             // The panel's range contains the two stack counters, so it is the
             // one that reads them while it is up -- see `Probe::stack`.
@@ -1256,17 +1524,25 @@ fn start_diag(
             // `diag::SampleSink`.
             probe.install(conn);
             let (lo, span) = probe.span();
-            info!(
-                "diag: {} counters from {} (image verified), {span} bytes at \
-                 0x{lo:08x} every {:.1} s",
-                probe.counter_count(),
-                probe.label(),
-                interval.as_secs_f64(),
-            );
+            if asked {
+                info!(
+                    "diag: {} counters from {} (image verified), {span} bytes at \
+                     0x{lo:08x} every {:.1} s -- d to stop",
+                    probe.counter_count(),
+                    probe.label(),
+                    interval.as_secs_f64(),
+                );
+            } else {
+                info!(
+                    "diag: {} counters ready from {} -- press d to sample them",
+                    probe.counter_count(),
+                    probe.label(),
+                );
+            }
             Some(probe)
         }
         Err(e) => {
-            warn!("--diag disabled: {e}");
+            note(asked, format!("--diag disabled: {e}"));
             None
         }
     }
@@ -1325,6 +1601,7 @@ fn start_stack_watch(
     }
 }
 
+/// `identify`: everything the loader-placement pass would work out, printed.
 fn identify_only(args: &Args, disc: &str) -> ExitCode {
     let reader = match dispatch::open_disc(disc) {
         Ok(d) => d,
@@ -1414,6 +1691,44 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         }
     );
 
+    // WHAT THE PATCH LIBRARY WOULD DO, and the one place it can be checked for
+    // free. A PPF that does not fit is a fact about two files and nothing else,
+    // so finding it out here costs a command; finding it out on hardware costs
+    // a title that boots and then behaves strangely, which is the hardest thing
+    // in this project to attribute to anything.
+    match boot_bytes.as_deref() {
+        Some(boot) => {
+            let plan = patch_plan(args, boot, Some(&identity.md5));
+            let line = |c: &patchdb::Chosen, what: &str| {
+                let mut out = format!("{what} {}", c.describe());
+                if let Some(first) = c.note.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    out.push_str(&format!("\n           {first}"));
+                }
+                out
+            };
+            let mut said = false;
+            for c in &plan.apply {
+                println!("patch    : {}", line(c, "WOULD APPLY"));
+                said = true;
+            }
+            for c in &plan.offer {
+                println!("patch    : {}", line(c, "available (--ppf)"));
+                said = true;
+            }
+            for p in &plan.problems {
+                println!("patch    : {p}");
+                said = true;
+            }
+            if !said {
+                println!(
+                    "patch    : no PPF patch listed or found for this dump ({})",
+                    plan.summary
+                );
+            }
+        }
+        None => println!("patch    : no boot binary, so no PPF patch could be checked"),
+    }
+
     let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
 
     // Does the title address the RAM the loader would be sitting in? Answered
@@ -1460,6 +1775,33 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             "stack    : never measured -- no session has read this title's GD stack \
              pointer back off the console"
         ),
+    }
+    // What the title writes before it calls anything, which the stack line
+    // above cannot see. See `low_loader_painted_by_title`.
+    let painted_at = |base: u32| {
+        boot_bytes
+            .as_deref()
+            .and_then(|b| low_loader_painted_by_title(&loaders, b, args.address, base))
+    };
+    if let Some(bytes) = boot_bytes.as_deref() {
+        let fills = dispatch::constant_range_fills(bytes, args.address);
+        match (painted_at(loaders::DEFAULT_BASE), fills.first()) {
+            (Some(p), _) => println!(
+                "startup  : {} -- NO LOW BASE",
+                painted_reason(loaders::DEFAULT_BASE, p)
+            ),
+            (None, Some(&(lo, hi, site))) => println!(
+                "startup  : fills 0x{lo:08x}..0x{hi:08x} (the loop at 0x{site:08x}){}; clear \
+                 of a loader at 0x{:08x}",
+                if fills.len() > 1 {
+                    format!(" and {} other constant range(s)", fills.len() - 1)
+                } else {
+                    String::new()
+                },
+                loaders::DEFAULT_BASE
+            ),
+            (None, None) => println!("startup  : no fill of a constant range found"),
+        }
     }
     let report_collisions = |base: u32| {
         let Some(bytes) = boot_bytes.as_deref() else {
@@ -1513,6 +1855,41 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             db_searched
         ),
         Ok(db) => match db.lookup(&identity) {
+            None if painted_at(loaders::DEFAULT_BASE).is_some()
+                || !low_base_has_stack_headroom(&loaders, loaders::DEFAULT_BASE, sp_min) =>
+            {
+                // The same branch `uexec` takes for a title the database does
+                // not know, from the stock base the CD boots at.
+                match boot_bytes.as_deref().and_then(|b| {
+                    base_off_the_low_family(
+                        &loaders,
+                        b,
+                        args.address,
+                        seen.as_ref(),
+                        sp_min,
+                        loaders::SCRATCH_BASE,
+                    )
+                }) {
+                    Some(alt) => {
+                        println!(
+                            "preset   : not in the database ({} rows); would leave 0x{:08x} \
+                             for 0x{alt:08x}, off the low family",
+                            db.len(),
+                            loaders::DEFAULT_BASE
+                        );
+                        report_collisions(alt);
+                    }
+                    None => {
+                        println!(
+                            "preset   : not in the database ({} rows); nothing clear of the \
+                             low family, so it would stay at 0x{:08x} and be overwritten",
+                            db.len(),
+                            loaders::DEFAULT_BASE
+                        );
+                        report_collisions(loaders::DEFAULT_BASE);
+                    }
+                }
+            }
             None => {
                 println!(
                     "preset   : not in the database ({} rows); would stay at 0x{:08x}",
@@ -1565,6 +1942,8 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 // and is the one the preset rules out.
                 let contested = low_family_contested(&db, &identity, &p);
                 let no_headroom = !low_base_has_stack_headroom(&loaders, p.memory, sp_min);
+                // Already said on the `startup` line.
+                let painted = painted_at(p.memory).is_some();
                 if loaders::known_unsupported(p.memory).is_some() {
                     match boot_bytes.as_deref().and_then(|b| {
                         base_for_low_preset(&loaders, b, args.address, seen.as_ref(), sp_min)
@@ -1583,8 +1962,8 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                              loader would stay where it is"
                         ),
                     }
-                } else if contested.is_some() || no_headroom {
-                    // THE SAME TWO PREDICATES `uexec` APPLIES, so the offline
+                } else if contested.is_some() || no_headroom || painted {
+                    // THE SAME PREDICATES `uexec` APPLIES, so the offline
                     // report cannot come to a different answer than a run.
                     if let Some(votes) = contested.as_ref() {
                         println!(
@@ -1608,7 +1987,14 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         );
                     }
                     match boot_bytes.as_deref().and_then(|b| {
-                        base_off_the_low_family(&loaders, b, args.address, seen.as_ref(), sp_min)
+                        base_off_the_low_family(
+                            &loaders,
+                            b,
+                            args.address,
+                            seen.as_ref(),
+                            sp_min,
+                            loaders::ISOLDR_HIGH_ADDR,
+                        )
                     }) {
                         Some(alt) => {
                             println!(
@@ -1726,6 +2112,90 @@ fn game_db_path(args: &Args, loaders: &loaders::LoaderSet) -> (std::path::PathBu
     (chosen, searched)
 }
 
+/// Everything the patch library has to say about this image, worked out once.
+///
+/// Split out from applying it so `identify` can print the same answer with no
+/// console attached -- which is where it is worth the most: a patch that does
+/// not fit is a fact about two files, and finding it out offline costs one
+/// command instead of a session.
+fn patch_plan(args: &Args, payload: &[u8], disc_md5: Option<&str>) -> patchdb::Plan {
+    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
+    let db = patchdb::PatchDb::discover(args.patch_dir.clone(), loaders.dir());
+    patchdb::plan(&db, disc_md5, payload, &args.ppf, !args.no_ppf)
+}
+
+/// Patch the payload in place, and hand back the words a reload has to undo.
+///
+/// BEFORE THE UPLOAD, on purpose. The alternative -- poking the words in
+/// afterwards, as `--patch` does -- costs a round trip each and, worse, puts
+/// the bytes outside everything that checks the transfer: the read-back
+/// verification would compare the console against an image the host itself no
+/// longer agrees with. Patching the buffer means what is uploaded is what runs
+/// and what was verified, and the scans that follow (`literals_in_loader_footprint`,
+/// the GAPS probe, the cable check) all look at the code that will actually
+/// execute.
+///
+/// The returned words are for `dispatch::receive_syscalls`' reload guard. A
+/// title is free to read its own binary back off the disc, and one that does
+/// would otherwise undo the patch several seconds into its own start-up --
+/// silently, since nothing on either side is watching those bytes.
+fn apply_ppf_patches(
+    args: &Args,
+    payload: &mut [u8],
+    identity: Option<&presets::DiscIdentity>,
+) -> Vec<(u32, u32)> {
+    let plan = patch_plan(args, payload, identity.map(|i| i.md5.as_str()));
+    for p in &plan.problems {
+        error!("{p}");
+    }
+    let mut guard = Vec::new();
+    for chosen in &plan.apply {
+        let applied = match chosen.ppf.apply(payload) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("{}: {e}", chosen.name);
+                continue;
+            }
+        };
+        if applied.already_applied() {
+            info!(
+                "{} is already applied to this image -- nothing to do",
+                chosen.describe()
+            );
+            continue;
+        }
+        info!("patching the title with {}", chosen.describe());
+        if !chosen.note.is_empty() {
+            info!("    {}", chosen.note.lines().next().unwrap_or_default().trim());
+        }
+        for c in applied.changed.iter().take(16) {
+            info!(
+                "    0x{:06x}: {:02x} -> {:02x}  (0x{:08x} in RAM)",
+                c.offset,
+                c.from,
+                c.to,
+                args.address.wrapping_add(c.offset as u32)
+            );
+        }
+        if applied.changed.len() > 16 {
+            info!("    ... and {} more bytes", applied.changed.len() - 16);
+        }
+        guard.extend(patchdb::guard_words(&applied.changed, payload, args.address));
+    }
+    // Said even when nothing was applied: "there is a patch for this game and
+    // it is not on" is exactly what somebody staring at a black screen needs,
+    // and it is one line.
+    for chosen in &plan.offer {
+        info!(
+            "a patch is AVAILABLE and was not applied: {} -- pass --ppf to use it",
+            chosen.describe()
+        );
+    }
+    guard.sort_unstable();
+    guard.dedup();
+    guard
+}
+
 /// Where the learned memory map is read from and written back to.
 fn memory_db_path(args: &Args, loaders: &loaders::LoaderSet) -> std::path::PathBuf {
     let exe = std::env::current_exe().ok();
@@ -1805,6 +2275,41 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     } = args.command
     {
         return Ok(extract_only(&args, disc, output.as_deref()));
+    }
+    if let Commands::AuditAudio { ref disc, track } = args.command {
+        let reader = match dispatch::open_disc(disc) {
+            Ok(d) => d,
+            Err(reason) => {
+                error!("{reason}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        return Ok(match dispatch::audit_audio(reader.as_ref(), track) {
+            Ok(0) => {
+                info!(
+                    "no ALIGNED discontinuity in this image's audio: every track's big \
+                     steps are spread evenly inside a sector, which is what loud music \
+                     looks like. Big steps on their own prove nothing -- a full-scale \
+                     44.1 kHz signal may legally step by 65534 between samples, and this \
+                     test was measured blind to a spliced ring, so only the alignment is \
+                     evidence."
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(n) => {
+                warn!(
+                    "{n} step(s) in this image's audio land at ONE offset inside a \
+                     sector. Music is aligned to nothing, so that is damage in the dump \
+                     or a fault in this reader -- the tracks and offsets are listed \
+                     above, and the same stretch will crackle however it is played."
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                ExitCode::FAILURE
+            }
+        });
     }
 
     let legacy_mode = protocol_version()[0] < 2;
@@ -1891,12 +2396,24 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // loader, so a title uploaded first would be uploaded into an image that is
     // about to be overwritten -- and the game's own RAM is zero-filled by the
     // loader that comes up.
+    //
+    // AND "STAY WHERE YOU ARE" STILL GOES THROUGH ensure_loader_base. It used
+    // to return early on None, so a session told to use a particular loader set
+    // never checked that the loader on the console came from it -- and a
+    // rebuilt set at the same address was silently not picked up. Measured
+    // 2026-09-04: a run with `--loader-dir loaders-tone` kept the ADPCM loader
+    // already at 0x8ce00000 and played the music exactly as before, which is
+    // the one outcome that experiment could not tell apart from a result. The
+    // evidence was in the log, twice, phrased as an instrument failing rather
+    // than as the wrong loader running. `want == running` costs one round trip
+    // and no upload when the image already matches.
     if matches!(args.command, Commands::UExec { .. })
         && let Some(want) = wanted_loader_base(
             &args,
             running_base,
             disc_reader.as_deref().zip(redirect_disc.as_deref()),
         )
+        .or(running_base)
     {
         match running_base {
             Some(base) => {
@@ -1930,13 +2447,25 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             let payload_disc = disc_reader
                 .as_deref()
                 .filter(|_| redirect_disc.as_deref() == Some(file.as_str()));
-            let (payload, label) = match resolve_payload(&args, file, payload_disc) {
+            let (mut payload, label) = match resolve_payload(&args, file, payload_disc) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("{e}");
                     return Ok(ExitCode::FAILURE);
                 }
             };
+            // Which dump this is, computed once and used twice: the patch
+            // library keys on it, and so does the learned memory map further
+            // down. Reading the boot sector twice would cost nothing; having
+            // two answers to "what game is this" would.
+            let identity = disc_reader
+                .as_deref()
+                .zip(redirect_disc.as_deref())
+                .and_then(|(d, p)| dispatch::identify(d, p).ok());
+            // BEFORE the upload, so what goes over the wire is what runs --
+            // see `apply_ppf_patches`. These words join the GAPS and cable
+            // guards below, because a title can reload its own image.
+            let ppf_guard = apply_ppf_patches(&args, &mut payload, identity.as_ref());
             let has_disc = redirect_disc.is_some();
             match dispatch::upload_bytes(
                 &mut udpsender,
@@ -2098,7 +2627,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         warn!("could not force the cable check to VGA: {e}");
                     }
                 }
-                let guards = [gaps_guard, vga_guard].concat();
+                let guards = [gaps_guard, vga_guard, ppf_guard].concat();
                 // Last, so a patch always wins over the bytes it replaces --
                 // whether they came from the title, from IP.BIN, or from both.
                 if !args.patch.is_empty()
@@ -2116,10 +2645,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // hand: from here on the reader belongs to the syscall loop.
                 // A title with no identity records nothing rather than filing
                 // its map under a name that could be any dump.
-                let memory_recorder = disc_reader
-                    .as_deref()
-                    .zip(redirect_disc.as_deref())
-                    .and_then(|(d, p)| dispatch::identify(d, p).ok())
+                let memory_recorder = identity
+                    .as_ref()
                     .map(|id| {
                         let path = memory_db_path(&args, &loaders::LoaderSet::discover(
                             args.loader_dir.clone(),
@@ -2142,34 +2669,37 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // Before `execute`: the identity check is a blocking round trip
                 // and the console is idle right now, which it will not be again
                 // until the session ends.
-                let diag = args
-                    .diag
-                    .then(|| {
-                        start_diag(
-                            &args,
-                            &mut udpsender,
-                            running_base,
-                            memory_recorder.clone(),
-                        )
-                    })
-                    .flatten();
-                // ON IN EVERY SESSION THE PANEL IS NOT, and here for the same
-                // reason as the panel: its one blocking check belongs in the
-                // seconds before the title starts. It costs eight bytes every
-                // ten seconds and it is the only thing that can see a title's
-                // stack coming (see `stackwatch`). Not alongside `--diag`: that
-                // panel samples a range containing the same two counters, and
-                // two sinks claiming by address would eat each other's replies.
-                let stack = (!args.diag)
-                    .then(|| {
-                        start_stack_watch(
-                            &args,
-                            &mut udpsender,
-                            running_base,
-                            memory_recorder.clone(),
-                        )
-                    })
-                    .flatten();
+                // Before both instruments, and before the title: this is the
+                // last moment the console is idle.
+                if let Some(base) = running_base
+                    && let Some(rtt) = measure_rtt(&mut udpsender, base)
+                {
+                    info!(
+                        "link: round trip {:.2} ms at rest -- what a disc or audio fetch \
+                         cannot go below",
+                        rtt.as_secs_f64() * 1e3
+                    );
+                }
+                let diag = start_diag(
+                    &args,
+                    &mut udpsender,
+                    running_base,
+                    memory_recorder.clone(),
+                );
+                // ON WHENEVER THE PANEL IS NOT, and built here for the same
+                // reason: its one blocking check belongs in the seconds before
+                // the title starts. It costs eight bytes every ten seconds and
+                // it is the only thing that can see a title's stack coming (see
+                // `stackwatch`). Never alongside the panel -- that samples a
+                // range containing the same two counters, and two sinks
+                // claiming by address would eat each other's replies -- so the
+                // two follow `d` in opposite directions, at their own ticks.
+                let stack = start_stack_watch(
+                    &args,
+                    &mut udpsender,
+                    running_base,
+                    memory_recorder.clone(),
+                );
                 info!("Upload complete, executing at 0x{:08x}", entry);
                 // The title is on the console now; the host's copy is only
                 // holding up to 16 MiB for the length of the session.
@@ -2177,6 +2707,14 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 match dispatch::execute(&mut udpsender, entry, console || has_disc || mount.is_some(), has_disc) {
                     Err(e) => Err(e),
                     Ok(_) => {
+                        if args.cdda_tone {
+                            warn!(
+                                "--cdda-tone: the disc's audio tracks are NOT being served. \
+                                 Every CD-DA read is answered with a synthetic triangle, \
+                                 344.5 Hz left and 689.1 Hz right. Anything you hear in \
+                                 place of the music is this, not the game."
+                            );
+                        }
                         if has_disc || mount.is_some() || console {
                             dispatch::receive_syscalls(
                                 &mut udpsender,
@@ -2184,7 +2722,13 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 mount.clone(),
                                 running_base,
                                 &guards,
-                                !args.no_cdda,
+                                if args.no_cdda {
+                                    dispatch::CddaSource::Off
+                                } else if args.cdda_tone {
+                                    dispatch::CddaSource::Tone
+                                } else {
+                                    dispatch::CddaSource::Disc
+                                },
                                 memory_recorder,
                                 diag,
                                 stack,
@@ -2223,7 +2767,10 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         // Handled before the socket is opened; unreachable here, but spelled
         // out rather than caught by a wildcard so adding a subcommand keeps
         // failing to compile until it is wired up.
-        Commands::Identify { .. } | Commands::Extract { .. } | Commands::Relocate { .. } => {
+        Commands::Identify { .. }
+        | Commands::Extract { .. }
+        | Commands::AuditAudio { .. }
+        | Commands::Relocate { .. } => {
             unreachable!("handled before connecting")
         }
         Commands::SelftestReadback {} => {
@@ -2462,6 +3009,22 @@ mod tests {
         ));
     }
 
+    /// The Katana stack paint against the two loaders it has met: the one
+    /// Sonic Adventure booted with, which ends below it, and the CD-DA build
+    /// Snow Surfers exited to the BIOS with -- which the stack test passed.
+    #[test]
+    fn the_stack_paint_rules_out_a_loader_that_ends_inside_it() {
+        const PAINT: (u32, u32, u32) = (0x8c00_c000, 0x8c00_f400, 0x8c0c_4c2e);
+        assert_eq!(fill_over_image(loaders::DEFAULT_BASE, 0x8c00_a558, &[PAINT]), None);
+        assert!(stack_headroom_ok(loaders::DEFAULT_BASE, Some(0x8c00_cb48), Some(0x8c00_e460)));
+        assert_eq!(
+            fill_over_image(loaders::DEFAULT_BASE, 0x8c00_cb48, &[PAINT]),
+            Some(PAINT)
+        );
+        // An image ending exactly where the paint starts is untouched.
+        assert_eq!(fill_over_image(loaders::DEFAULT_BASE, 0x8c00_c000, &[PAINT]), None);
+    }
+
     /// Sonic Adventure's two votes are 0x8c004000 and 0x8c000100, and the
     /// tie-break keeps the loader at the first. The second is DreamShell saying
     /// low RAM was too tight for a loader a quarter of this one's size.
@@ -2509,7 +3072,14 @@ mod tests {
         let set = loaders::LoaderSet::discover(Some(dir.to_string_lossy().into_owned()));
         let boot = vec![0u8; 0x1000];
         assert_eq!(
-            base_off_the_low_family(&set, &boot, 0x0c01_0000, None, Some(0x8c00_b9d0)),
+            base_off_the_low_family(
+                &set,
+                &boot,
+                0x0c01_0000,
+                None,
+                Some(0x8c00_b9d0),
+                loaders::ISOLDR_HIGH_ADDR
+            ),
             Some(loaders::ISOLDR_HIGH_ADDR)
         );
 
@@ -2518,7 +3088,14 @@ mod tests {
         // shortcut past the tests.
         let mut map = memmap::MemoryMap::new();
         map.mark(0x8cff_0000, 0x1000);
-        let got = base_off_the_low_family(&set, &boot, 0x0c01_0000, Some(&map), None)
+        let got = base_off_the_low_family(
+            &set,
+            &boot,
+            0x0c01_0000,
+            Some(&map),
+            None,
+            loaders::ISOLDR_HIGH_ADDR,
+        )
             .expect("somewhere else high");
         assert_ne!(got, loaders::ISOLDR_HIGH_ADDR);
         assert!(loaders::is_high(got));

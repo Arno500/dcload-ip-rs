@@ -12,7 +12,7 @@ use indicatif::{HumanBytes, ProgressBar};
 use crate::{
     CHUNK_SIZE,
     cd::build_dc_toc,
-    cmds::{DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
+    cmds::{AudioFormat, DCLoadClientCmds, DCLoadCmd, DCLoadCmds, DCReturnCmd},
     disc_formats::{
         boot,
         cdi::Cdi,
@@ -455,10 +455,17 @@ pub fn ensure_loader_base(
     running: u32,
     want: u32,
 ) -> u32 {
-    if running == want {
-        info!("loader is already at 0x{:08x}, no chainload needed", want);
-        return running;
-    }
+    // NOTE THERE IS NO `running == want -> return` HERE, AND THAT IS THE POINT.
+    // It used to say "loader is already at 0x…, no chainload needed" and return
+    // before the image was ever materialised -- so the same address was taken as
+    // proof of the same build, and a rebuilt loader set was silently not picked
+    // up. The `running == want` case is handled below, AFTER the image exists to
+    // compare against; it costs one round trip and no upload when they match.
+    // Measured 2026-09-04, twice in one evening: a session run with
+    // `--loader-dir loaders-tone` kept the ADPCM loader already at 0x8ce00000
+    // and played the music exactly as before, which is the one outcome that
+    // experiment could not tell apart from a result.
+    //
     // A base that is known not to work is refused BEFORE the missing-ELF path,
     // so the message says why instead of inviting someone to build it.
     if let Some(reason) = crate::loaders::known_unsupported(want) {
@@ -501,7 +508,14 @@ pub fn ensure_loader_base(
             loaders.dir().display(),
             missing,
             if available.is_empty() {
-                "none".to_string()
+                // Same trap as the "loader candidates" line in main.rs: this
+                // counted pre-linked ELFs only, so it read "none" for a
+                // directory holding the relocatable image that answers for
+                // every base.
+                match loaders.relocatable() {
+                    Some(_) => "relocatable (any base)".to_string(),
+                    None => "none".to_string(),
+                }
             } else {
                 available.join(", ")
             },
@@ -546,7 +560,87 @@ pub fn ensure_loader_base(
         .and_then(|(b, _)| crate::loaders::image_extent_bytes(&b).ok())
         .unwrap_or((u32::MAX, u32::MAX));
 
-    let hops = crate::loaders::plan(running, want, want_image, scratch_image);
+    // THE SAME BASE IS NOT THE SAME BUILD, AND plan() ANSWERS ON THE ADDRESS
+    // ALONE. A loader set rebuilt with different options -- a different CD-DA
+    // format, an experiment, a fix -- is simply NOT picked up when the console
+    // already runs something at that address: nothing is uploaded, nothing is
+    // said, and the old image goes on serving. That is AGENTS.md 14.19 on the
+    // host side, and on 2026-09-04 it silently voided a whole test run: the
+    // session was started with `--loader-dir loaders-tone`, the host kept the
+    // ADPCM loader already at 0x8ce00000, and the music played exactly as
+    // before -- the one outcome the experiment could not distinguish from a
+    // result. One blocking round trip on an idle console answers it.
+    let mut hops = crate::loaders::plan(running, want, want_image, scratch_image);
+    if running == want {
+        let Some((bytes, label)) = fetch(want) else {
+            return running;
+        };
+        match crate::diag::verify_image(conn, &bytes, &label) {
+            Ok(()) => {
+                // SAY THAT IT WAS CHECKED, not merely that nothing happened.
+                // "no chainload needed" was the old message and it was true of
+                // the address and silent about the build.
+                info!(
+                    "loader is already at 0x{running:08x} and is {label}; nothing to \
+                     chainload"
+                );
+                return running;
+            }
+            Err(e) => {
+                // REPLACE IT, DO NOT MERELY COMPLAIN. A loader cannot be
+                // uploaded over itself, and here the destination IS the scratch
+                // base, so there is no one-hop answer -- but the relocatable
+                // image goes anywhere, so any base that is clear in both
+                // directions works as a stepping stone. Both legs are ordinary
+                // moves planned by the same function, so nothing new is being
+                // reasoned about: the pair is only rejected together.
+                warn!(
+                    "the loader running at 0x{running:08x} is not {label}: {e}. \
+                     Replacing it by way of an intermediate base."
+                );
+                // THE SHORTEST RELAY, not the first one found. Each leg goes
+                // through the scratch base anyway, so a stepping stone other
+                // than the scratch base costs two extra uploads: replacing a
+                // stock-base loader went 0x8ce00000, 0x8cfe8000, 0x8ce00000,
+                // 0x8c004000 -- four chainloads, four redrawn screens, for a
+                // move the scratch base makes in two (2026-09-17).
+                let mut relay: Vec<u32> = Vec::new();
+                for alt in [
+                    crate::loaders::SCRATCH_BASE,
+                    crate::loaders::DEFAULT_BASE,
+                    crate::loaders::ISOLDR_HIGH_ADDR,
+                ] {
+                    if alt == want || !loaders.can_provide(alt) {
+                        continue;
+                    }
+                    let Some((alt_bytes, _)) = fetch(alt) else {
+                        continue;
+                    };
+                    let Ok(alt_image) = crate::loaders::image_extent_bytes(&alt_bytes) else {
+                        continue;
+                    };
+                    let there = crate::loaders::plan(running, alt, alt_image, scratch_image);
+                    let back = crate::loaders::plan(alt, want, want_image, scratch_image);
+                    if !there.is_empty()
+                        && !back.is_empty()
+                        && (relay.is_empty() || there.len() + back.len() < relay.len())
+                    {
+                        relay = [there, back].concat();
+                    }
+                }
+                if relay.is_empty() {
+                    warn!(
+                        "no intermediate base is clear in both directions, so the loader \
+                         at 0x{running:08x} cannot be replaced in place. Power-cycle the \
+                         Dreamcast: it will boot the CD at the stock base and the move \
+                         becomes an ordinary one."
+                    );
+                    return running;
+                }
+                hops = relay;
+            }
+        }
+    }
     if hops.is_empty() {
         warn!(
             "cannot move the loader from 0x{running:08x} to 0x{want:08x} without writing \
@@ -1360,6 +1454,105 @@ pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<
     out
 }
 
+/// RAM the title fills in a loop whose two bounds are constants in its code:
+/// `(lo, hi, site)`, `hi` exclusive, both in the cached window, `site` the
+/// loop's first instruction.
+///
+/// WHY THIS EXISTS: A KATANA TITLE PAINTS THE BIOS STACK BEFORE ANYTHING ELSE.
+/// The crt0 that 0x8c010000 jumps to fills 0x8c00c000..0x8c00f400 with the
+/// word "SEGA" as its very first loop -- found in the boot binaries of Snow
+/// Surfers, Crazy Taxi, Jet Set Radio, ChuChu Rocket!, Power Stone and Sonic
+/// Adventure (2026-09-17). A low loader whose `_end` is above 0x8c00c000 has
+/// its `.data` and `.bss` turned into "SEGA" before the title's first GD
+/// syscall. Measured under flycast the same day: Snow Surfers at 0x8c004000
+/// (`_end` 0x8c00cb48) failed `gdFsInit` and called the BIOS's exit-to-menu
+/// 180 ms after EXEC; on the error codes it does not exit for, it spins forever.
+///
+/// `literals_in_loader_footprint` cannot see it, on purpose: a low loader's
+/// image is the BIOS work area, where titles name IP.BIN addresses as a matter
+/// of course, so that scan skips it (see `exclusive_footprint`). A fill loop is
+/// not a mention but a write, and its shape corroborates it the way a
+/// `mov.l @(disp,PC)` corroborates a literal.
+///
+/// THE SHAPE, and nothing looser:
+///
+/// ```text
+///     mov.l  @(disp,PC),Rx     up to four PC-relative loads, immediately
+///     ...                      before the loop, giving Rp and Rend
+/// L:  mov.{b,w,l} Rv,@Rp
+///     add    #1|2|4,Rp         the store's size
+///     cmp/hs Rend,Rp           (cmp/hi makes the bound inclusive)
+///     bf     L
+/// ```
+///
+/// The loads have to be contiguous with the loop. A bound loaded from a
+/// literal and then dereferenced (`mov.l @Rn,Rn`) is a variable holding the
+/// range, not the range, and every crt0 measured clears its `.bss` that way.
+pub fn constant_range_fills(buf: &[u8], address: u32) -> Vec<(u32, u32, u32)> {
+    let ram = |w: u32| matches!(w & 0xff00_0000, 0x0c00_0000 | 0x8c00_0000 | 0xac00_0000);
+    let cached = |w: u32| (w & 0x1fff_ffff) | 0x8c00_0000;
+    let mut out = vec![];
+    for (span_base, data) in payload_spans(buf, address) {
+        let op = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]);
+        for at in (0..data.len().saturating_sub(7)).step_by(2) {
+            let store = op(at);
+            let size = match store & 0xf00f {
+                0x2000 => 1,
+                0x2001 => 2,
+                0x2002 => 4,
+                _ => continue,
+            };
+            let rp = (store >> 8) & 0xf;
+            let cmp = op(at + 4);
+            let inclusive = match cmp & 0xf00f {
+                0x3002 => false,
+                0x3006 => true,
+                _ => continue,
+            };
+            // add #size,Rp; cmp against Rp; bf back to the store (PC+4-10).
+            if op(at + 2) != 0x7000 | (rp << 8) | size
+                || (cmp >> 8) & 0xf != rp
+                || op(at + 6) != 0x8bfb
+            {
+                continue;
+            }
+            let rend = (cmp >> 4) & 0xf;
+            let (mut lo, mut hi) = (None, None);
+            for k in (1..=4).filter_map(|n| at.checked_sub(2 * n)) {
+                let load = op(k);
+                if load & 0xf000 != 0xd000 {
+                    break;
+                }
+                let pool = ((k + 4) & !3) + (load & 0xff) as usize * 4;
+                let Some(b) = data.get(pool..pool + 4) else {
+                    break;
+                };
+                let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                // Walking backwards, the first load of a register is the one
+                // the loop sees.
+                match (load >> 8) & 0xf {
+                    r if r == rp && lo.is_none() => lo = Some(v),
+                    r if r == rend && hi.is_none() => hi = Some(v),
+                    _ => {}
+                }
+            }
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                continue;
+            };
+            if !ram(lo) || !ram(hi) {
+                continue;
+            }
+            let (lo, hi) = (cached(lo), cached(hi) + if inclusive { size as u32 } else { 0 });
+            if lo < hi {
+                out.push((lo, hi, cached(span_base.wrapping_add(at as u32))));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 pub fn apply_patches(
     conn: &mut impl ExternalDcIo,
     patches: &[(u32, u32)],
@@ -1568,10 +1761,22 @@ fn open_zip_member(
     if lower.ends_with(".gdi") {
         // A .gdi names its track files, and inside an archive "next to it"
         // means the same prefix -- that is what ZipContainer resolves.
-        let container: Box<dyn Container> = Box::new(ZipContainer::new(archive, member));
-        return Gdi::new(container, &base)
-            .map(get_disc_format)
-            .map_err(|e| format!("cannot read the GDI '{member}' in the archive: {e}"));
+        let prefix = match member.rfind('/') {
+            Some(i) => member[..=i].to_string(),
+            None => String::new(),
+        };
+        let container: Box<dyn Container> = Box::new(ZipContainer::new(archive.clone(), member));
+        let gdi = Gdi::new(container, &base)
+            .map_err(|e| format!("cannot read the GDI '{member}' in the archive: {e}"))?;
+        // Now, while the title is still being uploaded, rather than inside the
+        // first CD-DA sub-fetch of a track with the loader's deadline running:
+        // see zip::warm_track_indexes.
+        crate::disc_formats::zip::warm_track_indexes(
+            &archive,
+            &prefix,
+            &gdi.audio_track_files(),
+        );
+        return Ok(get_disc_format(gdi));
     }
     let src = archive.open_named(member).map_err(|e| e.to_string())?;
     if lower.ends_with(".cdi") {
@@ -1622,11 +1827,281 @@ pub fn reboot(
     Ok(0)
 }
 
-// Nine, and each one is a different thing the session already decided: the
-// disc, the mount, where the loader is, the guard to keep alive, whether to
-// serve audio, where to record what is learned, what to sample, and how close
-// the title's stack is getting. Bundling them into a struct would only move the
-// list somewhere the caller cannot see it while reading this signature.
+/// Where the CD-DA samples come from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CddaSource {
+    /// Refuse every audio read (`--no-cdda`), so the loader stops the stream.
+    Off,
+    /// The disc image.
+    Disc,
+    /// A synthetic two-tone triangle (`--cdda-tone`), sent through the normal
+    /// audio path in place of the disc read. A clean tone clears the wire, the
+    /// encoder and the loader, and leaves the disc read as the suspect.
+    Tone,
+}
+
+/// The test tone as raw 2352-byte audio sectors: 344.5 Hz left, 689.1 Hz right.
+///
+/// The phase is computed from the absolute sample index (LBA x 588 + frame),
+/// so consecutive requests join without a seam and a re-asked sector comes
+/// back byte for byte.
+fn tone_sectors(lba: u32, sectors: u32) -> Vec<u8> {
+    const PERIOD_L: u64 = 128;
+    const PERIOD_R: u64 = 64;
+
+    fn tri(i: u64, period: u64) -> i16 {
+        let half = period / 2;
+        let scale = (32768 / half) as i64;
+        let t = i % period;
+        let a = if t < half { t } else { period - t } as i64;
+        ((a - (half / 2) as i64) * scale) as i16
+    }
+
+    let mut out = Vec::with_capacity(sectors as usize * RAW_SECTOR_SIZE);
+    for s in 0..sectors as u64 {
+        let base = (lba as u64 + s) * FRAMES_PER_SECTOR as u64;
+        for i in 0..FRAMES_PER_SECTOR as u64 {
+            out.extend_from_slice(&tri(base + i, PERIOD_L).to_le_bytes());
+            out.extend_from_slice(&tri(base + i, PERIOD_R).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Sample-to-sample continuity scan of the PCM this host serves, taken before
+/// any encoding.
+///
+/// It counts steps larger than `LIMIT` ("hits") and pairs of consecutive ones
+/// ("runs"), but **those counts are not evidence of a defect**: a band-limited
+/// signal of peak A may step by up to 2A between samples, so loud music produces
+/// thousands. Splicing real ring seams into a track moved the count from 4934
+/// to 4933. What separates a defect from music is where the hits land; see
+/// `verdict()`.
+///
+/// Used live by `receive_syscalls` (a warning only for an aligned spike) and
+/// offline by `audit_audio`.
+pub struct SlewWatch {
+    prev: Option<(i32, i32)>,
+    hits: u64,
+    runs: u64,
+    max: i32,
+    /// LBA and frame of the first run.
+    first: Option<(u32, usize)>,
+    /// 32 bytes of PCM around the first run, captured during the scan: only the
+    /// PCM buffer can be indexed by a frame number (an ADPCM answer is a quarter
+    /// of its size).
+    first_bytes: Vec<u8>,
+    /// Hit counts per frame offset inside a sector (588 frames).
+    off: Vec<u64>,
+}
+
+impl SlewWatch {
+    const LIMIT: i32 = 24000;
+
+    pub fn new() -> Self {
+        Self {
+            prev: None,
+            hits: 0,
+            runs: 0,
+            max: 0,
+            first: None,
+            first_bytes: Vec::new(),
+            off: vec![0; FRAMES_PER_SECTOR as usize],
+        }
+    }
+
+    /// Where the hits concentrate inside a sector: `(offset, hits there,
+    /// sigma above a uniform spread)`, or `None` below 64 hits.
+    ///
+    /// Every defect this pipeline can have -- a dropped sector in the rip, a
+    /// wrong deflate cursor, a lost sub-fetch, a ring seam -- is aligned to a
+    /// structure whose period divides a sector; music is aligned to nothing.
+    /// So a spike (callers use more than 8 sigma) is a defect at that offset,
+    /// and a flat spread is loud music.
+    pub fn verdict(&self) -> Option<(usize, u64, f64)> {
+        if self.hits < 64 {
+            return None;
+        }
+        let n = self.off.len() as f64;
+        let mean = self.hits as f64 / n;
+        // Poisson: a uniform spread over 588 bins puts the largest bin a few
+        // sigma above the mean by chance alone, so only a real spike counts.
+        let (i, top) = self
+            .off
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, c)| *c)
+            .map(|(i, c)| (i, *c))
+            .unwrap();
+        let sigma = mean.sqrt().max(1e-9);
+        let z = (top as f64 - mean) / sigma;
+        Some((i, top, z))
+    }
+
+    pub fn describe(&self) -> String {
+        match self.verdict() {
+            None => "too few steps to say anything".into(),
+            Some((i, top, z)) if z > 8.0 => format!(
+                "CONCENTRATED at sector offset {i} ({top} of {} hits, {z:.1} sigma) \
+                 -- that alignment is a reader or dump defect, not music",
+                self.hits
+            ),
+            Some((_, _, z)) => format!(
+                "spread evenly across all {} sector offsets ({z:.1} sigma at the \
+                 busiest) -- the fingerprint of loud music, not of a defect",
+                self.off.len()
+            ),
+        }
+    }
+
+    /// `pcm` is interleaved little-endian 16-bit stereo, which is what a raw
+    /// audio sector is and what both `read_audio` and `tone_sectors` produce.
+    pub fn scan(&mut self, lba: u32, pcm: &[u8]) {
+        let mut prev_big = false;
+        for (i, f) in pcm.chunks_exact(4).enumerate() {
+            let l = i16::from_le_bytes([f[0], f[1]]) as i32;
+            let r = i16::from_le_bytes([f[2], f[3]]) as i32;
+            let Some((pl, pr)) = self.prev else {
+                self.prev = Some((l, r));
+                continue;
+            };
+            let (dl, dr) = ((l - pl).abs(), (r - pr).abs());
+            self.prev = Some((l, r));
+            self.max = self.max.max(dl).max(dr);
+            let big = dl > Self::LIMIT || dr > Self::LIMIT;
+            if big {
+                self.hits += 1;
+                let slot = i % self.off.len();
+                self.off[slot] += 1;
+                if prev_big {
+                    self.runs += 1;
+                    if self.first.is_none() {
+                        self.first = Some((lba, i));
+                        let at = i * 4;
+                        let lo = at.saturating_sub(16).min(pcm.len());
+                        let hi = (lo + 32).min(pcm.len());
+                        self.first_bytes = pcm[lo..hi].to_vec();
+                    }
+                }
+            }
+            prev_big = big;
+        }
+    }
+}
+
+/// Scan every audio track of a disc image with `SlewWatch`, with no console.
+///
+/// Prints the track table, then one line per audio track: "clean" when the big
+/// steps are spread evenly across sector offsets (loud music), or a warning
+/// listing the bands of reads they occur in when they concentrate at one
+/// offset. Returns the number of steps in tracks judged defective.
+///
+/// This is where a suspected audio defect gets judged. The live path must not
+/// re-read the image while a title waits for its audio.
+pub fn audit_audio(disc: &dyn DiscFormat, only: Option<u8>) -> Result<u64, String> {
+    const RUN: u32 = 3;
+    let toc = disc.toc_tracks();
+    if toc.is_empty() {
+        return Err("this image reports no tracks at all".into());
+    }
+    info!("{} tracks:", toc.len());
+    for (i, t) in toc.iter().enumerate() {
+        let end = toc.get(i + 1).map(|n| n.start_lba);
+        info!(
+            "  track {:2} {:5} at LBA {:8} (0x{:08x}){}",
+            t.number,
+            if t.audio { "audio" } else { "data" },
+            t.start_lba,
+            t.start_lba,
+            match end {
+                Some(e) => format!(
+                    " .. {:8}, {} sectors, {:.1} s",
+                    e - 1,
+                    e - t.start_lba,
+                    (e - t.start_lba) as f64 * 588.0 / 44100.0
+                ),
+                None => " .. end of disc".into(),
+            }
+        );
+    }
+
+    let mut total = 0u64;
+    for (i, t) in toc.iter().enumerate() {
+        if !t.audio || only.is_some_and(|n| n != t.number) {
+            continue;
+        }
+        let Some(end) = toc.get(i + 1).map(|n| n.start_lba) else {
+            continue;
+        };
+        let mut watch = SlewWatch::new();
+        // Bands, not individual hits: consecutive bad reads are one event.
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        let mut lba = t.start_lba;
+        let mut failed = 0u32;
+        while lba + RUN <= end {
+            match disc.read_audio(lba, RUN) {
+                Ok(pcm) => {
+                    let before = watch.runs;
+                    watch.scan(lba, &pcm);
+                    if watch.runs > before {
+                        match bands.last_mut() {
+                            Some(b) if lba <= b.1 + RUN * 2 => b.1 = lba + RUN,
+                            _ => bands.push((lba, lba + RUN)),
+                        }
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+            lba += RUN;
+        }
+        let secs = |n: u32| n as f64 * 588.0 / 44100.0;
+        let aligned = matches!(watch.verdict(), Some((_, _, z)) if z > 8.0);
+        if !aligned {
+            info!(
+                "  track {:2}: clean ({:.1} s, {} big step(s), largest {}) -- {}",
+                t.number,
+                secs(end - t.start_lba),
+                watch.hits,
+                watch.max,
+                watch.describe()
+            );
+        } else {
+            warn!(
+                "  track {:2}: {} big step(s) in {} band(s), largest {}{} -- {}",
+                t.number,
+                watch.hits,
+                bands.len(),
+                watch.max,
+                if failed > 0 {
+                    format!(", {failed} read(s) failed")
+                } else {
+                    String::new()
+                },
+                watch.describe()
+            );
+            for (a, b) in bands.iter().take(16) {
+                warn!(
+                    "      LBA 0x{a:08x}..0x{b:08x}  ({:.1} s in, {:.1} s long)",
+                    secs(a - t.start_lba),
+                    secs(b - a)
+                );
+            }
+            if bands.len() > 16 {
+                warn!("      ... and {} more band(s)", bands.len() - 16);
+            }
+        }
+        if aligned {
+            total += watch.hits;
+        }
+        
+    }
+    Ok(total)
+}
+
+// Nine arguments, each something the session already decided: the disc, the
+// mount, where the loader is, the guards to keep alive, whether to serve
+// audio, where to record what is learned, what to sample, and the stack watch.
+// A struct would only move the list out of sight of this signature.
 #[allow(clippy::too_many_arguments)]
 pub fn receive_syscalls(
     conn: &mut impl ExternalDcIo,
@@ -1634,7 +2109,7 @@ pub fn receive_syscalls(
     mount: Option<String>,
     running_base: Option<u32>,
     guards: &[(u32, u32)],
-    cdda: bool,
+    cdda: CddaSource,
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     mut diag: Option<crate::diag::Probe>,
     mut stack: Option<crate::stackwatch::StackWatch>,
@@ -1657,7 +2132,45 @@ pub fn receive_syscalls(
     // otherwise happen inside the TOC syscall with the title frozen waiting.
     let toc_all_tracks = disc.toc_tracks();
     let mut cdda_reads: u64 = 0;
+    /// An audio answer that took longer than this to produce is dropped, not
+    /// sent -- ReturnValue included. The loader has stopped waiting for it, and
+    /// a late burst naming the same staging buffer as its next request could be
+    /// taken for that request's answer (or its ReturnValue release it early).
+    ///
+    /// **Must stay below the loader's `CDDA_FETCH_DEADLINE_TICKS` (20 ms)**, so
+    /// that "dropped here" and "arrived in time" cannot overlap. A normal answer
+    /// takes well under a millisecond; what this drops in practice is the first
+    /// read of a session, when a deflate index is being built.
+    const CDDA_GIVE_UP: Duration = Duration::from_millis(15);
+    let mut cdda_too_late: u64 = 0;
+    let mut slew = SlewWatch::new();
+    let mut slew_audited = false;
+    // The ADPCM encoder, one per session: its state must carry from one request
+    // to the next, in step with the AICA's decoder (see `adpcm::Stream`).
+    let mut adpcm = crate::adpcm::Stream::new();
+    // Raw disc sectors in the last audio request. Not derivable from the
+    // answer: an ADPCM answer is a quarter of the bytes it was encoded from.
+    let mut cdda_sectors: u64 = 0;
     let mut cdda_started: Option<Instant> = None;
+    // Per-window accounting, reported every 250 audio requests.
+    //
+    // The title is frozen from its audio request until our ReturnValue, and the
+    // console cannot time that while it waits, so this host does: disc read
+    // time, total time, the maximum, and how many were slow.
+    //
+    // Loss sampling: `send_audio` does not check delivery, so one request in
+    // 256 is probed with a DoneBinary to catch a link that starts dropping
+    // audio.
+    let mut cdda_probes: u64 = 0;
+    let mut cdda_probes_lossy: u64 = 0;
+    let mut cdda_win_start: Option<Instant> = None;
+    let mut cdda_win_disc_us: u64 = 0;
+    let mut cdda_win_total_us: u64 = 0;
+    let mut cdda_win_max_us: u64 = 0;
+    // Requests in this window that took longer than `CDDA_SLOW_US` to serve.
+    let mut cdda_win_slow: u64 = 0;
+    // The loader's audio clock, measured against this host's. See `CddaClock`.
+    let mut cdda_clock = CddaClock::new();
     let mut cdda_errors: u64 = 0;
     debug!("CDFS source: start_sector={toc_start} num_sectors={toc_sectors}");
     if toc_all_tracks.is_empty() {
@@ -2088,89 +2601,420 @@ pub fn receive_syscalls(
                                     }
                                 }
                             }
-                            // CDDA. Deliberately NOT recorded in the memory map:
-                            // the destination is dcload's own staging buffer,
-                            // inside the loader's footprint, and marking it
-                            // would teach the map that this title writes where
-                            // the loader lives -- the one thing the map exists
-                            // to answer, poisoned by our own traffic.
-                            DCLoadClientCmds::ReadAudio(start, dc_address, size) => {
-                                let answer = if !cdda {
+                            // CD-DA (DC23 PCM / DC24 ADPCM). Not recorded in the
+                            // memory map: the destination is the loader's own
+                            // staging buffer, and marking it would teach the map
+                            // that the title writes where the loader lives.
+                            DCLoadClientCmds::ReadAudio(start, dc_address, size, fmt) => {
+                                // The title is frozen from here until the
+                                // ReturnValue below: dcload sent this from
+                                // cdda_fetch() and waits in bb->loop().
+                                let t0 = Instant::now();
+                                // Request size per raw sector: PCM asks for the
+                                // disc's bytes (2352), ADPCM for one byte per
+                                // stereo frame (588).
+                                let per_sector = match fmt {
+                                    AudioFormat::Pcm => RAW_SECTOR_SIZE as u32,
+                                    AudioFormat::Adpcm { .. } => FRAMES_PER_SECTOR,
+                                };
+                                let answer = if cdda == CddaSource::Off {
                                     Err("CDDA is off (--no-cdda)".to_string())
-                                } else if size % RAW_SECTOR_SIZE as u32 != 0 {
+                                } else if size == 0 || size % per_sector != 0 {
                                     Err(format!(
                                         "CDDA read size {size} is not a multiple of \
-                                         {RAW_SECTOR_SIZE}"
+                                         {per_sector}"
                                     ))
                                 } else {
-                                    disc.read_audio(start, size / RAW_SECTOR_SIZE as u32)
-                                        .map_err(|e| e.to_string())
+                                    cdda_sectors = (size / per_sector) as u64;
+                                    // A re-ask comes out of the encoder's history
+                                    // BEFORE any disc read: see Stream::replay.
+                                    if let AudioFormat::Adpcm { restart: false } = fmt
+                                        && let Some(bytes) = adpcm.replay(start, size as usize)
+                                    {
+                                        Ok(bytes)
+                                    } else {
+                                        // The tone replaces the disc read and nothing
+                                        // else: the ADPCM encoder below still runs.
+                                        if cdda == CddaSource::Tone {
+                                            Ok(tone_sectors(start, size / per_sector))
+                                        } else {
+                                            disc.read_audio(start, size / per_sector)
+                                                .map_err(|e| e.to_string())
+                                        }
+                                        // Scanned before encoding, so it sees PCM
+                                        // whatever format the loader asked for.
+                                        .inspect(|pcm: &Vec<u8>| {
+                                            let was = slew.runs;
+                                            slew.scan(start, pcm);
+                                            // Big steps alone are loud music: only an
+                                            // aligned spike is a warning (see
+                                            // SlewWatch::verdict).
+                                            if slew.runs > was && (was == 0 || slew.runs % 250 == 0) {
+                                                match slew.verdict() {
+                                                    Some((_, _, z)) if z > 8.0 => debug!(
+                                                        "the audio leaving this host has \
+                                                         ALIGNED discontinuities: {}",
+                                                        slew.describe()
+                                                    ),
+                                                    _ => debug!(
+                                                        "audio slew: {} hit(s), largest step {} -- {}",
+                                                        slew.hits,
+                                                        slew.max,
+                                                        slew.describe()
+                                                    ),
+                                                }
+                                            }
+                                        })
+                                            .and_then(|pcm| match fmt {
+                                                AudioFormat::Pcm => Ok(pcm),
+                                                // Encoded inside the timed section,
+                                                // so encoder time shows up in the
+                                                // per-request figures.
+                                                AudioFormat::Adpcm { restart } => {
+                                                    let enc =
+                                                        adpcm.encode_request(start, &pcm, restart);
+                                                    // A short answer is refused, and the
+                                                    // loader re-asks. Both `read_audio`
+                                                    // implementations fill or fail, so
+                                                    // this should never fire.
+                                                    if enc.len() as u32 == size {
+                                                        Ok(enc)
+                                                    } else {
+                                                        Err(format!(
+                                                            "ADPCM encode produced {} bytes, not \
+                                                             the {size} the loader asked for",
+                                                            enc.len()
+                                                        ))
+                                                    }
+                                                }
+                                            })
+                                    }
                                 };
+                                // Disc read (and encode) time, kept apart from
+                                // the wire: they need different fixes and look
+                                // the same from the console.
+                                let disc_us = t0.elapsed().as_micros() as u64;
+                                // Once per session, if the scan has found an
+                                // ALIGNED spike (a real defect, see
+                                // SlewWatch::verdict), print the bytes around
+                                // its first run as hex and text: foreign data
+                                // such as an ASCII header shows at a glance.
+                                // Outside the timing above on purpose.
+                                if slew.runs > 0
+                                    && matches!(slew.verdict(), Some((_, _, z)) if z > 8.0)
+                                    && !slew_audited
+                                    && answer.is_ok()
+                                    && !slew.first_bytes.is_empty()
+                                    && let Some((bad_lba, bad_frame)) = slew.first
+                                {
+                                    slew_audited = true;
+                                    let lo = (bad_frame * 4).saturating_sub(16);
+                                    let mut hex = String::new();
+                                    let mut txt = String::new();
+                                    for b in &slew.first_bytes {
+                                        hex.push_str(&format!("{b:02x}"));
+                                        txt.push(if (0x20..0x7f).contains(b) {
+                                            *b as char
+                                        } else {
+                                            '.'
+                                        });
+                                    }
+                                    debug!(
+                                        "the discontinuity, as bytes: LBA 0x{bad_lba:08x} \
+                                         +{lo} ({} B) {hex} |{txt}|",
+                                        slew.first_bytes.len()
+                                    );
+                                    // The LBA is not re-read here to check the
+                                    // reader: that can build a deflate index while
+                                    // the title waits (measured at 223 ms, which
+                                    // then cost the answer in flight). The deflate
+                                    // reader is tested against ground truth, and
+                                    // `audit-audio` judges the image offline.
+                                    debug!(
+                                        "run `dcload-ip-rs audit-audio` on this image to \
+                                         judge LBA 0x{bad_lba:08x}: it is NOT re-read here, \
+                                         because doing that froze the title for 223 ms and \
+                                         cost the audio answer that was in flight"
+                                    );
+                                }
                                 match answer {
                                     Ok(buf) => {
-                                        if cdda_reads == 0 {
+                                        // Too late: see CDDA_GIVE_UP. Nothing is
+                                        // sent, not even the ReturnValue, which
+                                        // could release a later request early.
+                                        let spent = t0.elapsed();
+                                        if spent >= CDDA_GIVE_UP {
+                                            cdda_too_late += 1;
+                                            debug!(
+                                                "CDDA read of LBA 0x{start:08x}{} took \
+                                                 {:.0} ms ({:.1} ms of it reading and \
+                                                 encoding), past the loader's deadline: \
+                                                 dropping it rather than answering a \
+                                                 request that has moved on ({cdda_too_late} \
+                                                 so far)",
+                                                if let AudioFormat::Adpcm { restart: true } = fmt {
+                                                    " (stream restart)"
+                                                } else {
+                                                    ""
+                                                },
+                                                spent.as_secs_f64() * 1000.0,
+                                                disc_us as f64 / 1000.0
+                                            );
+                                            continue;
+                                        }
+                                        let first = cdda_reads == 0;
+                                        if first {
                                             cdda_started = Some(Instant::now());
-                                            info!(
+                                            cdda_win_start = Some(Instant::now());
+                                        }
+                                        cdda_reads += 1;
+                                        // No acknowledgement round trips (see
+                                        // `send_audio`); one request in 256 is
+                                        // probed for loss.
+                                        let probe = cdda_reads.is_multiple_of(256);
+                                        match send_audio(conn, &buf, dc_address, probe) {
+                                            Ok(Some(missing)) => {
+                                                cdda_probes += 1;
+                                                if missing > 0 {
+                                                    cdda_probes_lossy += 1;
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                debug!("CDDA read transfer failed: {e}");
+                                                let _ = conn.send_command(DCLoadCmd {
+                                                    cmd: DCLoadCmds::ReturnValue(),
+                                                    address: u32::MAX,
+                                                    size: u32::MAX,
+                                                });
+                                                continue;
+                                            }
+                                        }
+                                        // The ReturnValue releases the loader.
+                                        // `address` echoes the LBA served: every
+                                        // audio answer names the same buffer and
+                                        // size, so this is how the loader tells
+                                        // it from a late answer to an earlier
+                                        // request. `size` carries the clock trim
+                                        // in ppm (1000000 = no correction; see
+                                        // `CddaClock`). Both fields were unused.
+                                        conn.send_command(DCLoadCmd {
+                                            cmd: DCLoadCmds::ReturnValue(),
+                                            address: start,
+                                            size: cdda_clock.scale_ppm,
+                                        })?;
+                                        // The title is running again. Everything
+                                        // below is accounting, kept after the
+                                        // ReturnValue so the title never waits
+                                        // for it.
+                                        let total_us = t0.elapsed().as_micros() as u64;
+                                        cdda_win_disc_us += disc_us;
+                                        cdda_win_total_us += total_us;
+                                        cdda_win_max_us = cdda_win_max_us.max(total_us);
+                                        if total_us > CDDA_SLOW_US {
+                                            cdda_win_slow += 1;
+                                        }
+                                        // Clock trim: the LBA asked for and the
+                                        // arrival time are all it needs.
+                                        if cdda_trim()
+                                            && let Some(step) = cdda_clock.note(t0, start)
+                                        {
+                                            match step {
+                                                CddaTrim::Applied { from, to, win_ppm, secs } => {
+                                                    debug!(
+                                                        "CDDA clock: the loader's model ran {} \
+                                                         ppm {} over {secs:.0} s of free-running \
+                                                         stream -- trim {from} -> {to} ppm",
+                                                        win_ppm.abs(),
+                                                        if win_ppm < 0 { "slow" } else { "fast" }
+                                                    );
+                                                }
+                                                CddaTrim::Held { ppm, win_ppm, secs } => {
+                                                    debug!(
+                                                        "CDDA clock: the loader's model is within \
+                                                         {} ppm over {secs:.0} s -- the trim \
+                                                         stays at {ppm} ppm",
+                                                        win_ppm.abs()
+                                                    );
+                                                }
+                                                CddaTrim::Refused { est_ppm, secs } => {
+                                                    debug!(
+                                                        "CDDA clock: {secs:.0} s of stream say \
+                                                         the trim should be {est_ppm} ppm, which \
+                                                         is further out than any clock can be -- \
+                                                         not applied. Something other than the \
+                                                         model's period is wrong."
+                                                    );
+                                                }
+                                                CddaTrim::Discarded { secs, ratio } => {
+                                                    debug!(
+                                                        "CDDA clock: discarded {secs:.0} s -- \
+                                                         audio against real time came out at \
+                                                         {ratio:.3}, so the stream was not \
+                                                         free-running"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        // A single slow answer is reported as it
+                                        // happens (a window average hides it),
+                                        // split into the disc read -- the image
+                                        // may be on a network or sync folder --
+                                        // and the rest: the wire and this
+                                        // process's scheduling.
+                                        const CDDA_LOUD_US: u64 = 20_000;
+                                        if total_us > CDDA_LOUD_US {
+                                            debug!(
+                                                "CDDA read took {:.1} ms to serve (disc {:.1},                                                  rest {:.1}) at LBA 0x{start:08x} -- the title                                                  was frozen for all of it",
+                                                total_us as f64 / 1000.0,
+                                                disc_us as f64 / 1000.0,
+                                                (total_us - disc_us) as f64 / 1000.0,
+                                            );
+                                        }
+                                        if first {
+                                            debug!(
                                                 "CDDA: first audio read served (LBA \
                                                  0x{start:08x}, {} bytes)",
                                                 buf.len()
                                             );
                                         }
-                                        cdda_reads += 1;
-                                        // THE RATE, PERIODICALLY, BECAUSE A
-                                        // RUNAWAY IS INVISIBLE OTHERWISE.
-                                        // Measured 2026-08-29: a flow-control
-                                        // bug on the console fetched 3.4x
-                                        // real time and starved the title,
-                                        // and at DEBUG it looked like a wall
-                                        // of identical lines nobody would
-                                        // read as a rate. One raw sector is
-                                        // 1/75 s of audio, so the ratio is
-                                        // arithmetic, and 1.0 is the answer.
+                                        // Every 250 requests: the periodic
+                                        // report. The ratio is a runaway guard
+                                        // (a loader fetching much faster than
+                                        // real time starves the title). It
+                                        // counts requests, so re-asks inflate it
+                                        // slightly; the clock estimator measures
+                                        // by disc position instead.
                                         if cdda_reads % 250 == 0 {
                                             let secs = cdda_started
                                                 .get_or_insert_with(Instant::now)
                                                 .elapsed()
                                                 .as_secs_f64();
-                                            let audio = (cdda_reads
-                                                * (buf.len() / RAW_SECTOR_SIZE) as u64)
-                                                as f64
-                                                / 75.0;
+                                            let audio =
+                                                (cdda_reads * cdda_sectors) as f64 / 75.0;
                                             let ratio = if secs > 0.0 { audio / secs } else { 0.0 };
                                             if ratio > 1.5 {
-                                                warn!(
+                                                debug!(
                                                     "CDDA is streaming {ratio:.1}x faster than \
                                                      real time ({cdda_reads} reads): the \
                                                      loader's flow control is not holding, and \
                                                      it will starve the title"
                                                 );
                                             } else {
-                                                // THE LBA TOO, because "the
-                                                // stream is advancing" and
-                                                // "the stream is replaying
-                                                // the same three sectors at
-                                                // the right rate" look
-                                                // identical from a count.
-                                                info!(
+                                                // The LBA too: a stream stuck
+                                                // replaying the same sectors at
+                                                // the right rate looks healthy
+                                                // from a count alone.
+                                                debug!(
                                                     "CDDA: {cdda_reads} reads, {ratio:.2}x real \
                                                      time, at LBA 0x{start:08x}"
                                                 );
+                                                // The clock estimator's running
+                                                // view, printed before it commits,
+                                                // so "no trim yet" and "nothing
+                                                // to trim" can be told apart.
+                                                {
+                                                    let (banked, rate, ppm, trims) =
+                                                        cdda_clock.progress();
+                                                    let want = if trims == 0 {
+                                                        CDDA_TRIM_FIRST_S
+                                                    } else {
+                                                        CDDA_TRIM_S
+                                                    };
+                                                    debug!(
+                                                        "CDDA clock: window has {banked:.1}s of \
+                                                         {want:.0}s free-running stream banked, \
+                                                         reading {:+.0} ppm; {trims} trim(s) \
+                                                         applied, loader running on {ppm} ppm",
+                                                        if rate > 0.0 {
+                                                            (rate * f64::from(ppm) / 1e6 - 1.0)
+                                                                * 1e6
+                                                        } else {
+                                                            0.0
+                                                        }
+                                                    );
+                                                }
+                                                // Continuity counts of the audio
+                                                // leaving this host. Big steps
+                                                // are normal in loud music; only
+                                                // an aligned spike means a
+                                                // defect (SlewWatch::verdict).
+                                                debug!(
+                                                    "CDDA continuity leaving this host: \
+                                                     {} run(s), {} hit(s), largest step {}",
+                                                    slew.runs, slew.hits, slew.max
+                                                );
                                             }
+                                            // Encoder history. A re-ask answered
+                                            // from the kept bytes is free; one
+                                            // older than RECENT (`lost_replay`)
+                                            // decodes from the wrong coder state
+                                            // on both ears with every loader
+                                            // counter clean, so it must stay 0.
+                                            if adpcm.lost_replay > 0 {
+                                                debug!(
+                                                    "CDDA ADPCM: {} re-ask(s) older than the \
+                                                     {}-deep history -- those blocks decoded \
+                                                     from the wrong coder state and ARE the \
+                                                     audible glitches ({} replayed, {} \
+                                                     out of order)",
+                                                    adpcm.lost_replay,
+                                                    crate::adpcm::RECENT,
+                                                    adpcm.replays,
+                                                    adpcm.out_of_order
+                                                );
+                                            } else {
+                                                debug!(
+                                                    "CDDA ADPCM: {} re-ask(s) answered from \
+                                                     the kept bytes, {} out of order, none lost",
+                                                    adpcm.replays, adpcm.out_of_order
+                                                );
+                                            }
+                                            // What the music costs the title:
+                                            // time frozen per request (disc read
+                                            // + the rest) and the share of wall
+                                            // time. This host's half only: the
+                                            // flight times and the loader's G2
+                                            // copies into sound RAM, after the
+                                            // ReturnValue, are not in it.
+                                            let win = cdda_win_start
+                                                .get_or_insert_with(Instant::now)
+                                                .elapsed()
+                                                .as_secs_f64();
+                                            let n = 250.0_f64;
+                                            let frozen = cdda_win_total_us as f64 / 1000.0;
+                                            debug!(
+                                                "CDDA: 250 fetches in {win:.2} s ({:.1}/s) -- \
+                                                 title frozen {:.2} ms each (disc {:.2} + wire \
+                                                 {:.2}), max {:.2} ms, {cdda_win_slow} over \
+                                                 5 ms = {:.1}% of wall time",
+                                                n / win.max(1e-9),
+                                                frozen / n,
+                                                cdda_win_disc_us as f64 / 1000.0 / n,
+                                                (cdda_win_total_us - cdda_win_disc_us) as f64
+                                                    / 1000.0
+                                                    / n,
+                                                cdda_win_max_us as f64 / 1000.0,
+                                                frozen / (win.max(1e-9) * 1000.0) * 100.0,
+                                            );
+                                            // Only when it has something to
+                                            // say. A clean link should print
+                                            // this line never.
+                                            if cdda_probes_lossy > 0 {
+                                                debug!(
+                                                    "CDDA: {cdda_probes_lossy} of \
+                                                     {cdda_probes} sampled fetches arrived \
+                                                     incomplete -- the fast path does not \
+                                                     repair them, so this is audible as \
+                                                     crackle"
+                                                );
+                                            }
+                                            cdda_win_start = Some(Instant::now());
+                                            cdda_win_disc_us = 0;
+                                            cdda_win_total_us = 0;
+                                            cdda_win_max_us = 0;
+                                            cdda_win_slow = 0;
                                         }
-                                        if let Err(e) = send_data(conn, &buf, dc_address, None) {
-                                            warn!("CDDA read transfer failed: {e}");
-                                            let _ = conn.send_command(DCLoadCmd {
-                                                cmd: DCLoadCmds::ReturnValue(),
-                                                address: u32::MAX,
-                                                size: u32::MAX,
-                                            });
-                                            continue;
-                                        }
-                                        conn.send_command(DCLoadCmd {
-                                            cmd: DCLoadCmds::ReturnValue(),
-                                            address: 0,
-                                            size: 0,
-                                        })?;
                                     }
                                     // NOT fatal to the session. A title that
                                     // asks for audio this image cannot serve
@@ -2179,7 +3023,7 @@ pub fn receive_syscalls(
                                     // the game goes on reading data.
                                     Err(e) => {
                                         if cdda_errors == 0 {
-                                            warn!(
+                                            debug!(
                                                 "CDDA read refused (LBA 0x{start:08x}): {e}. \
                                                  The title will get silence; further \
                                                  refusals are not logged."
@@ -2332,6 +3176,328 @@ pub fn send_data(
     send_data_one(conn, data, address, progress_bar)
 }
 
+/// Stereo frames in one raw CD sector (2352 / 4, i.e. 1/75 s). An ADPCM request
+/// is one byte per frame, so this is also the ADPCM bytes a sector is worth.
+const FRAMES_PER_SECTOR: u32 = RAW_SECTOR_SIZE as u32 / 4;
+
+/// An audio answer this process took longer than this to serve is counted as
+/// slow in the periodic report (5 ms, a third of a PAL frame).
+const CDDA_SLOW_US: u64 = 5_000;
+
+// ---- The CD-DA clock estimator's thresholds (see `CddaClock`) ----
+//
+// They describe the loader's geometry. Since 2026-09-20 it keeps a fixed lead
+// of audio ahead of the AICA and fetches one sub-fetch of 4 sectors (53 ms)
+// whenever the lead is short, so the stream is PACED: one request every ~53 ms,
+// not a burst of 13 and then a 477 ms idle tail. The alignment machinery that
+// tail needed is gone with it. If the sub-fetch length or the pacing changes on
+// the loader, re-check these values and the `feed_stream` tests: the estimator
+// once accepted nothing for days because they still described an 80 ms half.
+
+/// Seconds of accepted stream before the first estimate, and between later
+/// ones. Later estimates refine the same constant over a longer total.
+///
+/// The error being resolved is a few hundred ppm (184 ppm measured), which
+/// moves the loader's write head through its lead in about an hour, so
+/// resolution matters more than speed: a 20 s window carries ~500 ppm of
+/// service jitter. A window's endpoints are two fetch instants, and the lead
+/// at each is the same to within one service call, so the phase the window
+/// cannot account for is ~17 ms: 190 ppm over 90 s, 55 over 300, and less again
+/// as the accumulated span grows.
+const CDDA_TRIM_FIRST_S: f64 = 90.0;
+const CDDA_TRIM_S: f64 = 300.0;
+/// The longest gap between two audio requests that still counts as a
+/// free-running stream. A paced stream asks every ~53 ms and a title that stops
+/// calling the GD driver stretches that to a few hundred ms; a longer gap means
+/// the loader was kept off the ring (a disc read, a pause), and the interval is
+/// dropped from both sums.
+const CDDA_TRIM_GAP_MAX: f64 = 1.0;
+/// The most sectors one request may advance the disc position and still be the
+/// next piece of the same stream (a sub-fetch is 3 or 4 sectors; a seek, a
+/// repeat or a new track jumps further).
+const CDDA_TRIM_STEP_MAX: u32 = 12;
+/// Seconds banked before a segment is judged and added to the window.
+///
+/// It is the whole defence against the bias a dropped interval leaves behind:
+/// the loader owes that audio and delivers it as fast as it can afterwards, so
+/// the catch-up must land in a segment short enough for the test below to see
+/// it. The lead is 893 ms, so a catch-up is at most that; two seconds puts it
+/// at +45 %, well past the gate, while the ordinary service jitter of a 2 s
+/// segment is under 1 %.
+const CDDA_TRIM_SEG_S: f64 = 2.0;
+/// A banked segment must itself have taken about as long as the audio in it. A
+/// loading stall is many times slower than real time; a segment with a couple
+/// of failed sub-fetches is at most ~10 % slower. Outside +/-20 % it is
+/// dropped.
+const CDDA_TRIM_SEG_SANE: f64 = 0.20;
+/// A window whose own estimate (corrected for the scale in force) is more than
+/// 3 % out was not measuring a clock, and is discarded.
+const CDDA_TRIM_WINDOW_SANE: f64 = 0.03;
+/// Estimates outside +/-1.5 % are refused: two crystals are a few hundred ppm
+/// apart at most, so such a number is a broken measurement (a loading stall once
+/// read as 25 %). The loader applies the same gate.
+const CDDA_TRIM_SANE: std::ops::RangeInclusive<u32> = 985_000..=1_015_000;
+
+/// What one clock measurement decided.
+#[derive(Debug, PartialEq)]
+enum CddaTrim {
+    Applied { from: u32, to: u32, win_ppm: i64, secs: f64 },
+    Held { ppm: u32, win_ppm: i64, secs: f64 },
+    Refused { est_ppm: u32, secs: f64 },
+    Discarded { secs: f64, ratio: f64 },
+}
+
+/// Measures the loader's CD-DA clock against this host's.
+///
+/// The loader decides which half of its ring the AICA is playing from an SH4
+/// timer with a compiled-in period; nothing on the console is locked to the
+/// AICA. If that period is off, the loader's idea of the play position drifts.
+/// This host serves every audio request and has its own clock, so it measures
+/// audio staged per second of real time and returns a scale in parts per
+/// million in the ReturnValue of every audio request.
+///
+/// What keeps the estimate honest:
+///  - it counts disc position, not requests (a re-asked sub-fetch repeats an
+///    LBA);
+///  - it uses only free-running intervals, in segments that must themselves
+///    have taken about as long as the audio in them (the `CDDA_TRIM_*`
+///    thresholds above);
+///  - it estimates one constant: total accepted audio over the sum of each
+///    epoch's accepted time divided by the scale then in force, so each
+///    correction is a fresh estimate over a longer span, not an increment.
+struct CddaClock {
+    /// What the loader is running on, in parts per million of its constant.
+    scale_ppm: u32,
+    prev: Option<(Instant, u32)>,
+    /// This segment, not yet judged. See `CDDA_TRIM_SEG_S`.
+    pend_audio_s: f64,
+    pend_time_s: f64,
+    win_audio_s: f64,
+    win_time_s: f64,
+    audio_s: f64,
+    denom_s: f64,
+    trims: u32,
+}
+
+impl CddaClock {
+    fn new() -> Self {
+        Self {
+            scale_ppm: 1_000_000,
+            prev: None,
+            pend_audio_s: 0.0,
+            pend_time_s: 0.0,
+            win_audio_s: 0.0,
+            win_time_s: 0.0,
+            audio_s: 0.0,
+            denom_s: 0.0,
+            trims: 0,
+        }
+    }
+
+    /// The estimator's current view, committed or not: seconds banked toward
+    /// the next window, that window's audio/time rate, the scale in force, and
+    /// how many estimates have been made.
+    fn progress(&self) -> (f64, f64, u32, u32) {
+        let rate = if self.win_time_s > 0.0 {
+            self.win_audio_s / self.win_time_s
+        } else {
+            0.0
+        };
+        (self.win_time_s, rate, self.scale_ppm, self.trims)
+    }
+
+    /// One audio fetch, at the instant it arrived and the LBA it asked for.
+    fn note(&mut self, now: Instant, lba: u32) -> Option<CddaTrim> {
+        if let Some((pt, plba)) = self.prev {
+            let gap = now.saturating_duration_since(pt).as_secs_f64();
+            let step = lba.wrapping_sub(plba);
+            if gap <= CDDA_TRIM_GAP_MAX && step <= CDDA_TRIM_STEP_MAX {
+                self.pend_audio_s += f64::from(step) / 75.0;
+                self.pend_time_s += gap;
+            } else {
+                // The stream was not free-running across this interval: the
+                // elapsed time is real and the audio it should answer for was
+                // never asked. Drop what is pending and start a fresh segment;
+                // the lead the loader owes comes back as a burst, which the
+                // test below is what refuses.
+                self.pend_audio_s = 0.0;
+                self.pend_time_s = 0.0;
+            }
+        }
+        self.prev = Some((now, lba));
+        if self.pend_time_s < CDDA_TRIM_SEG_S {
+            return None;
+        }
+        let (pa, pt) = (self.pend_audio_s, self.pend_time_s);
+        self.pend_audio_s = 0.0;
+        self.pend_time_s = 0.0;
+        // THE SEGMENT THAT JUST CLOSED MUST ITSELF LOOK LIKE REAL TIME. A
+        // stalled stream is many-fold behind and a catch-up many-fold ahead;
+        // dropping both keeps the sums honest.
+        if ((pa / pt) - 1.0).abs() > CDDA_TRIM_SEG_SANE {
+            return None;
+        }
+        self.win_audio_s += pa;
+        self.win_time_s += pt;
+
+        let want = if self.trims == 0 { CDDA_TRIM_FIRST_S } else { CDDA_TRIM_S };
+        if self.win_time_s < want {
+            return None;
+        }
+        let scale = f64::from(self.scale_ppm) / 1e6;
+        let rate = self.win_audio_s / self.win_time_s;
+        let secs = self.win_time_s;
+        // The window's own answer, which is the rate CORRECTED FOR THE SCALE
+        // ALREADY IN FORCE -- not the raw rate. Testing the raw rate would
+        // deadlock a loader that has already been trimmed: it would look 1 %
+        // out forever and never be measured again.
+        let est_win = rate * scale;
+        if (est_win - 1.0).abs() > CDDA_TRIM_WINDOW_SANE {
+            self.win_audio_s = 0.0;
+            self.win_time_s = 0.0;
+            return Some(CddaTrim::Discarded { secs, ratio: rate });
+        }
+        self.audio_s += self.win_audio_s;
+        self.denom_s += self.win_time_s / scale;
+        self.win_audio_s = 0.0;
+        self.win_time_s = 0.0;
+        self.trims += 1;
+        let win_ppm = ((est_win - 1.0) * 1e6).round() as i64;
+        let est_ppm = ((self.audio_s / self.denom_s) * 1e6).round() as u32;
+        if !CDDA_TRIM_SANE.contains(&est_ppm) {
+            return Some(CddaTrim::Refused { est_ppm, secs });
+        }
+        if est_ppm == self.scale_ppm {
+            return Some(CddaTrim::Held { ppm: est_ppm, win_ppm, secs });
+        }
+        let from = self.scale_ppm;
+        self.scale_ppm = est_ppm;
+        Some(CddaTrim::Applied { from, to: est_ppm, win_ppm, secs })
+    }
+}
+
+/// Is the clock trim on? `DCLOAD_CDDA_TRIM=0` turns it off, which leaves the
+/// loader on its compiled-in constant -- the A/B for "is the trim helping".
+fn cdda_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("DCLOAD_CDDA_TRIM").as_deref(),
+            Ok("0") | Ok("false") | Ok("no")
+        )
+    })
+}
+
+/// Packets of one audio answer sent before a short spin that lets the loader's
+/// 16 KB RX ring drain, and the length of the spin. An ADPCM answer is two
+/// packets and a PCM one five, so at the default geometry this never fires; it
+/// guards a larger sub-fetch, because an overrun ring does not degrade
+/// gracefully (loader AGENTS.md 4.8).
+const AUDIO_BURST_PACKETS: u32 = 8;
+const AUDIO_BURST_DELAY: Duration = Duration::from_micros(250);
+
+/// `DCLOAD_CDDA_SAFE=1` sends audio through the fully acknowledged `send_data`
+/// path instead of `send_audio`. Read once.
+///
+/// NOTE: current loaders do not echo the LoadBinary of an audio request, and
+/// `send_data` waits for that echo, so against them every audio request times
+/// out. It is only useful with a loader built without the echo suppression.
+fn cdda_safe() -> bool {
+    static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SAFE.get_or_init(|| {
+        matches!(
+            std::env::var("DCLOAD_CDDA_SAFE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    })
+}
+
+/// Ring pacing for the runtime path, in ONE place so the sector path and the
+/// audio fast path below cannot drift apart. Both feed the same 16 KB RX ring.
+fn runtime_pacing() -> (u32, Duration) {
+    let n = std::env::var("DCLOAD_RT_BURST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(10)
+        .max(1);
+    let us = std::env::var("DCLOAD_RT_DELAY_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1800);
+    (n, Duration::from_micros(us))
+}
+
+/// Send an audio answer with no acknowledgement round trips: the LoadBinary and
+/// the parts. The caller sends the ReturnValue.
+///
+/// `send_data_one` waits for the LoadBinary echo and probes with DoneBinary.
+/// A disc read needs both (a lost LoadBinary voids the whole window). For audio
+/// they cost more than they protect: measured 2026-08-31, they were 2.4 ms of
+/// the 3.0 ms each audio request froze the title. A lost packet here makes the
+/// loader's window incomplete, which it detects and re-asks for.
+///
+/// The ReturnValue stays mandatory: it is what releases the loader from
+/// `bb->loop()`.
+///
+/// With `probe` set, a DoneBinary follows the parts and the number of bytes
+/// the loader still reports missing is returned (`None` if no answer came in
+/// time).
+fn send_audio(
+    conn: &mut impl ExternalDcIo,
+    data: &[u8],
+    address: u32,
+    probe: bool,
+) -> std::result::Result<Option<u32>, std::boxed::Box<dyn std::error::Error>> {
+    // The acknowledged path, switchable without a rebuild (see `cdda_safe` for
+    // its limit with current loaders).
+    if cdda_safe() {
+        send_data(conn, data, address, None)?;
+        return Ok(None);
+    }
+    let (burst_packets, burst_delay) = runtime_pacing();
+    // Audio has its own, smaller burst threshold (see AUDIO_BURST_PACKETS).
+    let audio_burst = burst_packets.min(AUDIO_BURST_PACKETS);
+    let audio_delay = burst_delay.min(AUDIO_BURST_DELAY);
+    conn.send_command(DCLoadCmd {
+        cmd: DCLoadCmds::LoadBinary(),
+        address,
+        size: data.len() as u32,
+    })?;
+    let mut incr_address = address;
+    let mut packet_count: u32 = 0;
+    for chunk in data.chunks(CHUNK_SIZE) {
+        let mut padded_chunk = [0u8; CHUNK_SIZE];
+        padded_chunk[..chunk.len()].copy_from_slice(chunk);
+        conn.send_command(DCLoadCmd {
+            cmd: DCLoadCmds::PartBinary(Box::new(padded_chunk)),
+            address: incr_address,
+            size: chunk.len() as u32,
+        })?;
+        incr_address += chunk.len() as u32;
+        packet_count = packet_count.saturating_add(1);
+        if packet_count.is_multiple_of(audio_burst) {
+            spin_for(audio_delay);
+        }
+    }
+    if !probe {
+        return Ok(None);
+    }
+    // Before the caller's ReturnValue: after it the loader stops listening.
+    // One short wait, never `request_donebin`, which can wait seconds with the
+    // title frozen. A sample that gets no answer is simply ignored.
+    let deadline = Duration::from_millis(20);
+    conn.send_command(DCLoadCmd {
+        cmd: DCLoadCmds::DoneBinary(),
+        address: 0,
+        size: 0,
+    })?;
+    Ok(await_result(conn, Some(deadline))
+        .ok()
+        .as_deref()
+        .and_then(extract_donebin)
+        .map(|d| d.size))
+}
+
 fn send_data_one(
     conn: &mut impl ExternalDcIo,
     data: &[u8],
@@ -2414,21 +3580,28 @@ fn send_data_one(
         // to being fast.
         //
         // Tunable without a rebuild:
-        //   DCLOAD_RT_BURST     packets per pause (default 1 = pace each one)
-        //   DCLOAD_RT_DELAY_US  pause length, microseconds (default 500)
-        // Defaults left at the original values: pacing every packet at 500 us
-        // was measured and changed NOTHING about the failure, so slowing every
-        // transfer down for it would be a cost with no benefit.
-        let n = std::env::var("DCLOAD_RT_BURST")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(10)
-            .max(1);
-        let us = std::env::var("DCLOAD_RT_DELAY_US")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1800);
-        (n, Duration::from_micros(us))
+        //   DCLOAD_RT_BURST     packets per pause (default 10)
+        //   DCLOAD_RT_DELAY_US  pause length, microseconds (default 1800)
+        //
+        // THE DEFAULTS ARE THE DOMINANT COST ON THIS PATH, so know what they
+        // buy before raising them and what they cost before leaving them. A
+        // 16 KB read is 12 packets, so exactly ONE pause fires, at packet 10 --
+        // 1800 us of deliberate idling per chunk with the title frozen for all
+        // of it. Measured 2026-08-31 on Snow Surfers at 153 chunks/s: 276 ms
+        // per second, 27.6 % of wall time, spent waiting on purpose.
+        //
+        // What it buys is ring headroom: 10 packets back to back is ~15 KB into
+        // a 16 KB ring, which is the edge. A SHORTER pause taken MORE OFTEN is
+        // both safer and cheaper -- DCLOAD_RT_BURST=6 never puts more than
+        // ~9 KB in front of the DC and two 600 us pauses still cost a third of
+        // one 1800 us pause. Tune with g_cdfs_read_retries, g_rx_overflow and
+        // the "resending missing parts" warning as the acceptance test; if
+        // those stay at zero the pacing is not doing anything.
+        //
+        // A CD-DA fetch is 5 packets, so it never reaches the burst and pays
+        // none of this -- which is why the audio path's cost is round trips and
+        // G2 stores, not pacing.
+        runtime_pacing()
     } else {
         // UPLOAD PACING: THE BURST MUST FIT THE RING.
         //
@@ -2864,6 +4037,43 @@ fn await_result(
     }
 }
 
+/// Is this SendBinary chunk an answer to THIS read?
+///
+/// A STALE ANSWER FROM AN EARLIER READ IS INDISTINGUISHABLE BY ADDRESS ALONE,
+/// and that is not a theoretical worry. `measure_rtt()` reads four bytes at the
+/// loader's base five times over, and `diag::verify_image()` then reads the
+/// whole first segment from the SAME address: a straggler from the first
+/// arrives as a perfectly in-range chunk at offset 0, writes four bytes, marks
+/// the entire 1440-byte slot present -- and the other 1436 bytes stay zero.
+///
+/// Measured 2026-09-04 on Snow Surfers: `--diag` refused to start because the
+/// console "differed" from the ELF at base+4, reading 0x00 where the image
+/// carries the 0xdeadbeef magic. The loader was correct and the counters were
+/// there; the READ was wrong, and it reported that as a wrong build -- the one
+/// failure mode this check exists to catch, produced by the check itself.
+///
+/// The length is what tells them apart, because this read expects exactly
+/// `min(CHUNK_SIZE, size - offset)` bytes at each chunk boundary and anything
+/// else was cut to somebody else's request. The offset must land on a boundary
+/// too: `chunk_map` is indexed by `offset / CHUNK_SIZE`, so an unaligned chunk
+/// would mark a slot it does not fill.
+///
+/// `chunk_len` IS THE COMMAND'S `size` FIELD, NOT `chunk.len()`. The payload is
+/// carried as a fixed `Box<[u8; CHUNK_SIZE]>`, so `chunk.len()` is 1440 for
+/// every packet ever received and tells you nothing -- which is also why the
+/// copy below has to clamp with `.min(size)`. dcload sends
+/// `bytes_thistime = min(1440, bytes_left)` and puts it in `size`
+/// (`commands.c`, `cmd_sendbinq`), so that field is exact.
+fn chunk_is_ours(address: u32, size: usize, chunk_addr: u32, chunk_len: usize) -> bool {
+    if chunk_addr < address {
+        return false;
+    }
+    let offset = (chunk_addr - address) as usize;
+    offset < size
+        && offset.is_multiple_of(CHUNK_SIZE)
+        && chunk_len == CHUNK_SIZE.min(size - offset)
+}
+
 pub fn receive_data(
     conn: &mut impl ExternalDcIo,
     timeout: Option<Duration>,
@@ -2889,7 +4099,20 @@ pub fn receive_data(
     // the read-back verification path cannot draw over the log either.
     let bar = ui::bytes_bar(size as u64, "read-back");
 
-    for _ in 0..expected_chunks {
+    // PATIENCE, NOT A PACKET COUNT. This used to be `for _ in 0..expected_chunks`,
+    // so a batch carrying nothing but somebody else's leftovers burned one of
+    // this read's expected chunks -- and one straggler therefore shifted every
+    // subsequent read one answer out of phase, each one re-requesting in
+    // recovery and leaving a fresh duplicate behind it for the next. Measured
+    // 2026-09-04: a single stray packet from the PPF patch verification
+    // propagated through all five of measure_rtt()'s reads and ended up
+    // corrupting verify_image()'s, which is what disabled --diag. The budget is
+    // what keeps a silent console bounded; STRAGGLER_BUDGET is the slack.
+    const STRAGGLER_BUDGET: usize = 8;
+    let mut budget = expected_chunks + STRAGGLER_BUDGET;
+    let mut saw_done = false;
+    while budget > 0 && !saw_done && chunk_map.iter().any(|received| !received) {
+        budget -= 1;
         match await_result(conn, timeout) {
             Err(e) => {
                 warn!("Error waiting for data chunk: {}", e);
@@ -2907,12 +4130,18 @@ pub fn receive_data(
                                 // its slot never filled, and the recovery loop below
                                 // re-requested it forever. receive_data() therefore
                                 // only ever worked for single-packet reads.
-                                if inner_cmd.address < address
-                                    || (inner_cmd.address - address) as usize >= size
-                                {
+                                //
+                                // The length half is chunk_is_ours(); read it there.
+                                if !chunk_is_ours(
+                                    address,
+                                    size,
+                                    inner_cmd.address,
+                                    inner_cmd.size as usize,
+                                ) {
                                     warn!(
-                                        "Out-of-range chunk at 0x{:08x} for read-back of 0x{:08x}+{}, ignoring",
-                                        inner_cmd.address, address, size
+                                        "chunk at 0x{:08x}+{} is not an answer to the \
+                                         read-back of 0x{:08x}+{}, ignoring",
+                                        inner_cmd.address, inner_cmd.size, address, size
                                     );
                                     continue;
                                 }
@@ -2923,7 +4152,10 @@ pub fn receive_data(
                                 chunk_map[offset / CHUNK_SIZE] = true;
                                 bar.inc(chunk.len() as u64);
                             }
-                            DCLoadCmds::DoneBinary() => break,
+                            DCLoadCmds::DoneBinary() => {
+                                saw_done = true;
+                                break;
+                            }
                             _ => {
                                 warn!(
                                     "Unexpected command received while waiting for data: {:?}",
@@ -2968,10 +4200,17 @@ pub fn receive_data(
                                         // even for the short final piece --
                                         // "range end index 1440 out of range for
                                         // slice of length 30".
-                                        if inner_cmd.address < address
-                                            || (inner_cmd.address - address) as usize >= size
-                                        {
-                                            warn!("Bad packet received for DoneBinary, ignoring");
+                                        if !chunk_is_ours(
+                                            address,
+                                            size,
+                                            inner_cmd.address,
+                                            inner_cmd.size as usize,
+                                        ) {
+                                            warn!(
+                                                "chunk at 0x{:08x}+{} is not an answer to \
+                                                 the re-request of 0x{:08x}+{}, ignoring",
+                                                inner_cmd.address, inner_cmd.size, address, size
+                                            );
                                             continue;
                                         }
                                         // Append data chunk to data vector
@@ -2990,6 +4229,23 @@ pub fn receive_data(
                                                     if let Some(inner_cmd) = cmd.cmd {
                                                         match inner_cmd.cmd {
                                                             DCLoadCmds::DoneBinary() => {}
+                                                            // The first answer to this chunk,
+                                                            // late: it is what made the chunk
+                                                            // look missing, and the re-request
+                                                            // has just answered it again.
+                                                            DCLoadCmds::SendBinary(Some(_))
+                                                                if chunk_is_ours(
+                                                                    address,
+                                                                    size,
+                                                                    inner_cmd.address,
+                                                                    inner_cmd.size as usize,
+                                                                ) =>
+                                                            {
+                                                                debug!(
+                                                                    "duplicate answer for 0x{:08x}+{} ignored",
+                                                                    inner_cmd.address, inner_cmd.size
+                                                                );
+                                                            }
                                                             _ => {
                                                                 warn!(
                                                                     "Unexpected command received after receiving data: {:?}",
@@ -3253,6 +4509,134 @@ mod probe_tests {
 mod tests {
     use super::*;
 
+    /// The scan reports nothing on the clean test tone (whose steps are exactly
+    /// 512 and 1024) and does register foreign full-scale bytes as a run.
+    #[test]
+    fn the_continuity_check_is_silent_on_a_clean_signal_and_not_on_a_splice() {
+        let mut clean = SlewWatch::new();
+        for lba in 1000..1010 {
+            clean.scan(lba, &tone_sectors(lba, 1));
+        }
+        assert_eq!(clean.runs, 0, "the triangle is continuous by construction");
+        assert_eq!(clean.hits, 0);
+        assert_eq!(clean.max, 1024, "the right ear's step, and the larger one");
+
+        // Not a phase jump inside the tone: it only reaches +/-16384, so such a
+        // jump stays under LIMIT. Insert full-scale foreign bytes instead.
+        let mut spliced = SlewWatch::new();
+        let mut bad = tone_sectors(1000, 1);
+        for (k, f) in bad.chunks_exact_mut(4).skip(300).take(6).enumerate() {
+            let v: i16 = if k % 2 == 0 { i16::MAX } else { i16::MIN };
+            f[0..2].copy_from_slice(&v.to_le_bytes());
+            f[2..4].copy_from_slice(&v.to_le_bytes());
+        }
+        spliced.scan(1000, &bad);
+        assert!(spliced.runs > 0, "foreign bytes have to register as a run");
+        assert_eq!(spliced.first.map(|(l, _)| l), Some(1000));
+    }
+
+    /// A tone sector depends on its LBA alone: requests join without a seam
+    /// and a re-asked sector is byte-identical.
+    #[test]
+    fn the_served_tone_is_continuous_and_repeatable() {
+        let two = tone_sectors(1000, 2);
+        assert_eq!(two.len(), 2 * RAW_SECTOR_SIZE);
+        assert_eq!(tone_sectors(1000, 1), two[..RAW_SECTOR_SIZE]);
+        assert_eq!(tone_sectors(1001, 1), two[RAW_SECTOR_SIZE..]);
+        // ...and it is actually a signal, not a constant.
+        assert!(two.chunks_exact(2).any(|w| w != &two[0..2]));
+    }
+
+    /// The exact shape that disabled `--diag` on 2026-09-04.
+    ///
+    /// `measure_rtt()` reads four bytes at the loader base; `verify_image()`
+    /// then reads the whole first segment from that same address. A straggler
+    /// from the first is in range for the second, lands on chunk boundary 0,
+    /// and used to fill four bytes while marking all 1440 present -- so the
+    /// comparison read 0x00 where the image carries the 0xdeadbeef magic and
+    /// reported a perfectly good loader as the wrong build.
+    #[test]
+    fn a_four_byte_answer_is_not_a_chunk_of_a_long_read() {
+        let base = 0x8ce0_0000;
+        assert!(!chunk_is_ours(base, 27212, base, 4));
+        // ...while the real chunks of that read all are.
+        assert!(chunk_is_ours(base, 27212, base, CHUNK_SIZE));
+        assert!(chunk_is_ours(base, 27212, base + CHUNK_SIZE as u32, CHUNK_SIZE));
+        // 27212 = 18 * 1440 + 1292: the short tail is served short, not padded
+        // (`bytes_thistime = min(1440, bytes_left)` in cmd_sendbinq).
+        assert!(chunk_is_ours(base, 27212, base + 18 * CHUNK_SIZE as u32, 1292));
+        assert!(!chunk_is_ours(base, 27212, base + 18 * CHUNK_SIZE as u32, CHUNK_SIZE));
+        // And the four-byte read is still able to accept its own answer.
+        assert!(chunk_is_ours(base, 4, base, 4));
+    }
+
+    #[test]
+    fn a_chunk_off_the_boundary_or_out_of_range_is_refused() {
+        let base = 0x8ce0_0000;
+        // chunk_map is indexed by offset / CHUNK_SIZE, so an unaligned offset
+        // would mark a slot it does not fill.
+        assert!(!chunk_is_ours(base, 27212, base + 8, CHUNK_SIZE));
+        assert!(!chunk_is_ours(base, 27212, base - 4, CHUNK_SIZE));
+        assert!(!chunk_is_ours(base, 27212, base + 27212, CHUNK_SIZE));
+    }
+
+    /// Every packet `send_audio` puts on the wire, in order.
+    struct Wire(std::cell::RefCell<Vec<(String, u32, u32)>>);
+
+    impl ExternalDcIo for Wire {
+        fn poll(&self, _t: Option<Duration>) -> Result<polling::Events, std::io::Error> {
+            Ok(polling::Events::new())
+        }
+        fn handle_data(
+            &mut self,
+            _e: &polling::Events,
+        ) -> Result<Vec<DCReturnCmd>, std::io::Error> {
+            Ok(Vec::new())
+        }
+        fn send_command(
+            &self,
+            c: DCLoadCmd,
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            let name = match c.cmd {
+                DCLoadCmds::LoadBinary() => "LBIN",
+                DCLoadCmds::PartBinary(_) => "PBIN",
+                DCLoadCmds::DoneBinary() => "DBIN",
+                DCLoadCmds::ReturnValue() => "RETV",
+                _ => "other",
+            };
+            self.0.borrow_mut().push((name.to_string(), c.address, c.size));
+            Ok(0)
+        }
+    }
+
+    /// What `send_audio` puts on the wire for an ADPCM answer (2352 bytes): one
+    /// LoadBinary covering the whole answer, then two parts, and nothing else.
+    #[test]
+    fn an_audio_fetch_is_one_loadbin_two_parts_and_a_returnvalue() {
+        let w = Wire(std::cell::RefCell::new(Vec::new()));
+        // The ADPCM fetch: 4 sectors, one byte per stereo frame.
+        let buf = vec![0x80u8; 2352];
+        send_audio(&mut { w }, &buf, 0x8ce0_cc00, false).unwrap();
+        // `send_audio` took the value; rebuild to inspect. (Kept simple: the
+        // assertions below run on a second, identical call.)
+        let w2 = Wire(std::cell::RefCell::new(Vec::new()));
+        let mut w2 = w2;
+        send_audio(&mut w2, &buf, 0x8ce0_cc00, false).unwrap();
+        let sent = w2.0.borrow().clone();
+
+        let names: Vec<&str> = sent.iter().map(|p| p.0.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["LBIN", "PBIN", "PBIN"],
+            "send_audio put this on the wire: {sent:?}"
+        );
+        assert_eq!(sent[0].2, 2352, "the LoadBinary must open the whole window");
+        assert_eq!(sent[1].1, 0x8ce0_cc00);
+        assert_eq!(sent[1].2, CHUNK_SIZE as u32);
+        assert_eq!(sent[2].1, 0x8ce0_cc00 + CHUNK_SIZE as u32);
+        assert_eq!(sent[2].2, 2352 - CHUNK_SIZE as u32);
+    }
+
     /// A raw image with `image[at..at+4]` set to `word`, zero elsewhere.
     ///
     /// It used to be written to a temp file, because `gaps_probe_patches` took
@@ -3417,6 +4801,61 @@ mod tests {
         let got = literals_in_loader_footprint(&p, 0x0c01_0000, 0x8c00_4000);
         assert!(got.is_empty(), "the low base reported a high-RAM constant: {got:?}");
     }
+
+    use super::constant_range_fills;
+
+    /// The Katana crt0's first loop: r5 = hi, r6 = "SEGA", r4 = lo, then
+    /// `mov.l r6,@r4; add #4,r4; cmp/hs r5,r4; bf`. `between` goes after the
+    /// loads, to break the contiguity the scan relies on.
+    fn stack_paint(lo: u32, hi: u32, cmp: u16, between: Option<u16>) -> Vec<u8> {
+        let loop_at = if between.is_some() { 0x108 } else { 0x106 };
+        let mut ops = vec![
+            mov_l_pc(0x100, 0x208, 5),
+            mov_l_pc(0x102, 0x204, 6),
+            mov_l_pc(0x104, 0x200, 4),
+            (loop_at, 0x2462),
+            (loop_at + 2, 0x7404),
+            (loop_at + 4, cmp),
+            (loop_at + 6, 0x8bfb),
+        ];
+        if let Some(op) = between {
+            ops.push((0x106, op));
+        }
+        raw_ops(0x1000, &[(0x200, lo), (0x204, 0x4147_4553), (0x208, hi)], &ops)
+    }
+
+    #[test]
+    fn the_katana_stack_paint_is_found() {
+        let p = stack_paint(0x8c00_c000, 0x8c00_f400, 0x3452, None);
+        let got = constant_range_fills(&p, 0x0c01_0000);
+        assert_eq!(got, vec![(0x8c00_c000, 0x8c00_f400, 0x8c01_0106)]);
+    }
+
+    #[test]
+    fn an_inclusive_bound_covers_the_last_store() {
+        // cmp/hi keeps looping while Rp <= Rend, so the store AT hi happens.
+        let p = stack_paint(0x8c00_c000, 0x8c00_f3fc, 0x3456, None);
+        let got = constant_range_fills(&p, 0x0c01_0000);
+        assert_eq!(got, vec![(0x8c00_c000, 0x8c00_f400, 0x8c01_0106)]);
+    }
+
+    #[test]
+    fn a_bound_read_through_a_pointer_is_not_a_range() {
+        // `mov.l @r4,r4`: the literal is where the bound is kept, which is how
+        // every crt0 measured clears its .bss. Reporting it would name the
+        // variable's address as a range the title writes.
+        let p = stack_paint(0x8c00_c000, 0x8c00_f400, 0x3452, Some(0x6442));
+        let got = constant_range_fills(&p, 0x0c01_0000);
+        assert!(got.is_empty(), "reported a range held in a variable: {got:?}");
+    }
+
+    #[test]
+    fn a_fill_outside_ram_is_ignored() {
+        // Hardware registers are filled the same way, and are nobody's loader.
+        let p = stack_paint(0xa05f_8000, 0xa05f_8100, 0x3452, None);
+        let got = constant_range_fills(&p, 0x0c01_0000);
+        assert!(got.is_empty(), "reported a fill of hardware registers: {got:?}");
+    }
     use super::{PDTRA, declare_vga_in_ip_bin, ip_bin_peripherals, vga_cable_patches};
 
     /// The cable check every Katana title measured carries, byte for byte --
@@ -3521,5 +4960,210 @@ mod tests {
         assert_eq!(ip_bin_peripherals(&h), None);
         assert_eq!(declare_vga_in_ip_bin(&mut h), None);
         assert_eq!(&h[0x38..0x40], b"NOT HEX ");
+    }
+
+    /// Four sectors to a sub-fetch in ADPCM.
+    const TEST_SECTORS: u32 = 4;
+    /// The audio in one sub-fetch: what a correct model takes to play it, and
+    /// so the period a paced loader asks for the next one at.
+    fn fetch_audio_s() -> f64 {
+        f64::from(TEST_SECTORS) / 75.0
+    }
+
+    /// Feed a free-running stream shaped like the loader's: one sub-fetch every
+    /// `period_s` of real time, which is `fetch_audio_s()` when the loader's
+    /// clock is right and longer when it runs slow.
+    ///
+    /// Keep this in step with the loader's geometry: when it modelled an old
+    /// 80 ms half, every test passed on an estimator that accepted nothing on
+    /// the console.
+    fn feed_stream(clock: &mut CddaClock, fetches: u32, period_s: f64) -> Vec<CddaTrim> {
+        feed_from(clock, Instant::now(), 1000, fetches, period_s).0
+    }
+
+    /// The same, from a given instant and LBA, returning where it got to.
+    fn feed_from(
+        clock: &mut CddaClock,
+        base: Instant,
+        first_lba: u32,
+        fetches: u32,
+        period_s: f64,
+    ) -> (Vec<CddaTrim>, Instant, u32) {
+        let mut out = Vec::new();
+        let mut lba = first_lba;
+        let mut at = base;
+        for _ in 0..fetches {
+            if let Some(step) = clock.note(at, lba) {
+                out.push(step);
+            }
+            lba += TEST_SECTORS;
+            at += Duration::from_secs_f64(period_s);
+        }
+        (out, at, lba)
+    }
+
+    /// The estimator accepts time at all on the stream shape the console
+    /// produces (it once banked 0 s after minutes of play).
+    #[test]
+    fn a_free_running_stream_banks_time_at_all() {
+        let mut clock = CddaClock::new();
+        feed_stream(&mut clock, 280, fetch_audio_s());
+        let (banked, rate, _, _) = clock.progress();
+        assert!(banked > 10.0, "banked only {banked}s of a 14.9 s stream");
+        assert!((rate - 1.0).abs() < 0.001, "and it must read ~1.0, got {rate}");
+    }
+
+    /// And the guard that replaces what GAP_MAX used to do for stalls: a stream
+    /// whose every gap is short enough to be accepted, but which takes half
+    /// again as long as the audio it carries, is not a clock measurement.
+    #[test]
+    fn a_segment_that_took_too_long_is_not_banked() {
+        let mut clock = CddaClock::new();
+        // 80 ms of wall for 53 ms of audio: every gap is well inside
+        // CDDA_TRIM_GAP_MAX, so only CDDA_TRIM_SEG_SANE can refuse it.
+        feed_stream(&mut clock, 280, fetch_audio_s() * 1.5);
+        let (banked, _, _, trims) = clock.progress();
+        assert_eq!(banked, 0.0, "a stretched segment was banked");
+        assert_eq!(trims, 0);
+        assert_eq!(clock.scale_ppm, 1_000_000);
+    }
+
+    /// THE BIAS THE SEGMENT TEST EXISTS FOR. A gap past `CDDA_TRIM_GAP_MAX` is
+    /// dropped, but the audio it owes is not lost: the loader is behind by up
+    /// to its lead and asks for it as fast as the title lets it. Counted, that
+    /// burst is free audio against no elapsed time -- 890 ms of it, which is
+    /// 3000 ppm over a 300 s window, ten times the error being resolved.
+    #[test]
+    fn the_catch_up_after_a_long_gap_is_not_free_audio() {
+        let mut clock = CddaClock::new();
+        let base = Instant::now();
+        let (_, at, lba) = feed_from(&mut clock, base, 1000, 200, fetch_audio_s());
+        // The loader is kept off the ring for 3 s, then wins its lead back:
+        // 17 sub-fetches at the rate a service call can place them.
+        let at = at + Duration::from_secs_f64(3.0);
+        let (_, at, lba) = feed_from(&mut clock, at, lba, 17, 0.008);
+        let (_, _, _) = feed_from(&mut clock, at, lba, 200, fetch_audio_s());
+        let (banked, rate, _, _) = clock.progress();
+        assert!(banked > 15.0, "the whole stream was thrown away ({banked}s)");
+        assert!(
+            (rate - 1.0).abs() < 0.005,
+            "the catch-up dragged the rate to {rate}"
+        );
+    }
+
+    /// But an ordinary service stall -- the title not calling the GD driver for
+    /// a few hundred ms -- is inside GAP_MAX, so its deficit AND the catch-up
+    /// that answers it are both counted, and they cancel. Dropping those would
+    /// throw away most of a real session.
+    #[test]
+    fn a_short_service_stall_still_banks_its_time() {
+        let mut clock = CddaClock::new();
+        let base = Instant::now();
+        let (_, at, lba) = feed_from(&mut clock, base, 1000, 100, fetch_audio_s());
+        let at = at + Duration::from_secs_f64(0.30);
+        let (_, at, lba) = feed_from(&mut clock, at, lba, 6, 0.008);
+        feed_from(&mut clock, at, lba, 200, fetch_audio_s());
+        let (banked, rate, _, _) = clock.progress();
+        assert!(
+            banked > 15.0,
+            "a 300 ms stall cost more than one segment of a 16.3 s stream ({banked}s)"
+        );
+        assert!((rate - 1.0).abs() < 0.005, "rate {rate}");
+    }
+
+    #[test]
+    fn the_clock_measures_a_model_that_runs_slow() {
+        // 0.3 % slow: one half of audio staged every half/0.997 of real time.
+        let mut clock = CddaClock::new();
+        let steps = feed_stream(&mut clock, 1800, fetch_audio_s() / 0.997);
+        let first = steps.first().expect("a long stream must produce a decision");
+        match *first {
+            CddaTrim::Applied { from, to, .. } => {
+                assert_eq!(from, 1_000_000);
+                assert!(
+                    (996_800..=997_200).contains(&to),
+                    "measured {to} ppm, wanted 997000"
+                );
+            }
+            ref other => panic!("expected a trim, got {other:?}"),
+        }
+        assert_eq!(clock.scale_ppm, 997_000, "and it is what goes back to the loader");
+    }
+
+    #[test]
+    fn a_model_that_is_already_right_is_left_alone() {
+        let mut clock = CddaClock::new();
+        let steps = feed_stream(&mut clock, 1800, fetch_audio_s());
+        assert!(
+            matches!(steps.first(), Some(CddaTrim::Held { ppm: 1_000_000, .. })),
+            "got {steps:?}"
+        );
+    }
+
+    /// THE DEFECT THIS EXISTS FOR. While a title loads, the loader stops
+    /// servicing the ring on time and the stream falls behind real time -- 250
+    /// fetches in 37 s instead of 9 was measured on a real boot. Read as a clock
+    /// that says 25 % slow, and it drove the trim to its clamp.
+    #[test]
+    fn a_loading_stall_is_not_a_clock_measurement() {
+        let mut clock = CddaClock::new();
+        // Four times behind real time, without a single gap past GAP_MAX.
+        let steps = feed_stream(&mut clock, 1800, fetch_audio_s() * 4.0);
+        assert!(steps.is_empty(), "a stalled stream decided something: {steps:?}");
+        assert_eq!(clock.scale_ppm, 1_000_000);
+    }
+
+    /// A sub-fetch that missed its deadline is re-asked at the same LBA. Counted
+    /// as audio it is 1.5 % of error against the 0.03 % being resolved.
+    #[test]
+    fn a_re_asked_sub_fetch_is_not_audio() {
+        let mut clock = CddaClock::new();
+        let base = Instant::now();
+        clock.note(base, 1000);
+        clock.note(base + Duration::from_millis(2), 1000);
+        assert_eq!(clock.pend_audio_s, 0.0);
+        assert!(clock.pend_time_s > 0.0, "but the time it took still counts");
+    }
+
+    /// POSITIVE CONTROL FOR THE DISCONTINUITY DUMP, which printed nothing at all
+    /// for five sessions. The hit is placed deliberately past frame 588 --
+    /// a quarter of a 2352-frame request -- because that is where the old code,
+    /// indexing a PCM frame number into the ADPCM payload, clamped its slice to
+    /// empty. An instrument that prints an empty field looks like an instrument
+    /// that found nothing.
+    #[test]
+    fn the_discontinuity_dump_is_not_empty_past_the_adpcm_length() {
+        let mut pcm = vec![0u8; 2352 * 4];
+        // A full-scale flip at frame 1200: two samples no acoustic signal joins.
+        let at = 1200 * 4;
+        pcm[at..at + 4].copy_from_slice(&[0x00, 0x80, 0x00, 0x80]);
+        pcm[at + 4..at + 8].copy_from_slice(&[0xff, 0x7f, 0xff, 0x7f]);
+        pcm[at + 8..at + 12].copy_from_slice(&[0x00, 0x80, 0x00, 0x80]);
+        let mut slew = SlewWatch::new();
+        slew.scan(0x0004_e6ce, &pcm);
+        assert!(slew.runs > 0, "the control did not trip the scan at all");
+        let (lba, frame) = slew.first.expect("a run must record where it was");
+        assert_eq!(lba, 0x0004_e6ce);
+        assert!(frame > 588, "place the hit past the ADPCM length, got {frame}");
+        assert_eq!(
+            slew.first_bytes.len(),
+            32,
+            "the dump came back empty or short -- the exact defect this is for"
+        );
+    }
+
+    /// An answer further out than any pair of crystals can be is a broken
+    /// measurement, and applying one is worse than applying nothing.
+    #[test]
+    fn an_impossible_answer_is_refused() {
+        let mut clock = CddaClock::new();
+        // 2.5 % slow: inside the window's own sanity test, outside the range a
+        // clock can occupy.
+        let steps = feed_stream(&mut clock, 1800, fetch_audio_s() / 0.975);
+        assert!(
+            matches!(steps.first(), Some(CddaTrim::Refused { .. })),
+            "got {steps:?}"
+        );
+        assert_eq!(clock.scale_ppm, 1_000_000, "and nothing moved");
     }
 }

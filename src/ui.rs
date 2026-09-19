@@ -441,6 +441,28 @@ mod tests {
         }
     }
 
+    /// A snapshot carries the ZEROS, whatever the panel is currently showing.
+    ///
+    /// The whole reason `w` exists is that a paste of the panel is what gets
+    /// reasoned about later, and the panel hides zeros by default -- so
+    /// "this counter is absent" and "this counter is zero" arrive looking
+    /// identical, and the difference between them is the difference between a
+    /// feature compiled out and a hazard that is not happening.
+    #[test]
+    fn a_snapshot_holds_the_zeros_and_the_headings() {
+        let mut st = sample_state();
+        // Exactly the setting a reader of the panel would have left it in.
+        st.show_all = false;
+        st.collapsed = true;
+        let text = st.snapshot();
+        assert!(text.contains("g_rx_link_giveup"), "a zero counter");
+        assert!(text.contains("g_cdda_plays"), "a zero counter under its own heading");
+        assert!(text.contains("g_rx_polls"), "a counter that moved");
+        assert!(text.contains("[RX ring]") && text.contains("[CD-DA]"), "headings");
+        // Plain text: nothing from the box, and no escape sequences.
+        assert!(!text.contains('│') && !text.contains('\u{1b}'), "no box, no colour");
+    }
+
     /// EVERY LINE THE SAME WIDTH, or the box is a staircase. Measured on the
     /// visible width, since the borders and the highlight are styled.
     #[test]
@@ -773,6 +795,25 @@ mod tests {
 /// above it has to stay readable.
 static PANEL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Is the panel asking the console for anything right now?
+///
+/// A GLOBAL, and it has to be: the key that flips it is read on the panel's own
+/// thread, and the two things that act on it -- `diag::Probe` and
+/// `stackwatch::StackWatch` -- are ticked on the syscall loop and hold no
+/// reference to the panel or to each other. One bit, and the readers are
+/// eventually consistent by construction: a tick either sees the new value or
+/// the next one does.
+///
+/// FALSE ALSO WHEN THERE IS NO PANEL, which is what makes one switch serve both
+/// directions: the stack watch runs on the complement of this, so a session
+/// that never brings the panel up keeps the watch it has always had.
+static SAMPLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Does the panel want samples? Read from the syscall loop, once per tick.
+pub fn sampling_wanted() -> bool {
+    SAMPLING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Register a bar with the display, keeping the panel last.
 ///
 /// `MultiProgress::add` appends, so with a panel present every transfer bar
@@ -871,17 +912,25 @@ pub struct DiagPanel {
 }
 
 impl DiagPanel {
-    pub fn new(interval: Duration) -> Self {
+    /// `start_on` is whether the session asked for `--diag`. A panel that
+    /// starts off is not a panel that is absent: its key reader is running, so
+    /// `d` can bring the sampling up later -- which is the whole reason one is
+    /// built in every session now.
+    pub fn new(interval: Duration, start_on: bool) -> Self {
         // Nothing here draws when stderr is not a terminal (indicatif turns
         // every draw into a no-op), and a key reader would then spin on a
         // stdin that answers instantly. So both are decided by the same test.
         let on_screen = console::Term::stderr().is_term();
+        // NOT WANTED WITHOUT A TERMINAL. There would be no key reader to turn
+        // it off again, so an unattended run would poll a running title for the
+        // whole session with nobody there to read the numbers.
+        SAMPLING.store(start_on && on_screen, std::sync::atomic::Ordering::Relaxed);
         let state = std::sync::Arc::new(std::sync::Mutex::new(PanelState {
             rows: vec![PanelRow::placeholder("no sample yet")],
             status: "waiting for the first sample".into(),
             page: 0,
             show_all: false,
-            collapsed: false,
+            collapsed: !start_on,
             interval,
             painted: String::new(),
         }));
@@ -978,6 +1027,10 @@ impl DiagPanel {
                 }
                 unreadable = 0;
                 let Ok(mut s) = state.lock() else { break };
+                // Built under the lock, written outside it: `write_snapshot`
+                // takes indicatif's draw lock, and holding both is how two
+                // threads deadlock.
+                let mut dump: Option<String> = None;
                 // EVERY MOVEMENT KEY IS A PAGE. There is no scroll position to
                 // step: the panel pages, for the reason set out in `compose`.
                 match key {
@@ -993,8 +1046,19 @@ impl DiagPanel {
                         s.show_all = !s.show_all;
                         s.page = 0;
                     }
+                    // `d` IS THE MASTER SWITCH, not a way to hide the box.
+                    // Hiding it while it kept sampling was the worst of both:
+                    // every sample is a round trip dcload answers from inside
+                    // `bb->loop()`, so an invisible panel went on perturbing
+                    // exactly the timings someone hides it in order to measure.
                     console::Key::Char('d') | console::Key::Char('D') => {
                         s.collapsed = !s.collapsed;
+                        SAMPLING.store(!s.collapsed, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // `w` FOR A COPY THAT SURVIVES THE NEXT REPAINT. See
+                    // `PanelState::snapshot`.
+                    console::Key::Char('w') | console::Key::Char('W') => {
+                        dump = Some(s.snapshot());
                     }
                     console::Key::Char('+') | console::Key::Char('=') => {
                         s.interval = (s.interval / 2).max(INTERVAL_MIN);
@@ -1007,6 +1071,9 @@ impl DiagPanel {
                     }
                 }
                 drop(s);
+                if let Some(text) = dump {
+                    write_snapshot(&text);
+                }
                 paint(&bar, &state);
             }
         });
@@ -1016,10 +1083,71 @@ impl DiagPanel {
 impl Drop for DiagPanel {
     fn drop(&mut self) {
         PANEL_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        SAMPLING.store(false, std::sync::atomic::Ordering::Relaxed);
         self.bar.finish_and_clear();
         multi().remove(&self.bar);
         restore_terminal();
     }
+}
+
+impl PanelState {
+    /// The whole sample as plain text: no box, no colour, no paging, nothing
+    /// hidden.
+    ///
+    /// **THE PANEL IS THE WRONG THING TO COPY OUT OF, and not by accident.** It
+    /// lives in indicatif's live region, which is erased and redrawn on every
+    /// sample and again before every log record -- and a terminal drops a
+    /// selection the moment the cells under it change. Selecting it is a race
+    /// against the next repaint, which is unwinnable at any sampling rate that
+    /// is also useful. This puts the same numbers somewhere they will not move
+    /// again.
+    ///
+    /// **EVERYTHING, INCLUDING THE ZEROS.** The panel hides those by default,
+    /// which makes "absent" and "zero" indistinguishable to anyone reading a
+    /// paste of it -- a real cost, paid twice: the RX ring's overflow, reinit
+    /// and linkchange counters had to be *inferred* to be zero from the fact
+    /// that they were missing, before anything could be concluded from them.
+    fn snapshot(&self) -> String {
+        let mut out = String::from("=== dcload counters ===\n");
+        out.push_str(&format!("    {}\n", self.status));
+        for r in &self.rows {
+            if r.header {
+                out.push_str(&format!("\n[{}]\n", r.label));
+            } else if r.value.is_empty() {
+                out.push_str(&format!("  {}\n", r.label));
+            } else {
+                out.push_str(&format!("  {:<30} {}\n", r.label, r.value));
+            }
+        }
+        out
+    }
+}
+
+/// Put a snapshot where it will hold still: the scrollback, and a file.
+///
+/// Printed through `suspend`, so it lands ABOVE the live region as ordinary
+/// terminal output and is never redrawn -- which is the whole point. Appended
+/// to a file as well, because the reliable way to get these numbers off the
+/// machine is not to select them at all.
+fn write_snapshot(text: &str) {
+    const PATH: &str = "dcload-diag.txt";
+    let saved = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PATH)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(text.as_bytes())
+        })
+        .is_ok();
+    multi().suspend(|| {
+        eprintln!("{text}");
+        if saved {
+            eprintln!("  (also appended to {PATH})\n");
+        } else {
+            eprintln!("  (could not write {PATH})\n");
+        }
+    });
 }
 
 /// Draw the whole block into the bar's message, in one string.
@@ -1047,7 +1175,10 @@ fn paint(bar: &ProgressBar, state: &std::sync::Mutex<PanelState>) {
 /// is observable through a ProgressBar.
 fn compose(s: &mut PanelState, term_rows: usize, term_cols: usize) -> String {
     if s.collapsed {
-        let text = clip("── diag hidden · d to show ──", term_cols);
+        let text = clip(
+            "── diag off · the console is not polled · d to sample ──",
+            term_cols,
+        );
         let pad = term_cols.saturating_sub(text.chars().count());
         return format!("{}{}", " ".repeat(pad), style(text).dim());
     }
@@ -1185,11 +1316,11 @@ fn compose(s: &mut PanelState, term_rows: usize, term_cols: usize) -> String {
     let hint = fits(
         &[
             format!(
-                " ↑↓ PgUp/PgDn: page · a: {} · ± rate · d ",
+                " ↑↓ PgUp/PgDn: page · a: {} · ± rate · w: save · d ",
                 if s.show_all { "used only" } else { "all" }
             ),
-            " ↑↓ · a · ± · d ".to_string(),
-            " ↑↓ a ± d ".to_string(),
+            " ↑↓ · a · ± · w · d ".to_string(),
+            " ↑↓ a ± w d ".to_string(),
         ],
         total_inner,
     );

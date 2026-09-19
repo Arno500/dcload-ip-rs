@@ -1,0 +1,31 @@
+# dcload-ip-rs: which PPF patch belongs to which dump.
+#
+# A mapping list, and it has to be one: what these patches fix is different in
+# every title, so unlike the GAPS probe and the cable check there is no content
+# signature to look for. See src/patchdb.rs.
+#
+# THE LIST IS A CLAIM, THE PATCH CHECKS IT. A PPF3.0 carries 1024 bytes of the
+# original file, and a row that names the right patch for the wrong dump is
+# refused with a reason rather than applied. A patch with no blockcheck (PPF1.0,
+# or PPF3.0 written without one) can prove nothing, and for those the bin_md5
+# column is the only thing between the patch and the wrong image -- fill it in.
+#
+# Tab-separated. `-` means "no key of this kind"; a row needs at least one.
+#
+#   disc_md5   MD5 of the boot sector (IP.BIN sector 0). The identity the rest
+#              of this host uses -- `dcload-ip-rs identify <image>` prints it as
+#              `boot md5`. Names a dump, not a game.
+#   bin_md5    MD5 of the UNPATCHED boot binary, printed as `bin md5`. Narrower,
+#              and the one that matters when the patch has no blockcheck.
+#   file       the .ppf, in this directory.
+#   apply      auto   = applied by itself; --no-ppf turns it off.
+#              manual = shipped and reported, applied only with --ppf.
+#              Use manual when the patch changes what the title DOES rather
+#              than only what it supports.
+#   title      what the row is about. Documentation, never a key: the same game
+#              is renamed between regions and the same name covers dumps that
+#              differ.
+#   note       one line, logged when the patch is applied.
+#
+# disc_md5	bin_md5	file	apply	title	note
+1aae36b0c58051ed3f9c3190a2927dbd	ca89367a7c231402e015aa9b3844973b	jc-snows-60hz-vga.ppf	auto	SNOW SURFERS (PAL) -- Snow Surfers v1.001 (1999)(Sega)(PAL)[!]	Adds the VGA video path the PAL release was built without, and forces 60 Hz. By japanese_cake, 2015 (jc-snows-60hz-vga.nfo). Pair it with --vga so the cable check and IP.BIN agree; --no-ppf leaves the title as shipped.

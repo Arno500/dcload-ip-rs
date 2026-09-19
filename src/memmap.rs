@@ -243,10 +243,19 @@ impl MemoryDb {
             // Absent on every row written before this column existed, and
             // absent on any row whose sessions never got an answer out of the
             // loader. Both mean the same thing here: not measured.
-            let sp_min = f.next().and_then(|s| {
-                let s = s.trim();
-                u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()
-            });
+            // AND A VALUE THAT IS NOT AN ADDRESS IS "NOT MEASURED" TOO, which
+            // heals a file already carrying one rather than asking everyone to
+            // edit it. `note_stack` refuses to record such a value now; rows
+            // written before it did (Snow Surfers had 0x00000000) would
+            // otherwise keep failing the low-family margin test forever, since
+            // the merge only ever lowers this.
+            let sp_min = f
+                .next()
+                .and_then(|s| {
+                    let s = s.trim();
+                    u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+                })
+                .filter(|&sp| MemoryMap::index(sp).is_some());
             db.rows.insert(
                 md5.trim().to_string(),
                 Row {
@@ -346,6 +355,21 @@ impl MemoryDb {
     }
 }
 
+/// One write of the map, taken out of the recorder so it can happen without
+/// the recorder's lock.
+pub struct PendingSave {
+    db: MemoryDb,
+    path: std::path::PathBuf,
+    map: MemoryMap,
+    sp_min: Option<u32>,
+}
+
+impl PendingSave {
+    pub fn save(&self) -> std::io::Result<()> {
+        self.db.save(&self.path)
+    }
+}
+
 /// Accumulates one session's observations and writes them out as it goes.
 ///
 /// SAVED WHILE RUNNING, not at the end, and not from the read path either.
@@ -357,7 +381,7 @@ impl MemoryDb {
 /// **There are ends this process is not told about at all.** Under a debugger
 /// the Ctrl-C handler is not reached (see `install_signal_handler`), and a
 /// Stop button is a kill. So the file is kept current by a ticker thread that
-/// owes nothing to either: `record()` marks and returns, `flush_if_due()` on
+/// owes nothing to either: `record()` marks and returns, `take_due()` on
 /// the ticker does the I/O. Two consequences, both wanted:
 ///
 /// - the worst a `kill -9` can cost is `EVERY`, not a whole session;
@@ -463,39 +487,72 @@ impl MemoryRecorder {
     /// Called from the stack watch, which is off the read path like everything
     /// else here: this only takes a minimum, and the ticker does the writing.
     pub fn note_stack(&mut self, sp: u32) {
+        // A STACK POINTER IS IN RAM OR IT IS NOT A STACK POINTER. `g_gd_sp_min`
+        // is latched by the loader and read back over the wire, so a value that
+        // is not an address is a reading, not a measurement: a counter decoded
+        // out of the wrong build (AGENTS.md 14.19), a short reply, a loader that
+        // has not latched anything yet. Taking it costs the title its row
+        // forever, because this merges by MINIMUM and nothing ever raises it --
+        // and 0 fails the low-family margin test for every future session.
+        // Measured 2026-09-04: `game-memory.tsv` carried sp_min = 0x00000000 for
+        // Snow Surfers, reported as "seen entering GD syscalls with a stack
+        // pointer as low as 0x00000000".
+        if MemoryMap::index(sp).is_none() {
+            return;
+        }
         if self.sp_min.is_none_or(|had| sp < had) {
             self.sp_min = Some(sp);
         }
     }
 
-    /// Write, if there is anything to write and enough time has passed.
-    /// Called from the ticker, never from the read path.
-    pub fn flush_if_due(&mut self) {
+
+    /// The write that is due, if there is anything to write and enough time
+    /// has passed: what to write and where, taken under the recorder's lock so
+    /// the caller can do the I/O WITHOUT it (see the ticker in
+    /// `install_signal_handler`). Hand the result back to `note_saved`.
+    pub fn take_due(&self) -> Option<PendingSave> {
         let due = if self.first { Self::FIRST } else { Self::EVERY };
         let nothing_new = self.map == self.saved && self.sp_min == self.saved_sp_min;
         if nothing_new || self.last_save.elapsed() < due {
-            return;
+            return None;
         }
-        self.flush();
+        Some(self.pending())
     }
 
-    pub fn flush(&mut self) {
+    fn pending(&self) -> PendingSave {
         let mut db = MemoryDb::default();
         db.record(&self.md5, &self.title, &self.map, self.sp_min, self.first);
-        match db.save(&self.path) {
+        PendingSave {
+            db,
+            path: self.path.clone(),
+            map: self.map,
+            sp_min: self.sp_min,
+        }
+    }
+
+    /// Account for a write `take_due` handed out. What was written is what is
+    /// marked saved, not the current map: a block recorded while the file was
+    /// being written is still owed.
+    pub fn note_saved(&mut self, done: &PendingSave, result: std::io::Result<()>) {
+        match result {
             Ok(()) => {
-                self.saved = self.map;
-                self.saved_sp_min = self.sp_min;
+                self.saved = done.map;
+                self.saved_sp_min = done.sp_min;
                 self.first = false;
-                self.last_save = std::time::Instant::now();
             }
             // Not fatal and not silent: the session goes on, the map is simply
             // not learned. Retried at the next interval.
-            Err(e) => {
-                log::warn!("could not write {}: {e}", self.path.display());
-                self.last_save = std::time::Instant::now();
-            }
+            Err(e) => log::warn!("could not write {}: {e}", done.path.display()),
         }
+        self.last_save = std::time::Instant::now();
+    }
+
+    /// Write now, holding whatever lock the caller holds. Only for the end of
+    /// a session, when nothing is frozen waiting on it.
+    pub fn flush(&mut self) {
+        let p = self.pending();
+        let result = p.save();
+        self.note_saved(&p, result);
     }
 }
 
@@ -552,13 +609,21 @@ pub fn install_signal_handler() {
              seconds, but the end-of-session report will not be printed"
         );
     }
+    // THE FILE IS WRITTEN WITHOUT THE LOCK. The disc read path takes the same
+    // lock to mark a block, and the title is frozen on that path; a write that
+    // held it would freeze the title for as long as the file system takes --
+    // and this file lives wherever the host runs from, a synced folder
+    // included, where a rename can take far longer than a CD-DA fetch's 20 ms.
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(MemoryRecorder::TICK);
-            if let Some(rec) = active()
-                && let Ok(mut rec) = rec.lock()
-            {
-                rec.flush_if_due();
+            let Some(rec) = active() else { continue };
+            let Some(due) = rec.lock().ok().and_then(|r| r.take_due()) else {
+                continue;
+            };
+            let result = due.save();
+            if let Ok(mut r) = rec.lock() {
+                r.note_saved(&due, result);
             }
         }
     });
@@ -861,5 +926,38 @@ mod tests {
         assert!(back.get("aaa").unwrap().map.is_marked(0xe0));
         assert!(back.get("bbb").unwrap().map.is_marked(0xfc));
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod sp_tests {
+    use super::*;
+
+    fn rec() -> MemoryRecorder {
+        MemoryRecorder::new(
+            std::path::PathBuf::from("/nonexistent/game-memory.tsv"),
+            "1aae36b0c58051ed3f9c3190a2927dbd",
+            "SNOW SURFERS",
+            MemoryMap::new(),
+        )
+    }
+
+    #[test]
+    fn an_sp_outside_ram_is_not_a_measurement() {
+        // Measured 2026-09-04: game-memory.tsv carried sp_min = 0 for Snow
+        // Surfers, which the merge can never raise again and which fails the
+        // low-family margin test for every future session.
+        let mut r = rec();
+        r.note_stack(0);
+        r.note_stack(0xffff_ffff);
+        assert_eq!(r.sp_min, None, "a non-address was taken as a stack pointer");
+
+        r.note_stack(0x8c00_eee4);
+        assert_eq!(r.sp_min, Some(0x8c00_eee4));
+
+        // A real reading still merges by minimum, and junk still cannot lower it.
+        r.note_stack(0x8c00_b000);
+        r.note_stack(0);
+        assert_eq!(r.sp_min, Some(0x8c00_b000));
     }
 }

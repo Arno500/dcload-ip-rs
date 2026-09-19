@@ -60,6 +60,15 @@ enum Fmt {
     GdIdx,
     /// `g_gd_cmd_counts[]` -- one slot per GD command code.
     GdCmd,
+    /// A TMU1 tick count (Pck/16, 3125 ticks per ms), shown as milliseconds as
+    /// well. The loader measures the CD-DA ring's clearance on this one.
+    Tmu1Ms,
+    /// A TMU2 tick count (Pck/4, 12500 ticks per ms), shown as milliseconds as
+    /// well. The two timers run at DIFFERENT rates and the loader uses both, so
+    /// a raw tick count here is four times the millisecond figure it would be
+    /// above: that is exactly the kind of arithmetic to do once, here, and
+    /// never again in one's head.
+    Tmu2Ms,
 }
 
 /// What to read, grouped the way `scripts/dc-counters.py` groups it -- for
@@ -102,6 +111,13 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
         "Upload path",
         &[
             ("g_lbin_count", Fmt::Num),
+            // LoadBinaries answered without an echo: the CD-DA sub-fetches,
+            // whose answers the host sends without waiting for one.
+            ("g_lbin_noecho", Fmt::Num),
+            // Transfers ended by their last part rather than by the
+            // ReturnValue. In a healthy session this tracks the CD-DA
+            // sub-fetch count.
+            ("g_bin_data_done", Fmt::Num),
             ("g_dbin_count", Fmt::Num),
             ("g_dbin_incomplete", Fmt::Num),
             ("g_pbin_ok", Fmt::Num),
@@ -119,12 +135,11 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
     (
         "GD emulation",
         &[
-            // THE FOOTPRINT GUARD, and the first two numbers to look at when a
-            // title misbehaves at a low base. `g_gd_sp_min` is the lowest
-            // stack pointer a GD syscall was entered with: subtract `_end`
-            // from it and that is the margin §4.6 is about, readable while the
-            // title is still healthy. `g_gd_sp_in_image` is how many times it
-            // was already too late.
+            // The footprint guard, first to read when a title misbehaves at a
+            // low base: `g_gd_sp_min` is the lowest stack pointer a GD syscall
+            // was entered with (minus the loader's `_end`, the margin of the
+            // loader's AGENTS.md 4.6); `g_gd_sp_in_image` counts entries
+            // already inside the loader.
             ("g_gd_sp_min", Fmt::Hex),
             ("g_gd_sp_in_image", Fmt::Num),
             ("g_gd_idx_counts", Fmt::GdIdx),
@@ -134,22 +149,52 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("g_cdfs_read_fails", Fmt::Num),
             ("g_cdfs_sync_chunks", Fmt::Num),
             ("g_cdfs_sync_reentered", Fmt::Num),
+            // Non-zero while a disc read waits; CD-DA declines to fetch then.
+            ("g_gd_in_transfer", Fmt::Num),
+            // The stuck GD lock watchdog: `g_gd_lock_stuck` counts locks
+            // released because they were held while the server was parked and
+            // unchanged for 250 ms; `_owner` says who held it (0 = the server
+            // itself). It has not fired in any recorded session.
+            ("g_gd_lock_stuck", Fmt::Num),
+            ("g_gd_lock_stuck_owner", Fmt::Num),
+            ("g_gd_lock_stuck_ticks", Fmt::Num),
+            ("g_gd_lock_owner", Fmt::Num),
+            ("g_gd_lock_gen", Fmt::Num),
         ],
     ),
     (
         "CD-DA",
         &[
+            // Health. Both count SUB-FETCHES: served, and failed and asked
+            // again (the host answers a re-ask from its history).
             ("g_cdda_plays", Fmt::Num),
             ("g_cdda_fetches", Fmt::Num),
             ("g_cdda_fetch_fails", Fmt::Num),
-            ("g_cdda_underruns", Fmt::Num),
+            // Why they failed, when it was not the deadline: an answer to
+            // another request (refused), or our LBA echoed without our data (a
+            // lost answer, caught instead of pushing the previous one again).
+            ("g_cdda_wrong_lba", Fmt::Num),
+            ("g_cdda_retv_nodata", Fmt::Num),
+            // Late LoadBinaries into the staging buffer refused at the door.
+            ("g_cdda_stale_lbin", Fmt::Num),
+            // The AICA was about to play a part of the ring that was not
+            // refilled in time: keyed off and restarted -- a short silence
+            // instead of seconds of desynchronised ADPCM.
+            ("g_cdda_mutes", Fmt::Num),
+            // A title took channel 62/63: the stream was restarted.
+            ("g_cdda_ch_stolen", Fmt::Num),
+            // The least audio ever left ahead of the AICA (the lead, normally
+            // ~890 ms; 0 would be a ring run dry), and the longest the loader
+            // went without a service: the music only moves when the title
+            // calls the GD driver.
+            ("g_cdda_room_min", Fmt::Tmu1Ms),
+            ("g_cdda_svc_gap_max", Fmt::Tmu2Ms),
             ("g_cdda_toc_fails", Fmt::Num),
-            ("g_cdda_irq_pushes", Fmt::Num),
-            ("g_cdda_deferred", Fmt::Num),
-            ("g_cdda_aica_pos", Fmt::Num),
-            ("g_cdda_mvol", Fmt::Hex),
-            ("g_cdda_mvol_raised", Fmt::Num),
             ("g_cdda_last_lba", Fmt::Hex),
+            // Clock: the loop period in TMU1 ticks, and the host's trim in
+            // force (1000000 = none yet).
+            ("g_cdda_end_tm", Fmt::Num),
+            ("g_cdda_scale_ppm", Fmt::Num),
         ],
     ),
     (
@@ -170,6 +215,11 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("tool_ip", Fmt::Ip),
             ("g_pmcr_backwards", Fmt::Num),
             ("g_idle_polls_max", Fmt::Num),
+            // The millisecond deadline, which is a DIFFERENT exit from the
+            // adapter loop than `g_idle_polls_max` records -- reading that one
+            // as "no timeout fired" is exactly the mistake that hid a 3.005 s
+            // freeze for two sessions.
+            ("g_fine_timeouts", Fmt::Num),
         ],
     ),
 ];
@@ -277,6 +327,11 @@ pub struct SampleSink {
     /// True while the sink is pointed at the CONTROL range instead of the
     /// counters -- see `Probe::arm_control`.
     control: bool,
+    /// Is the panel switched on? AN INACTIVE SINK CLAIMS NOTHING, and that is
+    /// what lets this and `stackwatch`'s sink both stay installed: their ranges
+    /// OVERLAP -- the panel's span contains `g_gd_sp_min` -- so whichever came
+    /// first in the list would eat the other's replies. Exactly one is on.
+    active: bool,
 }
 
 impl SampleSink {
@@ -292,6 +347,11 @@ impl SampleSink {
             last_sent: Instant::now(),
             need_send: false,
             control: false,
+            // A SINK MADE BY HAND IS USABLE. `Probe::new` overrides this with
+            // the switch's real state; defaulting to off here would make the
+            // constructor's product silently deaf, which is a trap for the next
+            // caller and was one for the tests.
+            active: true,
         }
     }
 
@@ -391,6 +451,9 @@ impl PacketSink for SampleSink {
     /// The terminator is claimed whether or not a sample is still open,
     /// because that is exactly the case that leaked.
     fn claim(&mut self, cmd: &DCReturnCmd) -> bool {
+        if !self.active {
+            return false;
+        }
         let Some(inner) = cmd.cmd.as_ref() else {
             return false;
         };
@@ -498,6 +561,13 @@ pub struct Probe {
     real: (u32, usize),
     /// What the counters were read out of, for the one line this logs at start.
     label: String,
+    /// When the previous sample was DECODED, so the header can report the gap
+    /// the deltas are really against. See `status`.
+    prev_at: Option<Instant>,
+    /// That gap, latched at the TOP of `decode` -- `status()` is called from
+    /// the bottom of it and from repaints in between, so measuring it there
+    /// against a just-updated `prev_at` reports 0.00s every time.
+    last_gap: Option<f64>,
     /// THE PANEL FEEDS THE STACK VERDICT WHEN IT IS UP, because the range this
     /// samples CONTAINS `g_gd_sp_min` and `g_gd_sp_in_image` -- so the separate
     /// watch cannot run alongside it without the two sinks claiming each
@@ -512,7 +582,12 @@ impl Probe {
     /// Fails only when NONE of the counters are in the ELF, which means it is
     /// not dcload; a partial set is a build with some features compiled out and
     /// is served as it is.
-    pub fn new(elf: &[u8], label: String, interval: Duration) -> Result<Self, String> {
+    pub fn new(
+        elf: &[u8],
+        label: String,
+        interval: Duration,
+        start_on: bool,
+    ) -> Result<Self, String> {
         let syms = crate::loaders::symbols(elf)?;
         let mut entries = Vec::new();
         for (gi, (_, names)) in GROUPS.iter().enumerate() {
@@ -542,16 +617,21 @@ impl Probe {
             prev: vec![None; n],
             lo,
             span,
-            panel: ui::DiagPanel::new(interval),
+            panel: ui::DiagPanel::new(interval, start_on),
             // The first sample goes out as soon as the loop starts: a panel
             // that stays empty for two seconds looks broken.
             next_at: Instant::now(),
-            sink: Arc::new(Mutex::new(SampleSink::new(lo, span))),
+            sink: Arc::new(Mutex::new(SampleSink {
+                active: crate::ui::sampling_wanted(),
+                ..SampleSink::new(lo, span)
+            })),
             samples: 0,
             ctl: first_load(elf)
                 .map(|(a, d)| (a, d.len()))
                 .unwrap_or((lo, IDENT_BYTES)),
             ctl_done: false,
+            prev_at: None,
+            last_gap: None,
             real: (lo, span),
             label,
             stack: None,
@@ -594,6 +674,13 @@ impl Probe {
     /// progress: posting a command anywhere else would put it in the middle of
     /// a conversation somebody else owns.
     pub fn tick(&mut self, conn: &mut impl ExternalDcIo) {
+        // 0. Follow `d`. Turning off ABANDONS whatever is in flight rather
+        //    than waiting it out: the reason to press it is that the console
+        //    should stop being asked, and a sample already open would go on
+        //    being retransmitted for its whole PIECE_RETRY life.
+        if !self.sync_switch() {
+            return;
+        }
         // 1. Anything complete? Decoding is done here, off the packet path.
         let done = {
             let mut sink = self.sink.lock().expect("sink poisoned");
@@ -749,6 +836,31 @@ impl Probe {
         self.repaint_status();
     }
 
+    /// Bring the sampling into line with the panel's switch. Returns whether
+    /// anything should be done this tick.
+    fn sync_switch(&mut self) -> bool {
+        let want = crate::ui::sampling_wanted();
+        let mut sink = self.sink.lock().expect("sink poisoned");
+        if sink.active == want {
+            return want;
+        }
+        sink.active = want;
+        sink.pending = None;
+        sink.done = None;
+        sink.need_send = false;
+        drop(sink);
+        if want {
+            // Straight away: a panel that stays empty for a whole interval
+            // after the key was pressed reads as a key that did nothing.
+            self.next_at = Instant::now();
+            info!("diag: sampling on ({} every {:.1} s) -- d to stop",
+                  self.label, self.panel.interval().as_secs_f64());
+        } else {
+            info!("diag: sampling off -- the console is no longer being asked anything");
+        }
+        want
+    }
+
     /// How long the syscall loop may block before this wants the CPU again.
     ///
     /// Two things need waking up: the next sample, and the panel's own repaint
@@ -758,6 +870,20 @@ impl Probe {
     /// touches no socket.
     pub fn poll_timeout(&self) -> Option<Duration> {
         const REPAINT: Duration = Duration::from_millis(150);
+        // OFF: nothing is outstanding, so there is no sample to wait for. Come
+        // back anyway while there is a terminal, or `d` would not be noticed
+        // until whatever else wants the loop next -- which, with the stack
+        // watch on its ten-second interval, is a switch that appears dead.
+        //
+        // Slower than REPAINT because there is nothing to repaint: this is a
+        // keypress latency and a quarter of a second is not felt. It is the one
+        // cost this instrument now imposes on a session that never asks for it
+        // -- four wakeups a second that touch no socket, and `settle()` is
+        // guarded on its own idle time so they cannot end a burst early.
+        const IDLE_KEY_POLL: Duration = Duration::from_millis(250);
+        if !self.sink.lock().expect("sink poisoned").active {
+            return self.panel.on_screen().then_some(IDLE_KEY_POLL);
+        }
         // WHILE A SAMPLE IS IN FLIGHT THE DEADLINE IS ITS OWN, not the next
         // sample's -- which is already in the past, and asking to be woken at a
         // time that has been and gone is a busy loop. It spun at full tilt for
@@ -791,8 +917,20 @@ impl Probe {
             let sink = self.sink.lock().expect("sink poisoned");
             (sink.pending.is_some(), sink.misses)
         };
-        let secs = self.panel.interval().as_secs_f64();
-        let mut s = format!("{secs:.1}s");
+        // THE MEASURED GAP, NOT THE ONE THAT WAS ASKED FOR.
+        //
+        // Every rate anyone reads off this panel is a delta divided by this
+        // number, and the setting is not that number: a sample is answered
+        // from inside `bb->loop()`, which during CD-DA is a fraction of a
+        // percent duty cycle, so a request made on a 2 s timer is regularly
+        // served most of a second late. Printing the setting made 49 audio
+        // fetches served over a real 2.61 s read as 24.5/s against the
+        // 18.75/s real time needs -- a 31 % over-fetch that was not
+        // happening. AGENTS.md 11: prove the instrument first.
+        let mut s = match self.last_gap {
+            Some(secs) => format!("{secs:.2}s"),
+            None => format!("{:.1}s set", self.panel.interval().as_secs_f64()),
+        };
         if in_flight {
             s.push_str(" ...");
         }
@@ -818,6 +956,10 @@ impl Probe {
                 stack.observe(sp, in_image);
             }
         }
+        let now = Instant::now();
+        self.last_gap = self.prev_at.map(|t| (now - t).as_secs_f64());
+        self.prev_at = Some(now);
+
         let mut rows: Vec<PanelRow> = Vec::new();
         let mut changed_names: Vec<String> = Vec::new();
         let mut current_group = usize::MAX;
@@ -884,6 +1026,21 @@ impl Probe {
                     let moved = was.is_some_and(|w| w != v);
                     let text = match e.fmt {
                         Fmt::Hex => format!("0x{v:08x}"),
+                        Fmt::Tmu1Ms | Fmt::Tmu2Ms => {
+                            // 0xffffffff is the "nothing has been measured yet"
+                            // value of the minimum-tracking counters, and
+                            // 343 s of milliseconds would read as a measurement.
+                            if v == u64::from(u32::MAX) {
+                                "not measured yet".to_string()
+                            } else {
+                                let per_ms = if matches!(e.fmt, Fmt::Tmu1Ms) {
+                                    3125.0
+                                } else {
+                                    12500.0
+                                };
+                                format!("{} ({:.1} ms)", grouped(v), v as f64 / per_ms)
+                            }
+                        }
                         Fmt::Ip => format!(
                             "{}.{}.{}.{}",
                             v >> 24,
@@ -1097,10 +1254,16 @@ mod tests {
         peer.send_to(&sbin(0x0c01_0000, &[9; 4]), from)
             .expect("send theirs");
 
-        // ONE wakeup, both datagrams. The poller is one-shot, so this is only
-        // true because `handle_data` drains the socket -- and the reason it has
-        // to is that anything left queued surfaces a wakeup late, which is how
-        // the counter probe came to abandon replies that were on their way.
+        // THE SLEEP IS THE TEST'S PROBLEM, NOT THE PRODUCT'S. What is being
+        // asserted is that ONE wakeup drains whatever is queued -- the poller
+        // is one-shot, and anything left behind surfaces a wakeup late, which
+        // is how the counter probe came to abandon replies that were on their
+        // way. Two `send_to` calls on loopback are normally both queued before
+        // the receiver looks, but nothing guarantees it: caught 2026-09-05
+        // failing about one run in fifty with `seen.len()` 0, the second
+        // datagram simply not having arrived yet. Waiting for both to be
+        // queued is what makes the measurement the intended one.
+        std::thread::sleep(Duration::from_millis(50));
         let evt = conn.poll(Some(Duration::from_millis(500))).expect("poll");
         let seen = conn.handle_data(&evt).expect("handle");
 
@@ -1111,6 +1274,37 @@ mod tests {
         // the failure mode a greedy filter would cause.
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].cmd.as_ref().map(|c| c.address), Some(0x0c01_0000));
+    }
+
+    /// A sink that is switched off claims NOTHING, terminators included.
+    ///
+    /// This is the whole of the mutual exclusion between the panel and the
+    /// stack watch: their ranges overlap -- the panel's span contains
+    /// `g_gd_sp_min` -- so if both claimed at once, whichever the IO layer
+    /// consulted first would eat the other's replies, silently, and the loser
+    /// would report nothing for the rest of the session. `d` moves the flag;
+    /// this is what the flag has to mean.
+    #[test]
+    fn an_inactive_sink_claims_nothing() {
+        fn dbin(addr: u32, size: u32) -> DCReturnCmd {
+            let mut v = b"DBIN".to_vec();
+            v.extend_from_slice(&addr.to_be_bytes());
+            v.extend_from_slice(&size.to_be_bytes());
+            DCReturnCmd::try_from(v).expect("DBIN parses")
+        }
+        let ours = DCReturnCmd::try_from(sbin(0x8c00_a000, &[1, 2, 3, 4])).expect("SBIN parses");
+
+        let mut sink = SampleSink::new(0x8c00_a000, 8);
+        sink.open();
+        sink.active = false;
+        assert!(!sink.claim(&ours), "data inside our own range");
+        assert!(!sink.claim(&dbin(0x8c00_a000, 8)), "our own terminator");
+
+        // And the same sink switched back on takes both, so what is being
+        // tested is the flag and not a range that never matched.
+        sink.active = true;
+        assert!(sink.claim(&ours), "data, once switched on");
+        assert!(sink.claim(&dbin(0x8c00_a000, 8)), "terminator, once switched on");
     }
 
     /// A `DoneBinary` is claimed on its ADDRESS, and on nothing else.

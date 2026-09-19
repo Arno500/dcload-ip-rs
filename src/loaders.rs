@@ -188,8 +188,10 @@ pub const GD_STACK_WORST_CASE: u32 = 2048;
 ///   margin 5240 bytes (`_end` 0x8c00a558) -- booted and played, 1624 reads
 ///   margin 2444 bytes (`_end` 0x8c00b044) -- the title corrupted the loader
 ///
-/// CD-DA is what moved it: 2 KB of code in an image whose remaining headroom
-/// was 5 KB. 4096 sits between the two, and the reason it is not larger is
+/// The first CD-DA engine is what moved it between the two; the current one
+/// costs ~6.8 KB, and with it the default `_end` (0x8c00c58c) is above Sonic
+/// Adventure's SP, so that title no longer passes this test at the stock base.
+/// 4096 sits between the two measurements, and the reason it is not larger is
 /// AGENTS.md 14.9 -- a guard that rejects the one configuration measured to
 /// work guards nothing. `GD_STACK_WORST_CASE` is most of what it has to cover;
 /// the rest is the title's own frames below the point this can see.
@@ -952,6 +954,26 @@ pub fn game_db_candidates(
     )
 }
 
+/// Where the shipped PPF patches live: `patches/`, found by the same search as
+/// the two tables, so the loaders, the preset database, the learned memory map
+/// and the patches are one deployment rather than four.
+///
+/// A directory rather than a file, but the rule is identical -- and it has to
+/// be, because the failure it prevents is the same one: a set found in
+/// `target/` is a set `cargo clean` takes and a set that differs between the
+/// debug and release builds. A patch applied from a stale directory is worse
+/// than a missing one, since what it produces is a title that runs.
+pub fn patch_dir_candidates(
+    explicit: Option<String>,
+    env_dir: Option<String>,
+    loader_dir: &Path,
+    exe: Option<&Path>,
+    cwd: Option<&Path>,
+    manifest_dir: &str,
+) -> Vec<PathBuf> {
+    data_file_candidates("patches", explicit, env_dir, loader_dir, exe, cwd, manifest_dir)
+}
+
 /// Where the learned memory map lives: beside the preset database, by the same
 /// search, so the two travel together and a deployment has both or neither.
 pub fn memory_db_candidates(
@@ -1290,9 +1312,13 @@ pub fn is_uploadable(sh: &elf::section::SectionHeader) -> bool {
 ///
 /// EVERY MOVE GOES THROUGH THE SCRATCH BASE, deliberately, even when a direct
 /// one looks safe. 0x8ce00000 is chosen once and for all as neutral ground: its
-/// span is clear of every other base in the set in both directions, and a
-/// pre-linked (non-relocatable) loader is built for it, so the first step never
-/// depends on the relocation machinery working. From up there the final move is
+/// span is clear of every other base in the set in both directions, and it is
+/// the base `dcload-relocatable.elf` is LINKED at, so the first hop is a
+/// zero-delta move -- the relocation machinery is exercised but has nothing to
+/// change, which is as close to the old pre-linked ELF as makes no difference.
+/// (There used to be a pre-linked loader per base; the set is now the
+/// relocatable image alone -- see LOADER_BASES in target-src/dcload/Makefile.)
+/// From up there the final move is
 /// always the same shape -- high, clear ground, into the address the title
 /// actually wants -- instead of a different one per starting point.
 ///
@@ -1780,6 +1806,23 @@ mod tests {
     fn high_to_low_is_direct_from_neutral_ground() {
         let plan = plan(SCRATCH_BASE, 0x8c00_0100, image(0x8c00_0100), image(SCRATCH_BASE));
         assert_eq!(plan, vec![0x8c00_0100]);
+    }
+
+    #[test]
+    fn a_stale_build_at_the_scratch_base_can_be_replaced_via_a_relay() {
+        // running == want == SCRATCH_BASE, which is what a rebuilt loader set
+        // looks like on a console that was not power-cycled. There is no
+        // one-hop answer -- a loader cannot be uploaded over itself, and the
+        // destination IS the neutral ground -- so ensure_loader_base looks for
+        // a base that plans non-empty in BOTH directions and chains the two
+        // legs. Assert such a base exists, or that search is dead code and the
+        // only remedy is a power cycle.
+        let want = SCRATCH_BASE;
+        let relay = [DEFAULT_BASE, ISOLDR_HIGH_ADDR].iter().find(|&&alt| {
+            !plan(want, alt, image(alt), image(SCRATCH_BASE)).is_empty()
+                && !plan(alt, want, image(want), image(SCRATCH_BASE)).is_empty()
+        });
+        assert!(relay.is_some(), "no relay base for a same-base replacement");
     }
 
     #[test]

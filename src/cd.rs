@@ -9,7 +9,7 @@ use crate::disc_formats::types::{HIGH_DENSITY_LBA, TocTrack};
 /// This used to answer a fixed two-entry table built from `start_sector()` and
 /// `num_sectors()` alone: one data track, or two when the low-density area was
 /// separate, and nothing else. On a `.gdi` that is not an approximation, it is
-/// a different disc -- Snow Surfers has nineteen tracks, fifteen of them audio,
+/// a different disc -- Snow Surfers has nineteen tracks, sixteen of them audio,
 /// and was being told it had one. **The TOC is the only place a title ever
 /// learns it has music**, so a title handed that table will never ask to play
 /// a note, whatever else works.

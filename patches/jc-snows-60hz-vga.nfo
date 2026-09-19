@@ -1,0 +1,30 @@
+____________________________________________________
+
+ Snow Surfers PAL/EURO 60hz+VGA patch
+                         by japanese_cake 14/03/2015
+____________________________________________________
+
+
+[+] What is this patch for?
+    ~~~~~~~~~~~~~~~~~~~
+
+        The European version of Rippin' Riders Snowboarding, renamed Snow Surfers,
+        does not offer the VGA output nor a 50/60hz selection screen.
+		This patch forces the game to run in 60Hz and adds the VGA support.
+
+
+[+] NOTE
+    ~~~~
+
+        When building an Dreamcast image (CDI/GDI/etc.), make sure the VGA flag is
+        set in the boot file (AKA IP.BIN).
+        Apply the patch using PPF-O-Matic V3.0 on the 1ST_READ.BIN from the following
+        GDI dump:
+           - Snow Surfers v1.001 (1999)(Sega)(PAL)[!]
+
+        Or simply use the provided 1ST_READ_PATCHED.BIN.
+____________________________________________________
+
+                                  jc.dcdev@gmail.com
+                       japanese-cake.livejournal.com
+____________________________________________________

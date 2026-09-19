@@ -91,6 +91,10 @@ struct Sink {
     have: Vec<bool>,
     open: bool,
     done: Option<Vec<u8>>,
+    /// Is this watch the one on the wire? AN INACTIVE SINK CLAIMS NOTHING --
+    /// see the note on `StackVerdict` for why exactly one of this and the
+    /// panel's sink may be, and `d` for what moves it.
+    active: bool,
 }
 
 impl PacketSink for Sink {
@@ -99,6 +103,9 @@ impl PacketSink for Sink {
     /// terminator instead of our own breaks the disc read the title is blocked
     /// on, which is measured and written up in `diag::SampleSink`.
     fn claim(&mut self, cmd: &DCReturnCmd) -> bool {
+        if !self.active {
+            return false;
+        }
         let Some(inner) = cmd.cmd.as_ref() else {
             return false;
         };
@@ -150,6 +157,8 @@ pub struct StackVerdict {
     sp_min: Option<u32>,
     reported: bool,
     warned: bool,
+    /// A reading that was not a stack pointer has been reported.
+    foreign: bool,
 }
 
 impl StackVerdict {
@@ -165,6 +174,7 @@ impl StackVerdict {
             sp_min: None,
             reported: false,
             warned: false,
+            foreign: false,
         }
     }
 
@@ -186,6 +196,25 @@ impl StackVerdict {
         if sp == NEVER {
             // The title has not made a GD syscall yet -- normal for the first
             // seconds of a boot, and permanent for a title with no disc.
+            return;
+        }
+        // A VALUE THAT IS NOT RAM WAS READ OUT OF SOMETHING ELSE. Measured
+        // 2026-09-17: Snow Surfers went back to the BIOS menu 180 ms after
+        // EXEC, flycast booted the dcload disc again, and this read that
+        // build's `_global_bg_color` and three flag bytes -- 16 and 0x00010100
+        // -- then declared the title's stack inside the loader. `note_stack`
+        // already refused to record it; this refuses to report it.
+        if !(0x0c00_0000..0x0d00_0000).contains(&(sp & 0x1fff_ffff)) {
+            if !self.foreign {
+                self.foreign = true;
+                warn!(
+                    "the stack counters read back 0x{sp:08x} and {in_image}, which is no \
+                     stack pointer: the console is not running the loader verified at \
+                     0x{:08x} any more. If the title went back to the BIOS menu or the \
+                     console was reset, whatever booted since answered this read.",
+                    self.base
+                );
+            }
             return;
         }
         let sp = sp.min(self.sp_min.unwrap_or(u32::MAX));
@@ -323,6 +352,7 @@ impl StackWatch {
                 have: vec![false; span],
                 open: false,
                 done: None,
+                active: !crate::ui::sampling_wanted(),
             })),
             lo,
             span,
@@ -348,6 +378,13 @@ impl StackWatch {
     /// command anywhere else would put it in the middle of a transfer that owns
     /// the conversation.
     pub fn tick(&mut self, conn: &mut impl ExternalDcIo) {
+        // THE COMPLEMENT OF THE PANEL, decided once per tick. Both read the
+        // same two counters and both sinks claim by address, so exactly one of
+        // them may be on the wire; `d` moves the boundary and this is the side
+        // that gives way, because the panel shows these numbers itself.
+        if !self.sync_switch() {
+            return;
+        }
         let done = self.sink.lock().expect("sink poisoned").done.take();
         if let Some(blob) = done {
             self.started = None;
@@ -415,8 +452,30 @@ impl StackWatch {
         }
     }
 
+    /// Give way to the panel, or take over from it. Returns whether this watch
+    /// should do anything this tick.
+    fn sync_switch(&mut self) -> bool {
+        let want = !crate::ui::sampling_wanted();
+        let mut sink = self.sink.lock().expect("sink poisoned");
+        if sink.active == want {
+            return want;
+        }
+        sink.active = want;
+        sink.open = false;
+        sink.done = None;
+        drop(sink);
+        self.started = None;
+        if want {
+            self.next_at = Instant::now();
+        }
+        want
+    }
+
     /// How long the syscall loop may block before this wants the CPU again.
     pub fn poll_timeout(&self) -> Option<Duration> {
+        if !self.sink.lock().expect("sink poisoned").active {
+            return None;
+        }
         let due = match self.started {
             Some(started) => (started + TIMEOUT).min(self.last_sent + RETRY),
             None => self.next_at,
@@ -501,6 +560,28 @@ mod tests {
         assert_eq!(
             MemoryDb::load(&path).get("md5").and_then(|r| r.sp_min),
             Some(0x8c00_b000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a rebooted console answered: another build's globals, at the
+    /// addresses the verified loader keeps its stack counters.
+    #[test]
+    fn a_reading_that_is_not_ram_is_neither_recorded_nor_a_verdict() {
+        let dir = std::env::temp_dir().join("dcload-stackverdict-foreign");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = recorder(&dir);
+        let mut v = StackVerdict::new(crate::loaders::DEFAULT_BASE, 0x8c00_cb48, Some(rec.clone()));
+        v.observe(0x0001_0100, 16);
+        assert!(v.foreign && !v.warned && !v.reported);
+        assert_eq!(v.sp_min, None);
+        rec.lock().unwrap().flush();
+        assert_eq!(
+            MemoryDb::load(&dir.join("game-memory.tsv"))
+                .get("md5")
+                .and_then(|r| r.sp_min),
+            None
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

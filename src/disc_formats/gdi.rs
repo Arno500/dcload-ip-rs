@@ -16,6 +16,21 @@ pub struct Gdi {
 }
 
 impl Gdi {
+    /// The files of this `.gdi`'s audio tracks, in the order it lists them.
+    ///
+    /// For [`crate::disc_formats::zip::warm_track_indexes`]: the audio tracks
+    /// only, because the data tracks are indexed before the title runs anyway
+    /// (identifying the disc and reading its boot binary go through them), and
+    /// building one index twice at once would cost seconds on a 1 GiB track.
+    pub fn audio_track_files(&self) -> Vec<String> {
+        self.tracks
+            .borrow()
+            .iter()
+            .filter(|t| t.track_type == 0)
+            .map(|t| t.track.clone())
+            .collect()
+    }
+
     /// A `.gdi` sitting in a directory, with its tracks next to it.
     pub fn open_path(filename: &str) -> Result<Self, std::io::Error> {
         let path = Path::new(filename);
@@ -304,13 +319,24 @@ impl DiscFormat for Gdi {
             };
 
             let track = &tracks[idx];
+            let source = track.source.as_ref().unwrap();
             let at = (track.offset as u64)
                 + ((req_lba - track_start) as u64) * (RAW_SECTOR_SIZE as u64);
-            let out = &mut buffer[done * RAW_SECTOR_SIZE..(done + run) * RAW_SECTOR_SIZE];
+            // A track's span runs to the next track's start, and its file can
+            // stop short of it: the next track's pregap is not dumped (Snow
+            // Surfers' track 18 is 150 sectors short of the data track after
+            // it). Those sectors are silence, as on the disc. An error here
+            // made the loader ask for the same sectors forever, and a title
+            // playing that track to its end, or looping it, went silent.
+            let in_file = match next_start {
+                Some(_) => run.min((source.len().saturating_sub(at) / RAW_SECTOR_SIZE as u64) as usize),
+                None => run,
+            };
+            let out = &mut buffer[done * RAW_SECTOR_SIZE..(done + in_file) * RAW_SECTOR_SIZE];
             // One read for the whole run: an audio track is raw all the way
             // through, so unlike a data track there is nothing to skip
-            // between sectors.
-            track.source.as_ref().unwrap().read_at(at, out)?;
+            // between sectors. The rest of the run stays zero.
+            source.read_at(at, out)?;
             done += run;
         }
         Ok(buffer)
@@ -412,6 +438,26 @@ mod tests {
         }
     }
 
+    /// Positive control for the index warmer: this list is all it is given, so
+    /// an empty one would make it do nothing at all while looking like it
+    /// worked, and every track would go back to being indexed inside the first
+    /// CD-DA sub-fetch (AGENTS.md 14.9).
+    #[test]
+    fn the_audio_tracks_are_the_ones_the_warmer_is_given() {
+        let g = tracks_at(&[(0, 4), (45000, 4), (60000, 0), (70000, 0)]);
+        assert_eq!(
+            g.audio_track_files(),
+            vec!["track03.bin".to_string(), "track04.bin".to_string()],
+            "the audio tracks only, named the way the .gdi names them"
+        );
+        assert!(
+            tracks_at(&[(0, 4), (45000, 4)])
+                .audio_track_files()
+                .is_empty(),
+            "a disc with no audio gives nothing to warm, not its data tracks"
+        );
+    }
+
     /// THE BUG THIS LOCKS DOWN. `start_sector()` is the LOWEST data track and
     /// `boot_sector()` the high-density one, and on a GD-ROM they are different
     /// tracks with the same valid header. Getting them the same way round again
@@ -490,6 +536,35 @@ mod tests {
         // track's start at 0 (+150).
         let want = 45150 + (len / 2352) as u32 - 150;
         assert_eq!(gdi.num_sectors(), want);
+    }
+
+    /// A track's span runs to the next track's start, and its file can stop
+    /// short of it (the next track's pregap is not dumped): what is past the
+    /// file is silence, not an error the loader would ask about forever. Past
+    /// the LAST track there is no span, and that stays an error.
+    #[test]
+    fn audio_past_a_short_track_file_is_silence_up_to_the_next_track() {
+        let dir = std::env::temp_dir().join(format!("gdi-short-track-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Track 2: 3 sectors in its file, 5 in its span (track 3 starts at 5).
+        let body: Vec<u8> = (0..3 * 2352).map(|i| (i % 251) as u8 + 1).collect();
+        std::fs::write(dir.join("track02.raw"), &body).unwrap();
+        std::fs::write(dir.join("track03.raw"), vec![7u8; 2352]).unwrap();
+        let mut g = tracks_at(&[(0, 4), (0, 0), (5, 0)]);
+        g.container = Box::new(DirContainer::new(dir.clone()));
+        for (i, t) in g.tracks.borrow_mut().iter_mut().enumerate() {
+            t.track = format!("track{:02}.raw", i + 1);
+        }
+
+        let got = g.read_audio(150, 5).expect("the span reads whole");
+        assert_eq!(&got[..3 * 2352], &body[..], "the file's own sectors");
+        assert!(got[3 * 2352..].iter().all(|b| *b == 0), "the pregap is silence");
+        // The next track begins exactly where the span ends.
+        assert_eq!(g.read_audio(155, 1).expect("track 3"), vec![7u8; 2352]);
+        // Positive control: the last track has no span to fill.
+        assert!(g.read_audio(155, 2).is_err(), "past the last track's file");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// isoldr's `Load_IPBin()` patch offsets, worked out from its pointer

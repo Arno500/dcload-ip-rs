@@ -89,13 +89,13 @@ impl Preset {
                       arbitrate, and it is driven from the GD syscalls)"
                 .to_string());
         }
-        // `cdda` is SERVED now (dcload's cdda.c), so what is worth reporting
-        // is which of isoldr's options this loader answers differently -- not
-        // that the feature is missing. The source and destination bits pick
-        // between an IDE/SD device and DMA/SQ/PIO, none of which describe a
-        // loader reading over UDP and writing sound RAM with the CPU; the
-        // position bits pick an SH4 timer, and this engine reads the AICA's
-        // own play position instead. See target-src/dcload/cdda.h.
+        // `cdda` is served (dcload's cdda.c), so only the options answered
+        // differently are worth reporting. The source/destination bits choose
+        // an IDE/SD device and DMA/SQ/PIO, which do not apply to a loader
+        // reading over UDP and writing sound RAM with the CPU; the position
+        // bits choose TMU1 or TMU2, and dcload always uses TMU1. The channel
+        // bits are the one choice that differs visibly: dcload always uses the
+        // fixed pair.
         if self.cdda != 0 {
             const CDDA_CH_FIXED: u32 = 0x0002_0000;
             if self.cdda & CDDA_CH_FIXED == 0 {

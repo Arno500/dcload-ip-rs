@@ -69,6 +69,16 @@ impl ZipEntry {
     pub fn is_encrypted(&self) -> bool {
         self.flags & 1 != 0
     }
+    /// Whether random access to this member costs a deflate index build.
+    ///
+    /// One place, used both by [`ZipArchive::open_entry`] to choose the reader
+    /// and by [`warm_track_indexes`] to choose what to warm: two mirrored
+    /// conditions would be free to drift, and the warmer would then build
+    /// indexes nobody consults while the read path built them again on the
+    /// syscall it must not build them on.
+    pub fn needs_index(&self) -> bool {
+        self.method == METHOD_DEFLATE && self.uncompressed_size > INLINE_MAX
+    }
     /// Directory members are stored as zero-length names ending in `/`.
     pub fn is_dir(&self) -> bool {
         self.name.ends_with('/')
@@ -430,7 +440,7 @@ impl ZipArchive {
                 debug!("{label}: stored, read in place ({} bytes)", entry.uncompressed_size);
                 Ok(Box::new(comp))
             }
-            METHOD_DEFLATE if entry.uncompressed_size <= INLINE_MAX => {
+            METHOD_DEFLATE if !entry.needs_index() => {
                 let bytes = inflate_all(&comp, entry.uncompressed_size, entry.crc32, &label)?;
                 debug!("{label}: deflated, held in memory ({} bytes)", bytes.len());
                 Ok(Box::new(MemorySource::new(bytes, label)))
@@ -532,8 +542,109 @@ impl Container for ZipContainer {
     }
 }
 
+/// Build these tracks' deflate indexes on a thread, off the read path.
+///
+/// A deflated member is read through the checkpoint index in [`super::deflate`],
+/// and building one costs ~130 ms per 17 MiB. The DATA tracks pay that before
+/// the title starts, because identifying the disc and reading its boot binary go
+/// through them. An AUDIO track is first touched when the title asks for music,
+/// which happens inside a CD-DA sub-fetch -- the title frozen, the loader's
+/// 20 ms fetch deadline running. Measured on Snow Surfers (2026-09-12): "CDDA
+/// read of LBA 0x0004e352 took 140 ms, past the loader's deadline". The loader's
+/// first sub-fetch of the track therefore failed, `cdda_prime()` keyed the
+/// channels on with the rest of half 0 as quiet floor, and the music began with
+/// 693 ms of silence -- every track, every session, and invisible to every
+/// counter on the console (`g_cdda_stale` stayed 0: nothing reached a half that
+/// was still being filled).
+///
+/// Indexing them from a syscall is not open to us either: the TOC syscall has a
+/// 500 ms deadline of its own (`CDDA_TOC_DEADLINE_TICKS`) and `Gdi::num_sectors`
+/// already runs inside it. So this runs on its own thread, started while the
+/// title is still being uploaded, and all it does is fill the process-wide index
+/// cache that the read path already consults. Nothing waits on it, and nothing
+/// breaks if it loses the race: a track the title reaches first is indexed by
+/// the read path exactly as before.
+///
+/// RAM: one checkpoint table per track, sized by the deflate index budget --
+/// about an eighth of the track's size, so ~40 MiB for a 19-track disc.
+/// `DCLOAD_ZIP_INDEX_BUDGET` tunes it.
+pub fn warm_track_indexes(archive: &ZipArchive, prefix: &str, tracks: &[String]) {
+    // Resolved with `find_track`, the same way the read path resolves them, so
+    // the index lands under the cache key `open_entry` will look for.
+    let names: Vec<String> = tracks
+        .iter()
+        .map(|t| format!("{prefix}{t}"))
+        .filter(|n| {
+            archive
+                .find_track(n)
+                .is_some_and(ZipEntry::needs_index)
+        })
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let warmed = names.len();
+    let path = archive.path().to_path_buf();
+    let started = std::thread::Builder::new()
+        .name("warm-zip-index".into())
+        .spawn(move || {
+            // Re-opened here rather than shared: `ZipArchive` is `Rc`-based. Its
+            // central directory is a few hundred bytes to parse again.
+            let Ok(archive) = ZipArchive::open(&path) else {
+                return;
+            };
+            for name in &names {
+                let Some(entry) = archive.find_track(name) else {
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                // The source is dropped immediately: what is wanted is the index
+                // it leaves behind in the cache.
+                match archive.open_entry(entry) {
+                    Ok(_) => debug!(
+                        "warmed the index of '{name}' in {:.0} ms, off the read path",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    ),
+                    Err(e) => debug!("could not warm the index of '{name}': {e}"),
+                }
+            }
+        });
+    match started {
+        Ok(_) => debug!("warming {} deflated track(s) in the background", warmed),
+        // Not a failure worth stopping for: without the thread the read path
+        // indexes each track itself, as it did before.
+        Err(e) => debug!("no index-warming thread ({e}); tracks index on first read"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The condition that decides both which reader a member gets and which
+    /// members the warmer warms. Were it to answer "no index" for a big
+    /// deflated track, the warmer would skip it and the read path would build
+    /// its index inside a CD-DA sub-fetch again (AGENTS.md 4.13).
+    #[test]
+    fn only_a_big_deflated_member_needs_an_index() {
+        let entry = |method, uncompressed_size| ZipEntry {
+            name: "track10.raw".into(),
+            method,
+            flags: 0,
+            crc32: 0,
+            compressed_size: 1,
+            uncompressed_size,
+            local_header_offset: 0,
+        };
+        assert!(entry(METHOD_DEFLATE, INLINE_MAX + 1).needs_index());
+        assert!(
+            !entry(METHOD_DEFLATE, INLINE_MAX).needs_index(),
+            "at the threshold the member is inflated into RAM instead"
+        );
+        assert!(
+            !entry(METHOD_STORED, INLINE_MAX * 100).needs_index(),
+            "a stored member is read in place however large it is"
+        );
+    }
+
     use super::*;
 
     /// A minimal zip built here rather than by a tool, so the parser is tested

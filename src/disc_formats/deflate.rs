@@ -867,6 +867,46 @@ mod tests {
         (src, data.to_vec())
     }
 
+    /// THE CLAIM THE LIVE AUDIT MAKES, TESTED AGAINST GROUND TRUTH.
+    ///
+    /// A session warned "re-reading LBA 0x0004e6ce by way of a checkpoint
+    /// restart gives DIFFERENT bytes (first at Some(0)): this host's
+    /// random-access read of the image is wrong" (2026-09-11). That is a
+    /// falsifiable statement about THIS reader, so it gets a test rather than
+    /// an opinion: read a range warm, force the cursor pool to turn over so the
+    /// next read must restart from a checkpoint, read it again -- and compare
+    /// both against the original bytes, not merely against each other. Two
+    /// wrong reads that agree would pass the audit's own test and fail this
+    /// one.
+    #[test]
+    fn a_warm_read_and_a_checkpoint_restart_agree_with_the_original() {
+        let data = sample(8 << 20);
+        let (src, data) = indexed(&data);
+        let span = 2352 * 3; // one PCM CD-DA sub-fetch
+        for off in [0usize, 4096, 1 << 20, (3 << 20) + 7, 5 << 20, (8 << 20) - span] {
+            let mut warm = vec![0u8; span];
+            src.read_at(off as u64, &mut warm).expect("warm read");
+
+            // Walk far enough away, CURSORS + 1 times, that every cursor which
+            // could still serve `off` has been evicted or left behind it.
+            let mut scratch = vec![0u8; 4096];
+            for k in 0..=CURSORS {
+                let far = ((7 << 20) - k * (1 << 19)) as u64;
+                src.read_at(far, &mut scratch).expect("far read");
+            }
+
+            let mut restarted = vec![0u8; span];
+            src.read_at(off as u64, &mut restarted).expect("restarted read");
+
+            assert_eq!(&warm[..], &data[off..off + span], "warm read wrong at {off}");
+            assert_eq!(
+                &restarted[..],
+                &data[off..off + span],
+                "restarted read wrong at {off}"
+            );
+        }
+    }
+
     #[test]
     fn reads_match_the_original_everywhere() {
         let data = sample(3 << 20);
@@ -889,6 +929,36 @@ mod tests {
             let mut buf = vec![0u8; 4096];
             src.read_at(off as u64, &mut buf).expect("read");
             assert_eq!(&buf[..], &data[off..off + 4096], "mismatch at {off}");
+        }
+    }
+
+    /// The CD-DA access pattern: long runs of consecutive small reads (here
+    /// 7056 bytes, a PCM sub-fetch; ADPCM reads 9408 raw bytes per request).
+    ///
+    /// Unlike the jumping test above, this never restarts from a checkpoint and
+    /// instead exercises the buffer slide in `advance_past`: the cursor holds
+    /// WINDOW + CURSOR_SPAN bytes, so a slide falls every few dozen reads and
+    /// must keep exactly the history the back-references straddling it need.
+    /// 16 MiB is ~60 slides and ~2400 reads.
+    #[test]
+    fn a_long_sequential_stream_matches_byte_for_byte() {
+        const FETCH: usize = 7056;
+        let data = sample(16 << 20);
+        let (src, data) = indexed(&data);
+        let mut buf = vec![0u8; FETCH];
+        let mut off = 0usize;
+        while off + FETCH <= data.len() {
+            src.read_at(off as u64, &mut buf).expect("read");
+            if buf[..] != data[off..off + FETCH] {
+                let i = (0..FETCH).find(|&i| buf[i] != data[off + i]).unwrap();
+                panic!(
+                    "sequential read at {off} differs at byte {i} (offset {}):                      got 0x{:02x}, want 0x{:02x}",
+                    off + i,
+                    buf[i],
+                    data[off + i]
+                );
+            }
+            off += FETCH;
         }
     }
 

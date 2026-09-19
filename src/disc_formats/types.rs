@@ -9,9 +9,12 @@ pub struct Track {
     pub(crate) track: String,
     #[allow(unused)]
     pub(crate) offset: u32,
-    /// Opened lazily: a GDI names its audio tracks too, and nothing ever reads
-    /// them, so opening one would cost an index build on a zipped dump for
-    /// bytes nobody wants.
+    /// Opened lazily: a GDI names every track, and a session reads one data
+    /// track and at most a few audio ones, so opening them all would cost an
+    /// index build per track on a zipped dump for bytes nobody wants. The audio
+    /// tracks are warmed off this path instead -- see
+    /// [`crate::disc_formats::zip::warm_track_indexes`], because doing the build
+    /// inside the first CD-DA sub-fetch of a track put a hole in the music.
     pub(crate) source: Option<Box<dyn crate::disc_formats::source::ImageSource>>,
 }
 

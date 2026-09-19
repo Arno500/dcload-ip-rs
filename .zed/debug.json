@@ -175,10 +175,11 @@
       "192.168.1.64",
       "--infinite",
       // "--no-cdda",
-      "--diag",
-      "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\loaders-everysyscall",
+      // "--diag",
+      // "--cdda-tone",
+      // "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\loaders-adj25",
       // "--boot-ipbin",
-      "--loader-base", "0x8c004000",
+      // "--loader-base", "0x8c004000",
       "u-exec",
       "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Snow Surfers v1.001 (1999)(Sega)(PAL)[!].zip",
     ],
@@ -186,6 +187,36 @@
     "env": {
       "RUST_BACKTRACE": "1",
       "RUST_LOG": "debug",
+      // "DCLOAD_CDDA_SAFE": "1"
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch another game (flycast)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "--infinite",
+      // flycast needs a set built with DREAMCAST_IP=192.168.1.130 and
+      // CDDA_TICKS_X8192=580480; build it into a directory of its own and
+      // name it here. Only "loaders" (DHCP, console clock) is kept.
+      "--loader-dir",
+      "loaders",
+      "u-exec",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Snow Surfers v1.001 (1999)(Sega)(PAL)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      // "DCLOAD_CDDA_SAFE": "1"
     },
     "sourceLanguages": ["rust"],
   },
@@ -230,6 +261,7 @@
       "--host",
       "192.168.1.64",
       "--infinite",
+      // "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\loaders-adj25",
       "u-exec",
       "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"

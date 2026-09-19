@@ -221,12 +221,29 @@ pub enum DCLoadClientFSCmds {
     RewindDir(u32),
 }
 
+/// How the loader wants its audio, which is a property of the command it sent
+/// rather than a host-side option: `DC23` is raw 16-bit stereo straight off the
+/// disc, `DC24` is 4-bit Yamaha ADPCM with the two channels already split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFormat {
+    /// Interleaved signed 16-bit little-endian, 2352 bytes to the sector.
+    Pcm,
+    /// 4-bit Yamaha ADPCM, one byte per stereo frame, left block then right.
+    ///
+    /// `restart` is bit 31 of the loader's size field. The format carries a
+    /// running predictor shared with the AICA's decoder, so the encoder may be
+    /// reset only at the one event that resets the console's: keying the
+    /// channels on.
+    Adpcm { restart: bool },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DCLoadClientCmds {
     Exit,
     ReadSector(u32, u32, u32),
-    /// Raw 2352-byte audio sectors: LBA, destination, bytes. See `read_audio`.
-    ReadAudio(u32, u32, u32),
+    /// Audio for the CD-DA engine: LBA, destination, bytes, and the format the
+    /// loader asked for. See `read_audio` and `adpcm::Stream`.
+    ReadAudio(u32, u32, u32, AudioFormat),
     ReadToc(u32, u32, u32),
     FSCommand(DCLoadClientFSCmds),
 }
@@ -311,7 +328,16 @@ impl TryFrom<Vec<u8>> for DCLoadClientCmds {
             }
             b"DC23" => {
                 let (param1, param2, param3) = extract_3_u32(&input[4..])?;
-                Ok(DCLoadClientCmds::ReadAudio(param1, param2, param3))
+                Ok(DCLoadClientCmds::ReadAudio(param1, param2, param3, AudioFormat::Pcm))
+            }
+            b"DC24" => {
+                let (param1, param2, param3) = extract_3_u32(&input[4..])?;
+                Ok(DCLoadClientCmds::ReadAudio(
+                    param1,
+                    param2,
+                    param3 & 0x7fff_ffff,
+                    AudioFormat::Adpcm { restart: param3 & 0x8000_0000 != 0 },
+                ))
             }
             b"DC22" => {
                 let (param1, param2, param3) = extract_3_u32(&input[4..])?;
