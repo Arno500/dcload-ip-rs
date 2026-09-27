@@ -174,14 +174,12 @@
       "--host",
       "192.168.1.64",
       "--infinite",
-      // "--no-cdda",
       // "--diag",
-      // "--cdda-tone",
-      // "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\loaders-adj25",
+      "--loader-dir", "loaders-wince",
       // "--boot-ipbin",
       // "--loader-base", "0x8c004000",
       "u-exec",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Snow Surfers v1.001 (1999)(Sega)(PAL)[!].zip",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sega Rally 2 v1.000 (1999)(Sega)(PAL)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -207,10 +205,9 @@
       // flycast needs a set built with DREAMCAST_IP=192.168.1.130 and
       // CDDA_TICKS_X8192=580480; build it into a directory of its own and
       // name it here. Only "loaders" (DHCP, console clock) is kept.
-      "--loader-dir",
-      "loaders",
+      "--loader-dir", "loaders-wince",
       "u-exec",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Snow Surfers v1.001 (1999)(Sega)(PAL)[!].zip",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sega Rally 2 v1.000 (1999)(Sega)(PAL)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {

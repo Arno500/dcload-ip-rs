@@ -1195,6 +1195,50 @@ const PDTRA: u32 = 0xff80_0030;
 /// scan cannot wander into the next routine.
 const CABLE_READ_WINDOW: usize = 8;
 
+/// One entry of a packed 102-word TOC, for the log.
+fn toc_word(toc: &[u8], i: usize) -> String {
+    toc.get(i * 4..i * 4 + 4)
+        .map(|b| format!("0x{:08x}", u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .unwrap_or_default()
+}
+
+/// The BIOS GD driver's body, which the two syscall vectors at 0x8c0000bc and
+/// 0x8c0000c0 point at -- cached and uncached.
+const GD_DRIVER_BODY: [u32; 2] = [0x8c00_10f0, 0xac00_10f0];
+
+/// Send a title's DIRECT calls to the BIOS GD driver to the loader instead.
+///
+/// dcload emulates the GD driver by taking over the syscall vectors, and a
+/// title that calls through them is served from this host. A title that holds
+/// the driver's own address and calls it is not: it reaches the real driver,
+/// which reads whatever disc is in the drive. Windows CE does exactly that --
+/// its GD driver in Sega Rally 2's 0WINCEOS.BIN loads `0x8c0010f0` from 23
+/// literal pools and calls it with r6 = 0 and r7 = the function index, the same
+/// ABI the vectors use. None of the four Katana test titles carries the
+/// literal; they call through 0x8c0000bc, 13 times each.
+///
+/// isoldr answers it the same way (`gdc_syscall_patch`, `patch_memory(
+/// 0x8c0010f0, gdc_redir)`): rewrite the literal. From here rather than by
+/// overwriting the BIOS's copy of the driver on the console, because the loader
+/// still needs the real driver at its next boot (gd_spin_down_drive). `entry`
+/// is the running loader's `_gd_bios_entry`; a P2 literal stays P2.
+///
+/// Word-aligned only: a literal pool entry always is, and a match at any other
+/// offset is two halfwords of code that happen to spell the address.
+pub fn gd_body_patches(buf: &[u8], address: u32, entry: u32) -> Vec<(u32, u32)> {
+    let mut out = vec![];
+    for (base, data) in payload_spans(buf, address) {
+        let at = |i: usize| ((base & 0x1fff_ffff) | 0x8c00_0000).wrapping_add(i as u32);
+        for i in (0..data.len().saturating_sub(3)).step_by(4) {
+            let w = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            if GD_DRIVER_BODY.contains(&w) {
+                out.push((at(i), (entry & 0x1fff_ffff) | (w & 0xe000_0000)));
+            }
+        }
+    }
+    out
+}
+
 /// Make a title believe a VGA box is plugged in -- which is the whole of what
 /// a "VGA patch" is.
 ///
@@ -1796,9 +1840,10 @@ fn open_zip_member(
 pub fn boot_binary(
     spec: &str,
     mode: boot::Descramble,
+    wince: boot::WinCe,
 ) -> Result<boot::BootBinary, String> {
     let disc = open_disc(spec)?;
-    boot::extract(disc.as_ref(), mode).map_err(|e| format!("{spec}: {e}"))
+    boot::extract(disc.as_ref(), mode, wince).map_err(|e| format!("{spec}: {e}"))
 }
 
 /// Does this path look like a disc image rather than something to upload?
@@ -2113,6 +2158,7 @@ pub fn receive_syscalls(
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     mut diag: Option<crate::diag::Probe>,
     mut stack: Option<crate::stackwatch::StackWatch>,
+    stage: Vec<(u32, u32)>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     // A disc that could not be opened is not a silent no-op: the title is
     // about to be started with CDFS redirection ON, so it will ask for sectors
@@ -2287,7 +2333,33 @@ pub fn receive_syscalls(
                                     continue;
                                 }
                                 let num_sectors = size / 2048;
-                                let mut buf = disc.read_sector(start, num_sectors)?;
+                                // A READ OFF THE END OF THE DISC IS THE TITLE'S
+                                // ERROR TO RECEIVE, NOT THIS HOST'S TO DIE OF.
+                                // A real drive answers it with a failed
+                                // command; so does this, and the loader fails
+                                // the read after its retries. Windows CE asked
+                                // for LBA 0x9e80f on a disc ending at 549300,
+                                // and the `?` that was here ended the session
+                                // on the spot -- taking with it everything the
+                                // title would have done next.
+                                let mut buf = match disc.read_sector(start, num_sectors) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!(
+                                            "ReadSector for {num_sectors} sector(s) at LBA {start} \
+                                             (0x{start:08x}) -> 0x{dc_address:08x} cannot be served: \
+                                             {e}. The disc spans LBA {toc_start}..{}; answering \
+                                             with a failure, as a drive would.",
+                                            toc_start.saturating_add(toc_sectors)
+                                        );
+                                        let _ = conn.send_command(DCLoadCmd {
+                                            cmd: DCLoadCmds::ReturnValue(),
+                                            address: u32::MAX,
+                                            size: u32::MAX,
+                                        });
+                                        continue;
+                                    }
+                                };
 
                                 // DIAGNOSTIC ONLY: blank the payload for one LBA.
                                 // Destination and transfer size have both been
@@ -2377,10 +2449,26 @@ pub fn receive_syscalls(
                                 // 4.6, 14.17). The host is the only side that
                                 // can see it coming, and seeing it costs one
                                 // comparison per read.
-                                if let Some(hit) = crate::loaders::overlapping_range(
-                                    loader_base,
-                                    (dc_address, dc_address.saturating_add(buf.len() as u32)),
-                                ) && warned_overlap.insert(dc_address)
+                                // EXCEPT THE LOADER'S OWN STAGING BUFFERS
+                                // (`_gd_stage`, `_gd_stage_big`: `stage`). A read there is dcload
+                                // asking for sectors it copies to the title
+                                // itself, because the title's buffer is a
+                                // virtual address its MMU translates, which
+                                // cmd_partbin cannot write (Windows CE;
+                                // dcload-ip: cdfs_syscalls.c). It is neither a
+                                // collision nor evidence of where the title's
+                                // memory is. Those symbols only: anything else in
+                                // the loader is still a collision.
+                                let staged = stage.iter().any(|&(lo, len)| {
+                                    let (lo, a) = (lo & 0x1fff_ffff, dc_address & 0x1fff_ffff);
+                                    a >= lo && a.saturating_add(buf.len() as u32) <= lo + len
+                                });
+                                if !staged
+                                    && let Some(hit) = crate::loaders::overlapping_range(
+                                        loader_base,
+                                        (dc_address, dc_address.saturating_add(buf.len() as u32)),
+                                    )
+                                    && warned_overlap.insert(dc_address)
                                 {
                                     error!(
                                         "DISC READ LANDS ON THE LOADER: LBA 0x{start:08x} -> \
@@ -2405,7 +2493,8 @@ pub fn receive_syscalls(
                                 // Locked only for the marking, which is two
                                 // shifts; the Ctrl-C handler is the only other
                                 // holder and it takes it once, at the end.
-                                if let Some(rec) = memory.as_ref()
+                                if !staged
+                                    && let Some(rec) = memory.as_ref()
                                     && let Ok(mut rec) = rec.lock()
                                 {
                                     rec.record(dc_address, buf.len() as u32);
@@ -2437,7 +2526,7 @@ pub fn receive_syscalls(
                                 // immediately above the loader, so every read it
                                 // ever makes is "near" and the warning would fire
                                 // on every title forever (AGENTS.md 14.9).
-                                if loader_base >= 0x8c01_0000 {
+                                if !staged && loader_base >= 0x8c01_0000 {
                                     const TOO_NEAR: u32 = 0x4_0000;
                                     let lo = dc_address & 0x1fff_ffff;
                                     let (blo, bhi) = (
@@ -2480,7 +2569,22 @@ pub fn receive_syscalls(
                                 // half-filled buffer is complete. A title that
                                 // executes short data is far worse off than one
                                 // that waits.
-                                match send_data(conn, &buf, dc_address, None) {
+                                //
+                                // WHICH IS NOW THE LOADER'S JUDGEMENT, NOT OURS
+                                // (2026-09-20). `send_sectors` sends the window
+                                // and the parts and waits for neither the echo
+                                // nor a DoneBinary probe -- ~1.9 ms of frozen
+                                // title per 16 KB chunk out of 5. The loader
+                                // checks its own window when the ReturnValue
+                                // lands (`bin_window_complete`), fails a chunk
+                                // with a hole in it and asks again, so a short
+                                // buffer is still never reported complete; it
+                                // just costs a round trip when it happens
+                                // instead of two when it does not. It only
+                                // returns Err if the socket itself failed, and
+                                // the arm below then leaves the DC to time out
+                                // exactly as before.
+                                match send_sectors(conn, &buf, dc_address) {
                                     Ok(_) => {
                                         // READ-BACK VERIFICATION (DCLOAD_VERIFY_READS=1).
                                         //
@@ -3050,6 +3154,24 @@ pub fn receive_syscalls(
                                     });
                                     continue;
                                 }
+                                // NOT READ BACK. It was, for one session:
+                                // Windows CE asked for this TOC at 0x080df654,
+                                // a virtual address in a CE process slot, and
+                                // the SendBinQ that read it back froze the
+                                // console for good -- while the write that
+                                // delivered it had gone through. An instrument
+                                // that reads a title's virtual memory from
+                                // inside its GD call is inside the blast
+                                // radius (AGENTS.md 14.13). What was sent is
+                                // logged instead, to compare with what the
+                                // title does next.
+                                debug!(
+                                    "TOC area {area} -> 0x{dc_address:08x}: first {:?}, last {:?}, \
+                                     leadout {:?}",
+                                    toc_word(&toc, 99),
+                                    toc_word(&toc, 100),
+                                    toc_word(&toc, 101)
+                                );
                                 let _ = conn.send_command(DCLoadCmd {
                                     cmd: DCLoadCmds::ReturnValue(),
                                     address: 0,
@@ -3414,16 +3536,41 @@ fn cdda_safe() -> bool {
 
 /// Ring pacing for the runtime path, in ONE place so the sector path and the
 /// audio fast path below cannot drift apart. Both feed the same 16 KB RX ring.
+///
+/// A SHORTER PAUSE TAKEN MORE OFTEN, since 2026-09-20. The defaults were 10
+/// packets and 1800 us, which for a 16 KB chunk means exactly one pause fires
+/// -- 1.8 ms of the ~5 ms the title spent frozen per chunk, and after the two
+/// acknowledgement round trips were removed from `send_sectors` it became the
+/// single largest cost left on the path. Six packets is ~9 KB in front of the
+/// loader against a 16 KB ring, so it is also the safer of the two, and two
+/// 600 us pauses cost a third of one 1800 us pause.
+///
+/// WHAT IT DEFENDS AGAINST, and why it is not zero: outrunning the ring does
+/// not drop a frame, it desyncs CAPR from CBR and the loader receives NOTHING
+/// from then on -- a wedge that does not recover.
+///
+/// THE ACCEPTANCE TEST, before shortening it further (300, then 0): serve a
+/// busy session and check `g_cdfs_read_retries`, `g_cdfs_read_holes`,
+/// `g_rx_overflow` and `g_rx_missed`.
+///
+/// MEASURED AT 6/600, 2026-09-20, Crazy Taxi, 2302 chunks: `g_rx_missed` 0 --
+/// the chip never dropped a frame for want of ring space, so the pacing is
+/// adequate -- but `g_rx_overflow` 3 and `g_rx_resync` 2. **So do not shorten
+/// it further.** The ring is being pushed to its back-pressure limit already,
+/// and what is left is not congestion the delay can buy off: a resync is the
+/// status-word race of AGENTS.md 4.8 rule 4, and it DISCARDS THE QUEUE, which
+/// is where both of that session's two lost answers went
+/// (`g_cdfs_read_fails` 2 = `g_fine_timeouts` 2, `g_cdfs_read_holes` 0).
 fn runtime_pacing() -> (u32, Duration) {
     let n = std::env::var("DCLOAD_RT_BURST")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(10)
+        .unwrap_or(6)
         .max(1);
     let us = std::env::var("DCLOAD_RT_DELAY_US")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1800);
+        .unwrap_or(600);
     (n, Duration::from_micros(us))
 }
 
@@ -3496,6 +3643,102 @@ fn send_audio(
         .as_deref()
         .and_then(extract_donebin)
         .map(|d| d.size))
+}
+
+/// Serve one chunk of a disc read: the LoadBinary, the parts, and nothing else.
+/// The caller sends the ReturnValue, which is what releases the loader from
+/// `bb->loop()`.
+///
+/// THE TITLE IS FROZEN FOR EVERY MICROSECOND SPENT IN HERE, so this path buys
+/// nothing it does not need. `send_data_one` waits for the LoadBinary echo
+/// before sending the parts and probes with DoneBinary after them. Measured on
+/// Crazy Taxi, 2026-09-20: a 16 KB chunk took ~5 ms end to end, of which the
+/// wire is 1.3 ms, the deliberate pause 1.8 ms, and those two round trips
+/// ~1.9 ms. A 73-sector read is ten chunks, so the title stopped rendering for
+/// 58 ms at a time, several times a second -- which is what the stutter was.
+///
+/// What the two round trips bought was the host's only way of noticing a lost
+/// packet. The loader notices instead, for free: `cmd_partbin` already keeps a
+/// map of the window, so `bin_window_complete()` answers at no network cost,
+/// and a chunk with a hole is failed and asked for again (`g_cdfs_read_holes`,
+/// then `g_cdfs_read_retries`). That is one extra round trip on a loss instead
+/// of two on every chunk -- and across that session there were no losses to
+/// catch: `g_rx_missed`, `g_rx_overflow`, `g_pbin_rejected` and
+/// `g_cdfs_read_retries` were all 0 over 4000 chunks.
+///
+/// THIS NEEDS A LOADER THAT CHECKS ITS OWN WINDOW. An older one accepts the
+/// ReturnValue as proof of completion and would hand the title short data
+/// silently. There is no feature bit for it; what keeps the two in step is that
+/// the host chainloads its own loader from `loaders/` for every disc image, so
+/// that directory must be redeployed with this change (AGENTS.md 14.19).
+fn send_sectors(
+    conn: &mut impl ExternalDcIo,
+    data: &[u8],
+    address: u32,
+) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
+    // ONE WINDOW, OR THE LOADER'S CHECK CANNOT SPEAK FOR THE WHOLE TRANSFER.
+    //
+    // `bin_window_complete()` judges the window that is installed, so a payload
+    // split across several LoadBinary windows would be judged on its last one
+    // and the earlier ones would go unchecked. A chunk is GD_EMU_ASYNC sectors
+    // (16 KB today), far inside MAX_XFER, so this cannot fire as the loader is
+    // built -- but GD_BULK_SECTORS would send a whole 100-sector read in one
+    // call, and then the acknowledged path is the correct one.
+    if data.len() > MAX_XFER {
+        send_data(conn, data, address, None)?;
+        return Ok(());
+    }
+    let (burst_packets, burst_delay) = runtime_pacing();
+    conn.send_command(DCLoadCmd {
+        cmd: DCLoadCmds::LoadBinary(),
+        address,
+        size: data.len() as u32,
+    })?;
+    // LET THE WINDOW BE INSTALLED BEFORE THE FIRST PART.
+    //
+    // `cmd_loadbin` is not a cheap handler: it zeroes the part map and purges
+    // the cache over the WHOLE destination range -- 512 cache blocks for a
+    // 16 KB chunk. Waiting for the echo used to cover that work by accident,
+    // which is the one thing it did for the loader rather than for us, and
+    // dropping the wait without replacing it put the first parts on the wire
+    // while the loader was still purging. That is a ring overflow, and an
+    // overflow does not cost one part: the ring is drained or re-initialised
+    // and the whole answer is gone, after which the loader has nothing to do
+    // but wait out its deadline (measured on Crazy Taxi, 2026-09-20: 7.0 s,
+    // the coarse backstop, because TMU2 was not running either).
+    //
+    // One pause, not a round trip: it costs what it costs whatever the loader
+    // is doing, and it cannot deadlock.
+    //
+    // SCALED TO THE WINDOW (2026-09-27). The purge it covers is one cache
+    // block per 32 bytes of the window, and the full pause was sized for the
+    // 16 KB chunk of a Katana title. A Windows CE title reads through the
+    // loader's staging buffer, 6-10 KB a round trip, hundreds of trips for
+    // one file, and the title waits for all of them (dcload-ip:
+    // docs/wince-investigation.md 7u): a fixed 600 us was a third of each
+    // trip. Never below 100 us.
+    let scaled = burst_delay.mul_f64((data.len() as f64 / 16384.0).min(1.0));
+    spin_for(scaled.max(Duration::from_micros(100)));
+    let mut incr_address = address;
+    let mut packet_count: u32 = 0;
+    for chunk in data.chunks(CHUNK_SIZE) {
+        let mut padded_chunk = [0u8; CHUNK_SIZE];
+        padded_chunk[..chunk.len()].copy_from_slice(chunk);
+        conn.send_command(DCLoadCmd {
+            cmd: DCLoadCmds::PartBinary(Box::new(padded_chunk)),
+            address: incr_address,
+            size: chunk.len() as u32,
+        })?;
+        incr_address += chunk.len() as u32;
+        packet_count = packet_count.saturating_add(1);
+        // The burst still has to fit the loader's 16 KB RX ring. With the two
+        // round trips gone this pause is the largest remaining cost on the
+        // path; the acceptance test for shortening it is in `runtime_pacing`.
+        if packet_count.is_multiple_of(burst_packets) {
+            spin_for(burst_delay);
+        }
+    }
+    Ok(())
 }
 
 fn send_data_one(
@@ -4012,7 +4255,7 @@ fn request_donebin(
     )))
 }
 
-fn await_result(
+pub(crate) fn await_result(
     conn: &mut impl ExternalDcIo,
     timeout: Option<Duration>,
 ) -> std::result::Result<Vec<DCReturnCmd>, std::boxed::Box<dyn std::error::Error>> {
@@ -4169,7 +4412,45 @@ pub fn receive_data(
         }
     }
 
+    // AND THIS LOOP NEEDS THE SAME BUDGET THE ONE ABOVE HAS.
+    //
+    // It had none: it re-requested every missing chunk and repeated until the
+    // map was full, so a console that answers NOTHING turned it into an
+    // unbounded SendBinQ flood -- thousands a second, logging "Missing chunk 0"
+    // for each. Two consequences, and the second is the serious one: the
+    // Dreamcast is buried in requests it must answer from inside bb->loop(),
+    // and this host is single-threaded, so while it spins here **it never
+    // serves another disc read** and the title freezes for good.
+    //
+    // Measured 2026-09-20 on Crazy Taxi. The trigger was a 30-byte read: the
+    // loader's failed-chunk trace calls write(), and a write is fetched back
+    // off the console with SendBinQ (fs.rs, download_data) -- so a failing
+    // disc read produced an instrument read that could not be answered either,
+    // and that is what wedged the tool. The loader no longer emits that trace
+    // (cdfs_syscalls.c), but an instrument must not be able to do this
+    // whatever asks for it.
+    //
+    // A read that cannot be completed is a FAILED READ. Every caller here
+    // treats the Err (--diag skips the sample, the read-back verification
+    // warns), and all of them are better off than frozen. AGENTS.md 14.9: the
+    // first loop's budget was proof this could happen, and it guarded one loop
+    // out of two.
+    const REPAIR_PASSES: usize = 4;
+    let mut passes = REPAIR_PASSES;
     loop {
+        if passes == 0 {
+            let missing = chunk_map.iter().filter(|&&r| !r).count();
+            return Err(Box::new(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "read-back of 0x{address:08x}+{size} never completed: {missing} of \
+                     {expected_chunks} chunks still missing after {REPAIR_PASSES} repair \
+                     passes. The console is not answering; giving up rather than \
+                     re-requesting forever."
+                ),
+            )));
+        }
+        passes -= 1;
         for (i, received) in chunk_map.clone().iter().enumerate() {
             if !received {
                 debug!("Missing chunk {}", i);
@@ -5165,5 +5446,28 @@ mod tests {
             "got {steps:?}"
         );
         assert_eq!(clock.scale_ppm, 1_000_000, "and nothing moved");
+    }
+}
+
+#[cfg(test)]
+mod gd_body_tests {
+    use super::gd_body_patches;
+
+    #[test]
+    fn direct_driver_calls_are_redirected_and_keep_their_segment() {
+        let mut p = vec![0u8; 64];
+        p[8..12].copy_from_slice(&0x8c00_10f0u32.to_le_bytes());
+        p[20..24].copy_from_slice(&0xac00_10f0u32.to_le_bytes());
+        // Not word-aligned: two halfwords of code, not a literal pool entry.
+        p[34..38].copy_from_slice(&0x8c00_10f0u32.to_le_bytes());
+        let got = gd_body_patches(&p, 0x0c01_0000, 0x8c8a_4400);
+        assert_eq!(got, vec![(0x8c01_0008, 0x8c8a_4400), (0x8c01_0014, 0xac8a_4400)]);
+    }
+
+    #[test]
+    fn a_title_without_the_literal_is_left_alone() {
+        let mut p = vec![0u8; 64];
+        p[8..12].copy_from_slice(&0x8c00_00bcu32.to_le_bytes());
+        assert!(gd_body_patches(&p, 0x0c01_0000, 0x8c8a_4400).is_empty());
     }
 }

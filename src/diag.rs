@@ -147,6 +147,15 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("g_gd_park_longs", Fmt::Num),
             ("g_cdfs_read_retries", Fmt::Num),
             ("g_cdfs_read_fails", Fmt::Num),
+            // The host stopped waiting for the LoadBinary echo and stopped
+            // probing with DoneBinary on the sector path (`send_sectors`), so
+            // this is the ONLY place a lost packet in a disc read now shows up.
+            // fails = the host never answered; holes = it answered short.
+            ("g_cdfs_read_holes", Fmt::Num),
+            // A ReturnValue that ended a read's wait over an incomplete
+            // window and was waited past: the late answer to an earlier
+            // attempt. Absent from loaders before 2026-09-27.
+            ("g_cdfs_read_stale", Fmt::Num),
             ("g_cdfs_sync_chunks", Fmt::Num),
             ("g_cdfs_sync_reentered", Fmt::Num),
             // Non-zero while a disc read waits; CD-DA declines to fetch then.
@@ -160,6 +169,10 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("g_gd_lock_stuck_ticks", Fmt::Num),
             ("g_gd_lock_owner", Fmt::Num),
             ("g_gd_lock_gen", Fmt::Num),
+            // How the boot-time stop of the REAL drive went (the loader's
+            // AGENTS.md 4.14): 4 = COMPLETED, the healthy answer. 0 means it
+            // never ran -- an older loader, or one built WITH_GD_SPINDOWN=0.
+            ("g_gd_spindown", Fmt::Num),
         ],
     ),
     (

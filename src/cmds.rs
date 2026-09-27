@@ -11,7 +11,10 @@ pub enum DCLoadCmds {
     Version(Option<Box<[u8; CHUNK_SIZE]>>),
     ReturnValue(),
     Reboot(),
-    Mapl(),
+    /// Host-to-DC Maple passthrough. The payload is the loader's own
+    /// argument block: port, unit, Maple command, payload length in
+    /// LONGWORDS, then that many longwords (`cmd_maple` in commands.c).
+    Mapl(Option<Vec<u8>>),
     PerformanceCounter(),
 }
 
@@ -35,7 +38,7 @@ impl DCLoadCmds {
             DCLoadCmds::Version(_) => "VERS",
             DCLoadCmds::ReturnValue() => "RETV",
             DCLoadCmds::Reboot() => "RBOT",
-            DCLoadCmds::Mapl() => "MAPL",
+            DCLoadCmds::Mapl(_) => "MAPL",
             DCLoadCmds::PerformanceCounter() => "PMCR",
         }
     }
@@ -80,7 +83,11 @@ impl From<DCLoadCmd> for Vec<u8> {
             }
             DCLoadCmds::ReturnValue() => b"RETV".to_vec(),
             DCLoadCmds::Reboot() => b"RBOT".to_vec(),
-            DCLoadCmds::Mapl() => b"MAPL".to_vec(),
+            DCLoadCmds::Mapl(None) => b"MAPL".to_vec(),
+            DCLoadCmds::Mapl(Some(frame)) => {
+                data = frame;
+                b"MAPL".to_vec()
+            }
             DCLoadCmds::PerformanceCounter() => b"PMCR".to_vec(),
         };
         // cmd_bytes.append(&mut val.address.to_ne_bytes().to_vec());
@@ -185,7 +192,14 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
             }
             b"RETV" => DCLoadCmds::ReturnValue(),
             b"RBOT" => DCLoadCmds::Reboot(),
-            b"MAPL" => DCLoadCmds::Mapl(),
+            b"MAPL" => {
+                let payload = &input[12..];
+                if payload.is_empty() {
+                    DCLoadCmds::Mapl(None)
+                } else {
+                    DCLoadCmds::Mapl(Some(payload.to_vec()))
+                }
+            }
             b"PMCR" => DCLoadCmds::PerformanceCounter(),
             _ => return Err("Unknown command".to_string()),
         };

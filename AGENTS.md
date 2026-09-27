@@ -73,9 +73,14 @@ A `u-exec` session:
    `PBIN` parts, then `DBIN` probes and resends from the address it reports
    (runs doubling up to 64). Transfers larger than `MAX_XFER` (256 × 1440, the
    loader's map) are split.
-6. **Execute** (`dispatch::execute`): `EXEC` with console/CDFS flags. `-d`, `-m`
+6. **VM2 / VMUPro** (`src/vm2.rs`), with a disc image only: probe the four
+   Maple ports for a card that selects games, and hand each one the disc's
+   product number so the saves that come up are the right game's. Eight `MAPL`
+   round trips in the last idle moment before the title starts; never fatal,
+   `--no-vm2` to skip.
+7. **Execute** (`dispatch::execute`): `EXEC` with console/CDFS flags. `-d`, `-m`
    or a disc image turn console redirection on.
-7. **Syscall loop** (`dispatch::receive_syscalls`), until `DC00` Exit:
+8. **Syscall loop** (`dispatch::receive_syscalls`), until `DC00` Exit:
    `ReadSector` (disc sectors), `ReadAudio` (CD-DA, §4), `ReadToc`
    (`cd::build_dc_toc`), `FSCommand` (`src/fs.rs`). At the top of each
    iteration the counter panel and the stack watch may post one `SBIQ` each.
@@ -111,7 +116,7 @@ go before the subcommand**: `dcload-ip-rs -H <IP> u-exec game.gdi`
 Global options worth knowing: `-H/--host`, `-v`/`-vv` (or `RUST_LOG`), `-p/--port`,
 `-i/--infinite`, `-a/--address`, `--loader-dir`, `--game-db`, `--memory-db`,
 `--loader-base`, `--no-relocate`, `--patch ADDR=VALUE` (poke after upload),
-`--ppf FILE`, `--no-ppf`, `--patch-dir`, `--no-gaps-guard`,
+`--ppf FILE`, `--no-ppf`, `--patch-dir`, `--no-gaps-guard`, `--no-vm2`, `--no-wince`,
 `--vga auto|always|never`, `--no-cdda`, `--cdda-tone`, `--probe ADDR=ID[:PEEK]`
 (a stub that logs when ADDR executes),
 `--descramble auto|always|never`, `--boot-ipbin`, `--diag`, `--diag-interval`.
@@ -302,6 +307,25 @@ never read as VGA. `always` covers adapters that do not ground the detect pins.
 `--vga` cannot add a 480p mode a title was never built with; `identify` says
 what it can do. Patched words survive a reload (§1 step 4).
 
+**Direct calls to the BIOS GD driver** (`dispatch::gd_body_patches`), always
+on. The loader emulates the GD driver by holding its syscall vectors
+(`0x8c0000bc`, `0x8c0000c0`); a title that calls the driver body at
+`0x8c0010f0` by address goes past them to the real drive. Every 4-aligned
+`0x8c0010f0`/`0xac0010f0` in the payload is rewritten to the running loader's
+`_gd_bios_entry` symbol (read from the relocated ELF, `gd_bios_entry()` in
+`main.rs`), verified, and added to the reload guards. Windows CE does this
+(23 sites in Sega Rally 2); none of the Katana test titles does. `identify`
+prints the count on a `gd body` line.
+
+**Windows CE titles** (`boot::WinCe`). A boot file named `0WINCEOS.BIN`, or
+carrying `"ECEC"` at +64, is a CE title. For the named case the first 2048-byte
+sector is dropped before anything else sees the payload (upload, PPF, every
+content scan, placement), as DreamShell's isoldr does, and the title is entered
+through the disc's own second bootstrap as `--boot-ipbin` would. `--no-wince`
+uploads it whole and enters it directly. The skip is parity with isoldr, not a
+proven entry point: see the loader's `docs/wince-investigation.md` and its
+AGENTS.md §4.15 for what is known and what is still open.
+
 ## 6. Shipped patches (PPF)
 
 For fixes nobody can derive, only carry (e.g. a 60 Hz/VGA patch for Snow Surfers
@@ -341,11 +365,34 @@ PAL): `patches/patches.tsv` plus `.ppf` files, found like the other data files
   title that goes back to the BIOS menu makes the disc boot another build,
   which answers the same addresses with other globals (measured 2026-09-17,
   `0x00010100` = three flag bytes of the CD build).
+  A 4-aligned value in `0x02000000..0x42000000` outside main RAM's P0
+  window is a Windows CE thread stack (MMU on), said once and not recorded.
+- **`wince.rs`** — Windows CE titles (2026-09-27; dcload-ip:
+  docs/wince-investigation.md). CE's kernel owns RAM `ulRAMStart..ulRAMEnd`
+  from its `ROMHDR` and allocates top-down, so `wanted_loader_base` puts the
+  loader at `ulRAMEnd - LOADER_SPAN` (`0x8cee0000` for Sega Rally 2), ahead
+  of any preset, and the upload lowers `ulRAMEnd` to the loader's base
+  (`ram_end_patch`). `pio_patches` turns the branch of CE's GD driver that
+  sends an aligned read to DMA into a branch to its PIO path: CE chains DMA
+  stream pieces from the G1 DMA-end interrupt, which this transport never
+  raises, while PIO pieces are chained from a callback the loader calls. Both
+  found by content, applied with `apply_patches`, guarded like the others;
+  `identify` prints them (`ce ram`, `ce gd`). The syscall loop does not count
+  a read into the loader's `_gd_stage` or `_gd_stage_big` as a collision or as
+  title memory: the loader stages reads for translated addresses there
+  (`loader_stage`). `send_sectors` scales its post-LoadBinary pause to the
+  window (full `DCLOAD_RT_DELAY_US` at 16 KB, never below 100 us): a CE title
+  reads through those 6-10 KB stages hundreds of times per file and waits for
+  every trip.
 - **`diag.rs`**, **`ui.rs`** — the counter panel (§9) and everything that draws
   on the terminal.
 - **`io.rs`** — `DcIoUDP`; `handle_data` drains the socket each wakeup;
   `PacketSink` lets the panel and stack watch claim their replies wherever the
   host happens to be polling (they arrive inside other transfers).
+- **`vm2.rs`** — the VM2/VMUPro game ID over the loader's Maple passthrough
+  (§11). Pure frame building and answer reading, plus a `MapleBus` seam so the
+  scan is testable: `polling::Events` cannot be fabricated, so a fake
+  `ExternalDcIo` can record what was sent but can never answer.
 - **`cmds.rs`**, **`types.rs`** — wire formats. Command headers, payloads and
   syscall parameters are big-endian; the TOC and `DCLoadStat`/`DCLoadDirEnt`
   are little-endian.
@@ -476,3 +523,112 @@ open.
 - `cdi2iso.c` at the root is untracked third-party GPLv2 reference code, not
   built.
 - `-d`/`-m` turn console mirroring on with no warning.
+
+## 11. VM2 / VMUPro
+
+**Status 2026-09-20: the VMUPro is still not found, and the fault is now
+localised to one transaction.** Hardware: a VMUPro in A1, a VMU in A2, two VMUs
+on port B.
+
+| slot | answer |
+| --- | --- |
+| A0 (controller) | `5` from `0x23` -- **it reports slots 1 and 2 occupied** |
+| A1 (VMUPro) | `0` from `0xff`: eight longwords of `0xffffff00`, then the cleared buffer |
+| A2 (VMU) | `-1`, as if empty |
+| B0 (controller) | `5` from `0x63`, slots 1 and 2 occupied |
+| B1, B2 | `5` then `6`, "Visual Memory", extended `"Version 1.005,…"` |
+
+Everything on port B is perfect, so the parsing, the addressing and the
+enumeration are right. The controller on port A **sees both its cards**. What
+fails is one transaction: the first one addressed to A1. It produces exactly
+32 bytes -- the buffer clear shows where the DMA stopped -- of a pattern that
+is not a Maple frame and is not the controller's `-1` timeout either. **After
+that burst, both of port A's slots answer as empty**, which is the wedge the
+owner otherwise clears by unplugging the controller.
+
+Two things remain that KOS does and this did not, both now done:
+
+- **Pacing.** KOS flushes its frame queue from the vblank handler, at most once
+  per frame, and never starts a burst before the previous one's completion
+  interrupt. Every frame a device sees under KOS therefore arrives at 60 Hz or
+  slower. This host drove the bus once per UDP round trip, about a
+  millisecond. `PACE_MS` (17, `DCLOAD_VM2_PACE_MS`) puts a vblank between
+  transactions; the sleep is legitimate here because this is before `EXEC`.
+- **Reset.** A controller that reports a slot occupied while the slot answers
+  as empty is a contradiction, not a verdict, and KOS has the software
+  equivalent of unplugging a device: `maple_dev_reset` sends Maple command 3,
+  which KOS does to every device on shutdown "to leave them as we found them".
+  The scan now sends it to a reported-but-silent slot and asks once more.
+
+If that does not do it, the question is no longer software, and the control is
+physical: **move the VMUPro to controller B's slot 1**. If port B then fails
+the same way and port A recovers, the fault follows the device.
+
+The one byte that can say why was not being printed: **the response frame's
+sender byte**. Bit 5 marks a port's main device and bits 0..4 are one per
+expansion slot, so `slots_reported()` reads the controller's own account of
+what is plugged into it -- something no amount of addressing a slot can give,
+because a slot the controller does not report answers exactly like an empty
+one. **B0 is the positive control**: it must say slots 1 and 2 are occupied,
+and if it does not, the instrument is wrong rather than port A.
+
+`DCLOAD_VM2_WARMUP` overrides `WARM_UP_ROUNDS` so the amount of warming can be
+found on the console without a rebuild.
+
+Also learned: **a plain Sega VMU does not have a blank `extended` field** -- it
+carries its own version string. The guess that it did is gone, and the scan
+now reports by outcome rather than trying to judge each card.
+
+- **Detection**: `DEVINFO` (command 1) then `ALLINFO` (command 2) to units 1
+  and 2 of each of the four ports. Unit 0 is the controller. A plain VMU
+  answers both and must be left alone: what separates them is the 40-byte
+  `extended` field after the standard 112-byte device info, holding
+  `"VM2 by Dreamware"`, `"8BITMODS VMUPro "`, `"USB RP2040 EMU  "` or
+  `"Pico2Maple USBBT"` -- matched as a **substring**, case-insensitively, so a
+  firmware that pads with NUL or appends a version still matches.
+  **`DEVINFO` first is not decoration**: openMenu calls `check_vm2_present` on
+  a device KOS has already enumerated on a timer, so ALLINFO is never the first
+  thing that device hears. dcload never polls the Maple bus, so without this it
+  was. It is not a gate -- a device that answers one and not the other is what
+  this is looking for -- and its answer is logged.
+- **A rejected slot explains itself.** `identify` returns `None` four ways:
+  empty slot, a device that refuses `ALLINFO`, a frame too short to reach
+  `extended` at offset 116, and a name nobody knows. A scan that prints nothing
+  cannot be told from a scan that found nothing, which is exactly what happened
+  on 2026-09-20; `explain()` now names which one, at `info` for anything that
+  is not an empty slot or a blank-`extended` plain VMU.
+- **Selection**: Maple command 33. Payload = the memory-card function code
+  **big-endian** (`00 00 00 02`; KOS writes the same bytes as `0x02000000`),
+  12 bytes of product number and, when there is one, 128 bytes of title --
+  `strncpy` semantics, so NUL-padded with no terminator on an exact fit.
+- **Transport**: the loader's `MAPL` passthrough. Its argument block is port,
+  unit, command and **payload length in LONGWORDS**; the reply's `size` is how
+  many bytes it copied, and response codes are signed (-1 nothing there, -4
+  busy). Loader AGENTS.md §8 is the reference.
+- **Every answer is matched to its request.** `cmd_maple` copies the request's
+  header into its reply and overwrites only `size`, so `address` carries a tag
+  (port, unit, command) back. **This is not optional**: the scan runs in the
+  seconds after an upload and one wakeup drains the whole socket, so the first
+  batch a probe sees is routinely the upload's own tail. The first version read
+  that as a silent console and gave up on the very first probe, with a VMUPro
+  sitting in A1 (2026-09-20). A batch without our tag is not an answer and not
+  a silence; `transact` keeps waiting until its deadline.
+- **Bounded, and never fatal.** `AGAIN` is retried four times on top of the 64
+  the loader does. Each request is sent up to three times with a 500 ms window.
+  **Two consecutive** unanswered probes end the scan -- an empty slot still
+  answers promptly, so real silence means `WITH_MAPLE=0` or a dead link, and
+  eight probes at three tries and 500 ms is twelve seconds in front of `EXEC`.
+  One is a hiccup, and treating it as a verdict is what cost the first run.
+
+**It needs a loader from 2026-09-20.** No payload longer than one longword had
+ever gone through `MAPL`, and two defects were waiting there: the payload copy
+counted longwords into a byte-counted memcpy (a 12-character ID arrived as 3),
+and the response was read back through the cache, so every probe after the
+first returned the first one's answer. Both are fixed on the Dreamcast side.
+There is no feature bit to test for it; the host chainloads its own loader for
+every disc image, so redeploying `loaders/` is what keeps the two in step.
+
+`polling::Events` cannot be constructed by hand, so a fake `ExternalDcIo`
+cannot answer anything — which is why the module's seam is `MapleBus`, one
+Maple transaction, and the scan is tested against a scripted console rather
+than against a socket.

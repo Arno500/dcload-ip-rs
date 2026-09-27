@@ -24,6 +24,8 @@ mod presets;
 mod stackwatch;
 mod types;
 mod ui;
+mod vm2;
+mod wince;
 
 const PROTOCOL_VERSION_LEGACY: [u8; 3] = [0, 0, 0];
 const PROTOCOL_VERSION_MODERN: [u8; 3] = [2, 0, 3];
@@ -148,6 +150,25 @@ struct Args {
     /// dcload's own recovery handle it.
     #[arg(long)]
     no_gaps_guard: bool,
+
+    /// Do not tell a VM2/VMUPro which game is starting.
+    ///
+    /// By default, with a disc image, the host probes the four Maple ports for
+    /// a VM2, a VMUPro or one of the adapters that answer like them, and hands
+    /// each one the disc's product number so it selects that game's saves
+    /// (`src/vm2.rs`). Pass this to leave the card on whatever it had.
+    #[arg(long)]
+    no_vm2: bool,
+
+    /// Treat a Windows CE title like any other boot binary.
+    ///
+    /// By default a disc whose IP.BIN boots `0WINCEOS.BIN` is framed as
+    /// DreamShell's isoldr frames it -- the file's first 2048-byte sector is
+    /// dropped and the rest loaded at 0x8c010000 -- and is entered through the
+    /// disc's own second bootstrap, as `--boot-ipbin` does. Pass this to upload
+    /// the file whole and enter it directly, as this host did before.
+    #[arg(long)]
+    no_wince: bool,
 
     /// Make the title believe a VGA box is plugged in.
     ///
@@ -317,7 +338,18 @@ impl From<DescrambleArg> for disc_formats::boot::Descramble {
     }
 }
 
-/// The bytes to upload, and what to call them in the log and on the bar.
+impl Args {
+    fn wince_mode(&self) -> disc_formats::boot::WinCe {
+        if self.no_wince {
+            disc_formats::boot::WinCe::Off
+        } else {
+            disc_formats::boot::WinCe::Auto
+        }
+    }
+}
+
+/// The bytes to upload, what to call them in the log and on the bar, and
+/// whether they are a Windows CE boot file (which changes how it is entered).
 ///
 /// POINT AT THE IMAGE, NOT AT A FILE YOU EXTRACTED FROM IT. A disc already says
 /// which file it boots (IP.BIN names it) and where that file is, so extracting
@@ -331,14 +363,14 @@ fn resolve_payload(
     args: &Args,
     file: &str,
     opened: Option<&dyn disc_formats::types::DiscFormat>,
-) -> Result<(Vec<u8>, String), String> {
+) -> Result<(Vec<u8>, String, bool), String> {
     let boot = match opened {
         Some(disc) => Some(
-            disc_formats::boot::extract(disc, args.descramble.into())
+            disc_formats::boot::extract(disc, args.descramble.into(), args.wince_mode())
                 .map_err(|e| format!("{file}: {e}"))?,
         ),
         None if dispatch::is_disc_image(file) => {
-            Some(dispatch::boot_binary(file, args.descramble.into())?)
+            Some(dispatch::boot_binary(file, args.descramble.into(), args.wince_mode())?)
         }
         None => None,
     };
@@ -349,9 +381,11 @@ fn resolve_payload(
             indicatif::HumanBytes(boot.bytes.len() as u64),
             boot.lba
         );
-        return Ok((boot.bytes, boot.name));
+        return Ok((boot.bytes, boot.name, boot.wince));
     }
-    dispatch::payload_from_file(std::path::Path::new(file)).map_err(|e| format!("{file}: {e}"))
+    dispatch::payload_from_file(std::path::Path::new(file))
+        .map(|(bytes, label)| (bytes, label, false))
+        .map_err(|e| format!("{file}: {e}"))
 }
 
 /// Which image serves the title's disc reads.
@@ -928,8 +962,12 @@ fn wanted_loader_base(
     // title is uploaded. It re-reads the boot binary that `resolve_payload`
     // will read again -- a megabyte or two, against a session that would end in
     // a black screen with no way to tell why.
-    let boot = match disc_formats::boot::extract(disc, args.descramble.into()) {
-        Ok(b) => b.bytes,
+    let framed_wince;
+    let boot = match disc_formats::boot::extract(disc, args.descramble.into(), args.wince_mode()) {
+        Ok(b) => {
+            framed_wince = b.wince && b.skipped > 0;
+            b.bytes
+        }
         Err(e) => {
             // Not fatal, and not silent: the base stands, and if it does
             // collide this line is the only warning there will ever be. A
@@ -952,6 +990,34 @@ fn wanted_loader_base(
             return unchecked;
         }
     };
+
+    // A WINDOWS CE TITLE SAYS WHERE ITS RAM IS, AND IT IS ALMOST ALL OF IT.
+    // Its kernel hands pages out of `ulRAMStart..ulRAMEnd` from the top down,
+    // so a loader placed by the rules below -- which know Katana allocators --
+    // lands in that pool and is overwritten once CE's allocations reach it.
+    // The loader goes at the top of the pool instead, and the upload tells CE
+    // its pool ends there (`wince::ram_end_patch`). Measured on Sega Rally 2
+    // PAL: pool 0x8c143000..0x8cef0000, loader at 0x8cee0000.
+    if framed_wince {
+        match wince::romhdr(&boot, args.address) {
+            Some(h) => match wince::loader_base(&h, loaders::LOADER_SPAN) {
+                Some(base) => {
+                    info!(
+                        "Windows CE: its kernel manages RAM 0x{:08x}..0x{:08x} (ROMHDR at                          0x{:08x}); putting the loader at 0x{base:08x}, the top of that, and                          telling CE its RAM ends there",
+                        h.ram_start, h.ram_end, h.at
+                    );
+                    return Some(base);
+                }
+                None => warn!(
+                    "Windows CE: its RAM ends at 0x{:08x}, too low to take the loader's 64 KB                      out of; placing the loader by the usual rules, where CE may reuse it",
+                    h.ram_end
+                ),
+            },
+            None => warn!(
+                "Windows CE: no ROM header found in the boot image, so where CE's kernel                  keeps its RAM is unknown; placing the loader by the usual rules, where CE                  may reuse it"
+            ),
+        }
+    }
 
     // WHICH ADDRESSES WERE ON THE TABLE, not just the one that won. Measured
     // 2026-08-27: a run picked 0x8ce00000 when the policy says 0x8cef8000,
@@ -1473,6 +1539,35 @@ fn note(loud: bool, msg: String) {
 /// answering promptly the moment it has something better to do. Without
 /// `--diag` it starts switched off, and every failure here drops to `debug`:
 /// nobody asked, so nothing is missing.
+/// Where the running loader's GD emulation is entered: `_gd_bios_entry` in the
+/// image the host would upload for `base`, which is the one running (a loader
+/// that differs from the file is replaced, even at the same base).
+fn gd_bios_entry(args: &Args, base: u32) -> Result<u32, String> {
+    let (elf, label) = loaders::LoaderSet::discover(args.loader_dir.clone()).image_for(base)?;
+    loaders::symbols(&elf)?
+        .get("gd_bios_entry")
+        .map(|&(addr, _)| addr)
+        .ok_or_else(|| format!("{label} predates it"))
+}
+
+/// The running loader's staging buffers for reads into translated addresses
+/// (`_gd_stage` in `.hiram`, `_gd_stage_big` above `_end`; dcload-ip
+/// cdfs_syscalls.c): the ranges of the loader a disc read is meant to land on.
+/// Empty for a loader that predates them.
+fn loader_stage(args: &Args, base: u32) -> Vec<(u32, u32)> {
+    let Ok((elf, _)) = loaders::LoaderSet::discover(args.loader_dir.clone()).image_for(base) else {
+        return vec![];
+    };
+    let Ok(syms) = loaders::symbols(&elf) else {
+        return vec![];
+    };
+    ["gd_stage", "gd_stage_big"]
+        .iter()
+        .filter_map(|n| syms.get(*n).copied())
+        .filter(|&(_, n)| n > 0)
+        .collect()
+}
+
 fn start_diag(
     args: &Args,
     conn: &mut DcIoUDP,
@@ -1645,8 +1740,14 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             );
         }
     }
-    let boot_bytes = match disc_formats::boot::extract(reader.as_ref(), args.descramble.into()) {
+    let mut framed_wince = false;
+    let boot_bytes = match disc_formats::boot::extract(
+        reader.as_ref(),
+        args.descramble.into(),
+        args.wince_mode(),
+    ) {
         Ok(b) => {
+            framed_wince = b.wince && b.skipped > 0;
             println!(
                 "boot bin : {} ({} bytes at LBA {}){}",
                 b.name,
@@ -1659,6 +1760,20 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 }
             );
             println!("bin md5  : {:x}", md5::compute(&b.bytes));
+            if b.wince {
+                println!(
+                    "wince    : Windows CE -- {}",
+                    if args.no_wince {
+                        "uploaded whole and entered directly (--no-wince)".to_string()
+                    } else {
+                        format!(
+                            "first {} bytes dropped as isoldr does, entered through the \
+                             disc's own second bootstrap",
+                            b.skipped
+                        )
+                    }
+                );
+            }
             Some(b.bytes)
         }
         Err(e) => {
@@ -1666,6 +1781,39 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             None
         }
     };
+    if let Some(b) = boot_bytes.as_ref() {
+        let n = dispatch::gd_body_patches(b, args.address, 0).len();
+        if n > 0 {
+            println!(
+                "gd body  : {n} direct call site(s) to the BIOS GD driver (0x8c0010f0), \
+                 pointed at the loader's emulation at upload"
+            );
+        }
+        if framed_wince {
+            match wince::romhdr(b, args.address) {
+                Some(h) => println!(
+                    "ce ram   : ROMHDR at 0x{:08x}: RAM 0x{:08x}..0x{:08x}, driver globals \
+                     0x{:08x}..0x{:08x}; loader {}",
+                    h.at,
+                    h.ram_start,
+                    h.ram_end,
+                    h.drivglob_start,
+                    h.drivglob_start.wrapping_add(h.drivglob_len),
+                    match wince::loader_base(&h, loaders::LOADER_SPAN) {
+                        Some(base) => format!("at 0x{base:08x}, RAM end moved there"),
+                        None => "placed by the usual rules".to_string(),
+                    }
+                ),
+                None => println!("ce ram   : no ROM header found"),
+            }
+            match wince::pio_patches(b, args.address).first() {
+                Some((at, w)) => println!(
+                    "ce gd    : aligned reads sent to PIO at 0x{at:08x} (word 0x{w:08x})"
+                ),
+                None => println!("ce gd    : DMA/PIO choice NOT found -- DMA streams would stall"),
+            }
+        }
+    }
 
     // WHAT --vga WOULD DO, answered where it costs no console. "The cable check
     // was not found" is the one thing worth knowing BEFORE such a run: after
@@ -1847,6 +1995,22 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             ),
         }
     };
+    // A WINDOWS CE TITLE IS PLACED BY ITS OWN ROM HEADER, ahead of any preset
+    // (`wanted_loader_base`), so a preset report would describe a decision no
+    // run takes.
+    if let Some(base) = boot_bytes
+        .as_deref()
+        .filter(|_| framed_wince)
+        .and_then(|b| wince::romhdr(b, args.address))
+        .and_then(|h| wince::loader_base(&h, loaders::LOADER_SPAN))
+    {
+        println!(
+            "would use: 0x{base:08x} -- the top of Windows CE's RAM, taken out of it at \
+             upload; the preset is not consulted"
+        );
+        report_collisions(base);
+        return ExitCode::SUCCESS;
+    }
     let (db_path, db_searched) = game_db_path(args, &loaders);
     match presets::PresetDb::load(&db_path) {
         Err(e) => println!(
@@ -2054,7 +2218,7 @@ fn safe_output_name(name: &str) -> String {
 
 /// `extract`: the boot binary out of an image and onto disk.
 fn extract_only(args: &Args, disc: &str, output: Option<&str>) -> ExitCode {
-    let boot = match dispatch::boot_binary(disc, args.descramble.into()) {
+    let boot = match dispatch::boot_binary(disc, args.descramble.into(), args.wince_mode()) {
         Ok(b) => b,
         Err(e) => {
             error!("{e}");
@@ -2447,7 +2611,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             let payload_disc = disc_reader
                 .as_deref()
                 .filter(|_| redirect_disc.as_deref() == Some(file.as_str()));
-            let (mut payload, label) = match resolve_payload(&args, file, payload_disc) {
+            let (mut payload, label, wince) = match resolve_payload(&args, file, payload_disc) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("{e}");
@@ -2520,6 +2684,21 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         }
                     },
                 };
+                // A WINDOWS CE TITLE IS ENTERED THROUGH THE DISC'S OWN
+                // SECOND BOOTSTRAP, as if --boot-ipbin had been given. That
+                // stub hands over the machine state a real boot does -- SR
+                // 0x700000f0, the kilobyte below 0x8c010000 zeroed, entry
+                // through P2 -- and go.S differs from it on exactly those
+                // (dcload-ip: docs/wince-investigation.md). isoldr enters CE titles
+                // directly (all 98 of DreamShell's type=3 presets say
+                // mode=0), so this is fidelity to the disc, not to isoldr.
+                let boot_ipbin = args.boot_ipbin || (wince && !args.no_wince);
+                if boot_ipbin && !args.boot_ipbin {
+                    info!(
+                        "Windows CE title: entering it through the disc's own second \
+                         bootstrap, as --boot-ipbin does (--no-wince enters it directly)"
+                    );
+                }
                 let mut entry = addr;
                 if let (Some(reader), Some(d)) = (disc_reader.as_deref(), redirect_disc.as_ref()) {
                     match dispatch::load_ip_bin(
@@ -2527,13 +2706,13 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         reader,
                         d,
                         running_base,
-                        args.boot_ipbin,
+                        boot_ipbin,
                         vga,
                     ) {
-                        Ok(true) if args.boot_ipbin => {
+                        Ok(true) if boot_ipbin => {
                             entry = dispatch::IP_BIN_BOOTSTRAP_2_EXEC;
                         }
-                        Ok(false) if args.boot_ipbin => {
+                        Ok(false) if boot_ipbin => {
                             // Declined, not failed -- the loader is sitting on
                             // the region. Entering 0x8c00e000 now would jump
                             // into the loader's own image.
@@ -2545,7 +2724,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("could not load IP.BIN: {e}");
-                            if args.boot_ipbin {
+                            if boot_ipbin {
                                 warn!(
                                     "--boot-ipbin asked for, but IP.BIN is not in RAM; \
                                      entering 0x{addr:08x} directly instead"
@@ -2553,7 +2732,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                } else if args.boot_ipbin {
+                } else if boot_ipbin {
                     if has_disc {
                         warn!(
                             "--boot-ipbin asked for, but the disc image could not be \
@@ -2627,7 +2806,75 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         warn!("could not force the cable check to VGA: {e}");
                     }
                 }
-                let guards = [gaps_guard, vga_guard, ppf_guard].concat();
+                // A title that calls the BIOS GD driver by its own address
+                // instead of through the syscall vectors bypasses the
+                // emulation and reads the physical drive. Windows CE does
+                // (dispatch::gd_body_patches). Always on, found by content:
+                // no Katana title measured carries the literal. Guarded like
+                // the others, because a module CE reloads carries it again.
+                let mut gd_guard: Vec<(u32, u32)> = vec![];
+                let direct = dispatch::gd_body_patches(&payload, args.address, 0).len();
+                if direct > 0 {
+                    match running_base.ok_or_else(|| "the loader does not report its base".to_string())
+                        .and_then(|b| gd_bios_entry(&args, b))
+                    {
+                        Ok(entry) => {
+                            info!(
+                                "this title calls the BIOS GD driver directly from {direct} \
+                                 place(s); pointing them at the loader's emulation (0x{entry:08x})"
+                            );
+                            gd_guard = dispatch::gd_body_patches(&payload, args.address, entry);
+                            if let Err(e) = dispatch::apply_patches(&mut udpsender, &gd_guard) {
+                                warn!("could not redirect the direct GD driver calls: {e}");
+                            }
+                        }
+                        Err(e) => warn!(
+                            "this title calls the BIOS GD driver directly from {direct} \
+                             place(s), and they will reach the real drive: no \
+                             _gd_bios_entry in the running loader ({e}) -- redeploy loaders/"
+                        ),
+                    }
+                }
+                // WINDOWS CE: its RAM stops where the loader starts, and its GD
+                // driver reads by PIO (src/wince.rs). Both are words of the ROM
+                // image CE reads in place, guarded like the others.
+                let mut wince_guard: Vec<(u32, u32)> = vec![];
+                if wince && !args.no_wince {
+                    match wince::romhdr(&payload, args.address) {
+                        Some(h) => match running_base.and_then(|b| wince::ram_end_patch(&h, b)) {
+                            Some(p) => {
+                                info!(
+                                    "Windows CE: its RAM now ends at 0x{:08x} instead of                                      0x{:08x}, so its kernel never hands out the loader's pages",
+                                    p.1, h.ram_end
+                                );
+                                wince_guard.push(p);
+                            }
+                            None => info!(
+                                "Windows CE: the loader is outside CE's RAM (0x{:08x}..0x{:08x});                                  nothing to take out of it",
+                                h.ram_start, h.ram_end
+                            ),
+                        },
+                        None => warn!(
+                            "Windows CE: no ROM header found, so the loader's RAM could not be                              taken out of CE's -- expect it to be overwritten"
+                        ),
+                    }
+                    let pio = wince::pio_patches(&payload, args.address);
+                    if pio.is_empty() {
+                        warn!(
+                            "Windows CE: the GD driver's DMA/PIO choice was not found, so aligned                              reads stay on DMA streams, which wait for an interrupt this                              transport never raises -- expect loading to stall"
+                        );
+                    } else {
+                        info!(
+                            "Windows CE: its GD driver will read aligned requests by PIO (0x{:08x}),                              whose pieces it chains itself",
+                            pio[0].0
+                        );
+                        wince_guard.extend(pio);
+                    }
+                    if let Err(e) = dispatch::apply_patches(&mut udpsender, &wince_guard) {
+                        warn!("could not patch the Windows CE image: {e}");
+                    }
+                }
+                let guards = [gaps_guard, vga_guard, ppf_guard, gd_guard, wince_guard].concat();
                 // Last, so a patch always wins over the bytes it replaces --
                 // whether they came from the title, from IP.BIN, or from both.
                 if !args.patch.is_empty()
@@ -2640,6 +2887,18 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         dispatch::apply_probes(&mut udpsender, &args.probe, running_base)
                 {
                     warn!("could not place probes: {e}");
+                }
+                // A VM2/VMUPro selects a game's saves when it is told which
+                // game is starting, and the title will ask it for a save long
+                // before this host gets another idle moment -- so this goes
+                // here, before the instruments and before EXEC. With a disc
+                // image only: a homebrew ELF has no product number and there
+                // is nothing to select. Never fatal (src/vm2.rs).
+                if !args.no_vm2
+                    && let Some(id) = identity.as_ref()
+                {
+                    let name = (!id.title.is_empty()).then_some(id.title.as_str());
+                    vm2::announce(&mut udpsender, &id.product, name);
                 }
                 // Set up BEFORE the title starts, while the disc is still in
                 // hand: from here on the reader belongs to the syscall loop.
@@ -2732,6 +2991,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 memory_recorder,
                                 diag,
                                 stack,
+                                running_base.map(|b| loader_stage(&args, b)).unwrap_or_default(),
                             )?;
                             return Ok(ExitCode::SUCCESS);
                         }
@@ -2741,7 +3001,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }},
         Commands::Upload { ref file } => {
-            let (payload, label) = match resolve_payload(&args, file, None) {
+            let (payload, label, _) = match resolve_payload(&args, file, None) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("{e}");

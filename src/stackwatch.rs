@@ -159,6 +159,8 @@ pub struct StackVerdict {
     warned: bool,
     /// A reading that was not a stack pointer has been reported.
     foreign: bool,
+    /// A virtual stack (an MMU title) has been reported.
+    virtual_sp: bool,
 }
 
 impl StackVerdict {
@@ -175,6 +177,7 @@ impl StackVerdict {
             reported: false,
             warned: false,
             foreign: false,
+            virtual_sp: false,
         }
     }
 
@@ -196,6 +199,27 @@ impl StackVerdict {
         if sp == NEVER {
             // The title has not made a GD syscall yet -- normal for the first
             // seconds of a boot, and permanent for a title with no disc.
+            return;
+        }
+        // A THREAD STACK IN A WINDOWS CE PROCESS SLOT IS NOT FOREIGN. CE runs
+        // with the MMU on and maps each process at a 32 MB slot from
+        // 0x02000000; Sega Rally 2 entered the GD driver with SP 0x080df62c
+        // and 0x0205f0c4 (2026-09-27), and this said the loader was gone while
+        // it was answering. Such a stack is not in the physical RAM a loader
+        // occupies, so there is no margin to measure and nothing to record.
+        // Main RAM's own P0 window is left to the test below: a Katana stack
+        // may be recorded through it.
+        if sp & 3 == 0
+            && (0x0200_0000..0x4200_0000).contains(&sp)
+            && !(0x0c00_0000..0x0d00_0000).contains(&sp)
+        {
+            if !self.virtual_sp {
+                self.virtual_sp = true;
+                info!(
+                    "this title enters GD syscalls on a virtual stack (SP 0x{sp:08x}): its \
+                     MMU is on, as Windows CE's is, so the loader's stack margin does not apply"
+                );
+            }
             return;
         }
         // A VALUE THAT IS NOT RAM WAS READ OUT OF SOMETHING ELSE. Measured
