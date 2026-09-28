@@ -59,7 +59,7 @@ pub fn known_unsupported(base: u32) -> Option<&'static str> {
 
 /// Where to bounce through when the target overlaps the running loader.
 ///
-/// Chosen because its own footprint (0x8ce00000..0x8ce0b000) is clear of every
+/// Chosen because its own footprint (0x8ce00000..0x8ce0bc00) is clear of every
 /// other base in the set, in both directions: no low base can reach it and it
 /// cannot reach any of them.
 pub const SCRATCH_BASE: u32 = 0x8ce0_0000;
@@ -201,7 +201,7 @@ pub fn layout(base: u32) -> Layout {
     if is_high(base) {
         Layout {
             image: base,
-            stack: base + 0xb000,
+            stack: base + 0xbc00,
             hiram: base + 0xc000,
             maple: base + 0xf000,
         }
@@ -383,7 +383,7 @@ pub fn search_free_base_above(
 }
 
 /// How wide a loader's own span is, from its base. Mirrors the HIGH layout in
-/// target-src/dcload/Makefile: stack at +0xb000, .hiram at +0xc000, Maple DMA
+/// target-src/dcload/Makefile: stack at +0xbc00, .hiram at +0xc000, Maple DMA
 /// at +0xd000.
 pub const LOADER_SPAN: u32 = 0x10000;
 

@@ -259,6 +259,11 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             // Resumes of the reading thread with a chunk on the wire: under
             // a Katana title, one per ExecServer while a read is in flight.
             ("g_ga_wakes", Fmt::Num),
+            // G2 DMA (loaders from 2026-09-28): frames received by DMA, and
+            // DMAs that never ended (must stay 0). The tick finishing chunks
+            // is g_ga_irq_done against g_ga_posts.
+            ("g_rx_dma_frames", Fmt::Num),
+            ("g_g2dma_timeouts", Fmt::Num),
         ],
     ),
     (
