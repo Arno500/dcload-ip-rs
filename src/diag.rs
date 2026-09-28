@@ -69,6 +69,13 @@ enum Fmt {
     /// above: that is exactly the kind of arithmetic to do once, here, and
     /// never again in one's head.
     Tmu2Ms,
+    /// A running total of TMU2 ticks (`g_irq_tick_sum`), shown as the
+    /// milliseconds it grew by since the last sample: the CPU the interrupt
+    /// hook took. It wraps every 343 s, so the delta is taken modulo 2^32.
+    Tmu2Total,
+    /// A small array of status words, shown as hex on one line (the Holly
+    /// interrupt masks the hook found, `g_irq_iml[]`).
+    HexList,
 }
 
 /// What to read, grouped the way `scripts/dc-counters.py` groups it -- for
@@ -208,6 +215,50 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             // force (1000000 = none yet).
             ("g_cdda_end_tm", Fmt::Num),
             ("g_cdda_scale_ppm", Fmt::Num),
+        ],
+    ),
+    (
+        // The loader's hook in a Windows CE title's vector table (its irq.c).
+        // Hooked 1 and entries climbing = the loader runs on the title's
+        // interrupts; refused > 0 = a table it did not recognise and left
+        // alone (refused_vbr says which); rehooks = the title re-installed
+        // its table and the hook was put back.
+        "Interrupt hook",
+        &[
+            ("g_irq_hooked", Fmt::Num),
+            // 1: the hooked entry is Katana's three nops, 0: Windows CE's.
+            ("g_irq_nop_entry", Fmt::Num),
+            ("g_irq_vbr", Fmt::Hex),
+            ("g_irq_rehooks", Fmt::Num),
+            ("g_irq_refused", Fmt::Num),
+            ("g_irq_refused_vbr", Fmt::Hex),
+            ("g_irq_entries", Fmt::Num),
+            ("g_irq_ticks", Fmt::Num),
+            ("g_irq_tick_max", Fmt::Tmu2Ms),
+            // Every tick's time added up: its growth per sample is the CPU the
+            // hook takes from the title.
+            ("g_irq_tick_sum", Fmt::Tmu2Total),
+            ("g_irq_evt_last", Fmt::Hex),
+            // BBA RX interrupts the hook took (Katana titles).
+            ("g_irq_rx", Fmt::Num),
+            // The level the BBA is routed to (0x3a0 IML2, 0x360 IML4, 0x320
+            // IML6; 0 = none), and the title's masks the hook found:
+            // IML2 NRM EXT ERR, IML4 ..., IML6 ...
+            ("g_irq_rx_evt", Fmt::Hex),
+            ("g_irq_iml", Fmt::HexList),
+            // Disc reads served asynchronously under Windows CE: chunks
+            // posted, and how many the tick finished (copy included).
+            ("g_ga_posts", Fmt::Num),
+            ("g_ga_irq_done", Fmt::Num),
+            // Pages of a title's buffer the UTLB probe did not find: those
+            // chunks are copied by the thread, a wake later, not the tick.
+            ("g_ga_xlat_miss", Fmt::Num),
+            // Reads finished synchronously because nothing could be
+            // translated (the page-table walk failed its check).
+            ("g_ga_sync", Fmt::Num),
+            // Resumes of the reading thread with a chunk on the wire: under
+            // a Katana title, one per ExecServer while a read is in flight.
+            ("g_ga_wakes", Fmt::Num),
         ],
     ),
     (
@@ -1033,6 +1084,15 @@ impl Probe {
                         }
                     }
                 }
+                Fmt::HexList => {
+                    let text = values
+                        .iter()
+                        .map(|v| format!("{v:08x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let zero = values.iter().all(|v| *v == 0);
+                    rows.push(PanelRow::value(e.name.to_string(), text, false, zero));
+                }
                 _ => {
                     let v = values.first().copied().unwrap_or(0);
                     let was = previous.and_then(|p| p.first()).copied();
@@ -1054,6 +1114,13 @@ impl Probe {
                                 format!("{} ({:.1} ms)", grouped(v), v as f64 / per_ms)
                             }
                         }
+                        Fmt::Tmu2Total => match was {
+                            Some(w) => format!(
+                                "+{:.1} ms",
+                                f64::from((v as u32).wrapping_sub(w as u32)) / 12500.0
+                            ),
+                            None => "(needs two samples)".to_string(),
+                        },
                         Fmt::Ip => format!(
                             "{}.{}.{}.{}",
                             v >> 24,

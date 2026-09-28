@@ -585,9 +585,26 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
 
     // Everything the loader would occupy has to be in RAM, and the image has to
     // fit under a stack that, for a LOW base, does not come down with it. The
-    // second rule is the link script's own ASSERT((_stack - _end) > 800), which
-    // is the check a native link would have made.
+    // rules are the link script's own two ASSERTs, the checks a native link
+    // would have made: every allocated section of the image at or under
+    // _stack, and (_stack - _end) > 800. `.gdstage` (NOLOAD, above `_end`)
+    // lives INSIDE the loader's stack on purpose -- the stack is dead while a
+    // title runs, the only time the stage is used (dcload.x.in) -- so the 800
+    // bytes are measured from the `_end` symbol, not from the top of the
+    // sections. Measured from the sections, every build within 800 bytes of a
+    // full stage was refused although it linked.
     let image_len = image_end.wrapping_sub(from);
+    if to.saturating_add(image_len) > dst.stack {
+        return Err(format!(
+            "a {image_len}-byte image at 0x{to:08x} runs past its stack top 0x{:08x}",
+            dst.stack
+        ));
+    }
+    let image_len = symbols(elf)
+        .ok()
+        .and_then(|s| s.get("end").map(|&(v, _)| v))
+        .filter(|&e| e >= from && e <= image_end)
+        .map_or(image_len, |e| e - from);
     for (lo, hi) in live_footprint(to) {
         if lo >= hi || hi > 0x8d00_0000 {
             return Err(format!(
