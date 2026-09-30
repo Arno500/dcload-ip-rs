@@ -264,6 +264,9 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             // is g_ga_irq_done against g_ga_posts.
             ("g_rx_dma_frames", Fmt::Num),
             ("g_g2dma_timeouts", Fmt::Num),
+            // G2 DMA channels seen used by the title (bit n = channel n;
+            // 0 is always set): the RX DMA never takes one of them.
+            ("g_g2dma_foreign", Fmt::Hex),
         ],
     ),
     (

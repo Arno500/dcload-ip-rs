@@ -1175,7 +1175,25 @@ impl LoaderSet {
     /// whole point of it: the set stops being a menu of addresses someone
     /// thought of in advance. Both families, since 2026-08-28.
     pub fn can_provide(&self, base: u32) -> bool {
-        self.has(base) || (self.relocatable().is_some() && could_relocate_to(base))
+        if self.has(base) {
+            return true;
+        }
+        let Some(path) = self.relocatable() else {
+            return false;
+        };
+        if !could_relocate_to(base) {
+            return false;
+        }
+        // A LOW BASE IS ASKED OF THE IMAGE ITSELF. The cheap test above sizes
+        // the image with `LOADER_IMAGE_MAX`, but a low loader's image and its
+        // `.gdstage` must fit under the BIOS VBR, and the relocatable set has
+        // grown to within bytes of it (2026-09-30: the memory marks and the
+        // idle listen put it 576 B past, where it had 136 B to spare). Saying
+        // yes here sent the placement to a base `image_for` then refused, and
+        // the session stayed on whatever loader was running. A high base has
+        // 16 KB between `_end` and its stack and is not in this race.
+        is_high(base)
+            || std::fs::read(path).is_ok_and(|elf| relocate(&elf, base).is_ok())
     }
 
     /// The ELF to upload for `base`, and a label for the log.

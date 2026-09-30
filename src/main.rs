@@ -17,6 +17,7 @@ mod disc_formats;
 mod dispatch;
 mod io;
 mod loaders;
+mod marks;
 mod memmap;
 mod patchdb;
 mod ppf;
@@ -159,6 +160,15 @@ struct Args {
     /// (`src/vm2.rs`). Pass this to leave the card on whatever it had.
     #[arg(long)]
     no_vm2: bool,
+
+    /// Do not paint witness words in free RAM before EXEC.
+    ///
+    /// By default, with a disc image the database knows, the loader marks the
+    /// RAM no disc read has landed in, and the host learns which 64 KB blocks
+    /// the title writes with the CPU while it runs (`src/marks.rs`), into
+    /// `game-memory.tsv`. Pass this to leave that RAM as it was.
+    #[arg(long)]
+    no_marks: bool,
 
     /// Treat a Windows CE title like any other boot binary.
     ///
@@ -505,6 +515,7 @@ fn pick_clear_base(
         dispatch::literals_in_loader_footprint(boot, address, b).is_empty()
             && low_base_has_stack_headroom(loaders, b, sp_min)
             && low_loader_painted_by_title(loaders, boot, address, b).is_none()
+            && region_reaching_loader(boot, address, b).is_none()
     };
     choose(loaders, wanted, &is_clear)
 }
@@ -530,6 +541,88 @@ fn base_is_clear(
         && !map_hits_loader(base, seen, margin)
         && low_base_has_stack_headroom(loaders, base, sp_min)
         && low_loader_painted_by_title(loaders, boot, address, base).is_none()
+        && region_reaching_loader(boot, address, base).is_none()
+}
+
+/// How far under a high base a region the title names may start and still be
+/// taken to reach it. One block: see `region_reaching_loader`.
+const REGION_REACH: u32 = memmap::BLOCK;
+
+/// A region the title names that starts inside a HIGH loader's span, or less
+/// than `REGION_REACH` under it: `Some(start)`.
+///
+/// THE CONSTANT SCAN LOOKS AT THE SPAN, AND A REGION GROWS UPWARD. A title that
+/// names 0x8cfc0000 has something that starts there and extends to an address
+/// it computes; the scan only asked whether 0x8cfc0000 was inside the loader.
+/// Shenmue II is the measured case: 0x8cfc0000 is in its region table, the
+/// host put the loader at 0x8cfd0000, and at the end of a cinematic the title
+/// wrote 0x8cfd0000..0x8cfd07c0 -- the loader's first 2 KB -- and the console
+/// reset (2026-09-30). One block of reach is what that measured, and a region
+/// further down is left to the learned map and the memory marks.
+///
+/// Region starts are 64 KB-aligned words anywhere in the image
+/// (`dispatch::region_starts`), not only loaded literals: Shenmue II's are in a
+/// data table. A low base shares the BIOS work area with the title by design,
+/// and is left to the tests that know about it.
+fn region_reaching_loader(boot: &[u8], address: u32, base: u32) -> Option<u32> {
+    if !loaders::is_high(base) {
+        return None;
+    }
+    let (lo, hi) = (base.saturating_sub(REGION_REACH), base + loaders::LOADER_SPAN);
+    dispatch::region_starts(boot, address)
+        .into_iter()
+        .find(|&c| lo <= c && c < hi)
+}
+
+/// Where the loader goes when DreamShell's preset is right about the RAM but
+/// our loader is too big for it.
+///
+/// A PRESET IS A WINDOW, NOT ONLY AN ADDRESS. DreamShell's `memory` is where
+/// isoldr ran for this title, and isoldr is 13 KB: what the preset tells us is
+/// that the title leaves `preset..` alone for at least that far. The title's
+/// own constants say where the window ends -- the lowest address it names
+/// above the preset. When our 64 KB span does not fit (the case where the
+/// constant scan refuses the preset itself), the least surprising place is
+/// against that ceiling: the most of our span inside the window, the least
+/// below it.
+///
+/// Shenmue II: preset 0x8cfe8000, ceiling 0x8cff0000 (its Maple DMA list, as
+/// for Sonic Adventure 2), so 0x8cfe0000 -- measured to run where the old
+/// search's 0x8cfd0000 reset the console (2026-09-30).
+///
+/// Tested with no margin against the map, like a preset: a margin is a guess
+/// about an allocator heading somewhere, and this candidate is DreamShell's
+/// evidence. Everything else `base_is_clear` asks still applies, the region
+/// rule included -- it is what refuses 0x8cfd0000 for Shenmue II.
+fn preset_window_base(
+    loaders: &loaders::LoaderSet,
+    boot: &[u8],
+    address: u32,
+    preset: u32,
+    seen: Option<&memmap::MemoryMap>,
+    sp_min: Option<u32>,
+) -> Option<(u32, u32)> {
+    if !loaders::is_high(preset) {
+        return None;
+    }
+    let ceiling = preset_window_ceiling(boot, address, preset)?;
+    let base = ceiling.checked_sub(loaders::LOADER_SPAN)? & !(loaders::LAYOUT_PAGE - 1);
+    if base == preset || !loaders::is_high(base) || !loaders.can_provide(base) {
+        return None;
+    }
+    base_is_clear(loaders, boot, address, base, seen, sp_min, 0).then_some((base, ceiling))
+}
+
+/// The lowest RAM address above `preset` the title names: a loaded literal or
+/// a region start.
+fn preset_window_ceiling(boot: &[u8], address: u32, preset: u32) -> Option<u32> {
+    let loaded = dispatch::loaded_literals_in(boot, address, &[(preset + 1, 0x8d00_0000)])
+        .into_iter()
+        .map(|(at, _)| at);
+    let regions = dispatch::region_starts(boot, address)
+        .into_iter()
+        .filter(|&c| c > preset);
+    loaded.chain(regions).min()
 }
 
 /// Does a loader at `base` fit under this title's stack?
@@ -1085,7 +1178,11 @@ fn wanted_loader_base(
     // where every chainload passes through.
     let Some((preset, _)) = &found else {
         let running = running?;
-        if base_is_clear(
+        // A low loader this set cannot reproduce (the CD's own, once the set
+        // outgrew the low family) would be kept as it is, older build and all:
+        // go high instead, like a painted title.
+        let unprovidable = !loaders::is_high(running) && !loaders.can_provide(running);
+        if !unprovidable && base_is_clear(
             &loaders,
             &boot,
             args.address,
@@ -1102,12 +1199,21 @@ fn wanted_loader_base(
         // found nothing and the loader stayed where Snow Surfers paints its
         // stack (2026-09-17).
         let painted = low_loader_painted_by_title(&loaders, &boot, args.address, running);
-        if painted.is_some() || !low_base_has_stack_headroom(&loaders, running, sp_min) {
+        if painted.is_some()
+            || unprovidable
+            || !low_base_has_stack_headroom(&loaders, running, sp_min)
+        {
             match painted {
                 Some(p) => warn!(
                     "'{}' is not in the database, and {}. Leaving the low family.",
                     identity.title,
                     painted_reason(running, p)
+                ),
+                None if unprovidable => warn!(
+                    "'{}' is not in the database, and the loader set cannot be placed at \
+                     0x{running:08x}, where the running loader is: its image no longer fits \
+                     under the BIOS VBR. Leaving the low family.",
+                    identity.title
                 ),
                 None => warn!(
                     "'{}' is not in the database, and its stack has been measured coming \
@@ -1220,11 +1326,15 @@ fn wanted_loader_base(
     let contested = low_family_contested(&db, &identity, preset);
     let no_headroom = !low_base_has_stack_headroom(&loaders, preset.memory, sp_min);
     let painted = low_loader_painted_by_title(&loaders, &boot, args.address, preset.memory);
+    // AND THE SET MAY NOT BE ABLE TO GO THERE AT ALL: a low base needs the
+    // image under the BIOS VBR (`LoaderSet::can_provide`).
+    let unprovidable = !loaders::is_high(preset.memory) && !loaders.can_provide(preset.memory);
     if hits.is_empty()
         && !seen_hits_preset
         && contested.is_none()
         && !no_headroom
         && painted.is_none()
+        && !unprovidable
     {
         return Some(preset.memory);
     }
@@ -1234,7 +1344,17 @@ fn wanted_loader_base(
     // same 0x8c004000..0x8c00f400 hole with the title's stack, so moving a few
     // kilobytes inside it buys nothing -- which is exactly what the ordinary
     // search would try, since it never crosses families on purpose.
-    if contested.is_some() || no_headroom || painted.is_some() {
+    if contested.is_some() || no_headroom || painted.is_some() || unprovidable {
+        if unprovidable {
+            warn!(
+                "'{}': its preset asks for 0x{:08x}, and the loader set in {} cannot be \
+                 placed that low -- its image no longer fits under the BIOS VBR. Leaving the \
+                 low family.",
+                preset.title,
+                preset.memory,
+                loaders.dir().display()
+            );
+        }
         if let Some(p) = painted {
             warn!(
                 "'{}': {}. Leaving the low family.",
@@ -1310,6 +1430,27 @@ fn wanted_loader_base(
              asks for, though nothing in its binary names it. Looking for somewhere else.",
             preset.title, preset.memory
         );
+    } else if let Some((alt, ceiling)) = preset_window_base(
+        &loaders,
+        &boot,
+        args.address,
+        preset.memory,
+        seen.as_ref(),
+        sp_min,
+    ) {
+        // THE PRESET'S WINDOW, when only our size is the problem. See
+        // `preset_window_base`.
+        warn!(
+            "'{}': its preset 0x{:08x} is where DreamShell's 13 KB loader ran, and the \
+             title names 0x{ceiling:08x} just above it (the constant at 0x{:08x}), so a 64 KB \
+             loader does not fit there. Using 0x{alt:08x}, against that ceiling: as much of \
+             the preset's free window as possible, and nothing the title is known to use. Pin \
+             it with --loader-base to override.",
+            preset.title,
+            preset.memory,
+            hits[0].1,
+        );
+        return Some(alt);
     }
     match pick_clear_base(
         &loaders,
@@ -1696,6 +1837,54 @@ fn start_stack_watch(
     }
 }
 
+/// Paint the witness words and bring up their check, or say why not
+/// (`src/marks.rs`). Never fatal, like every instrument here.
+fn start_marks(
+    args: &Args,
+    conn: &mut DcIoUDP,
+    running_base: Option<u32>,
+    wince: bool,
+    image_end: u32,
+    recorder: Option<std::sync::Arc<std::sync::Mutex<memmap::MemoryRecorder>>>,
+) -> Option<marks::MarkWatch> {
+    if args.no_marks {
+        return None;
+    }
+    // Nothing to learn into: a title with no identity records nothing.
+    let recorder = recorder?;
+    let Some(base) = running_base else {
+        debug!("no memory marks: this loader does not report its own load address");
+        return None;
+    };
+    if wince {
+        debug!("no memory marks: Windows CE's kernel owns this RAM, and its loader's place is fixed");
+        return None;
+    }
+    let known = recorder.lock().ok()?.known();
+    let blocks = marks::blocks_to_paint(image_end, base, &known);
+    if blocks.is_empty() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    match marks::paint(conn, &blocks) {
+        Ok(()) => {
+            info!(
+                "memory marks: {} blocks of 64 KB above the title's image painted in {:.0} ms; \
+                 the ones it writes will be recorded as used",
+                blocks.len(),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            let watch = marks::MarkWatch::new(blocks, recorder);
+            watch.install(conn);
+            Some(watch)
+        }
+        Err(e) => {
+            warn!("memory marks: {e}; this session learns from disc reads only");
+            None
+        }
+    }
+}
+
 /// `identify`: everything the loader-placement pass would work out, printed.
 fn identify_only(args: &Args, disc: &str) -> ExitCode {
     let reader = match dispatch::open_disc(disc) {
@@ -1951,7 +2140,9 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             (None, None) => println!("startup  : no fill of a constant range found"),
         }
     }
-    let report_collisions = |base: u32| {
+    // `is_preset`: `base` is the title's own preset, whose window is tried
+    // first (`preset_window_base`), as `uexec` does.
+    let report_collisions = |base: u32, is_preset: bool| {
         let Some(bytes) = boot_bytes.as_deref() else {
             return;
         };
@@ -1980,6 +2171,18 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         // cannot drift from what a run would actually do. The answer is what
         // the reader actually needs; without it "pick another base" is an
         // invitation to guess, and a guess costs a session per attempt.
+        if is_preset
+            && let Some((alt, ceiling)) =
+                preset_window_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min)
+        {
+            println!(
+                "           uexec would use 0x{alt:08x} instead: the top of the preset's \
+                 window, under 0x{ceiling:08x}, the lowest address the title names above it \
+                 (relocating {} there -- no rebuild).",
+                loaders::RELOCATABLE_NAME
+            );
+            return;
+        }
         match pick_clear_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min) {
             Some(alt) => println!(
                 "           uexec would use 0x{alt:08x} instead ({}).",
@@ -2008,7 +2211,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             "would use: 0x{base:08x} -- the top of Windows CE's RAM, taken out of it at \
              upload; the preset is not consulted"
         );
-        report_collisions(base);
+        report_collisions(base, false);
         return ExitCode::SUCCESS;
     }
     let (db_path, db_searched) = game_db_path(args, &loaders);
@@ -2041,7 +2244,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             db.len(),
                             loaders::DEFAULT_BASE
                         );
-                        report_collisions(alt);
+                        report_collisions(alt, false);
                     }
                     None => {
                         println!(
@@ -2050,7 +2253,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             db.len(),
                             loaders::DEFAULT_BASE
                         );
-                        report_collisions(loaders::DEFAULT_BASE);
+                        report_collisions(loaders::DEFAULT_BASE, false);
                     }
                 }
             }
@@ -2060,7 +2263,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     db.len(),
                     loaders::DEFAULT_BASE
                 );
-                report_collisions(loaders::DEFAULT_BASE);
+                report_collisions(loaders::DEFAULT_BASE, false);
             }
             Some((p, kind)) => {
                 let how = match kind {
@@ -2108,6 +2311,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 let no_headroom = !low_base_has_stack_headroom(&loaders, p.memory, sp_min);
                 // Already said on the `startup` line.
                 let painted = painted_at(p.memory).is_some();
+                let unprovidable = !loaders::is_high(p.memory) && !loaders.can_provide(p.memory);
                 if loaders::known_unsupported(p.memory).is_some() {
                     match boot_bytes.as_deref().and_then(|b| {
                         base_for_low_preset(&loaders, b, args.address, seen.as_ref(), sp_min)
@@ -2119,16 +2323,23 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                                 loaders::ISOLDR_DEFAULT_ADDR,
                                 loaders::ISOLDR_HIGH_ADDR
                             );
-                            report_collisions(alt);
+                            report_collisions(alt, false);
                         }
                         None => println!(
                             "would use: nothing clear of this title could be produced; the \
                              loader would stay where it is"
                         ),
                     }
-                } else if contested.is_some() || no_headroom || painted {
+                } else if contested.is_some() || no_headroom || painted || unprovidable {
                     // THE SAME PREDICATES `uexec` APPLIES, so the offline
                     // report cannot come to a different answer than a run.
+                    if unprovidable {
+                        println!(
+                            "too big  : the loader set cannot be placed at 0x{:08x} -- its \
+                             image no longer fits under the BIOS VBR",
+                            p.memory
+                        );
+                    }
                     if let Some(votes) = contested.as_ref() {
                         println!(
                             "contested: presets under this title disagree ({}) and one is \
@@ -2167,7 +2378,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                                  workable",
                                 loaders::ISOLDR_HIGH_ADDR
                             );
-                            report_collisions(alt);
+                            report_collisions(alt, false);
                         }
                         None => {
                             println!(
@@ -2175,11 +2386,11 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                                  the preset's 0x{:08x} would be used anyway",
                                 p.memory
                             );
-                            report_collisions(p.memory);
+                            report_collisions(p.memory, false);
                         }
                     }
                 } else {
-                    report_collisions(p.memory);
+                    report_collisions(p.memory, true);
                 }
             }
         },
@@ -2959,6 +3170,18 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     running_base,
                     memory_recorder.clone(),
                 );
+                // LAST BEFORE EXEC, after everything else that writes RAM: the
+                // witness words must be what the title finds (src/marks.rs).
+                let image_end = ((args.address & 0x1fff_ffff) | 0x8c00_0000)
+                    .saturating_add(payload.len() as u32);
+                let marks = start_marks(
+                    &args,
+                    &mut udpsender,
+                    running_base,
+                    wince && !args.no_wince,
+                    image_end,
+                    memory_recorder.clone(),
+                );
                 info!("Upload complete, executing at 0x{:08x}", entry);
                 // The title is on the console now; the host's copy is only
                 // holding up to 16 MiB for the length of the session.
@@ -2991,6 +3214,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 memory_recorder,
                                 diag,
                                 stack,
+                                marks,
                                 running_base.map(|b| loader_stage(&args, b)).unwrap_or_default(),
                             )?;
                             return Ok(ExitCode::SUCCESS);

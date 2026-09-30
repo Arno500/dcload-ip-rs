@@ -218,6 +218,9 @@ impl MemorySource {
 
 impl ImageSource for MemorySource {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         let start = offset as usize;
         let end = start.saturating_add(buf.len());
         if end > self.bytes.len() {
@@ -353,5 +356,19 @@ mod tests {
             assert!(c.read_text(bad).is_err(), "'{bad}' must be refused");
         }
         let _ = std::fs::remove_file(dir.join("track01.bin"));
+    }
+
+    /// A play range that runs into the next track's undumped pregap asks for
+    /// nothing of the file: a zero-length read past the end. It must not be an
+    /// error, or the loader re-asks for the same sectors forever (Shenmue II's
+    /// title screen: "read of 0 bytes at 1629936 runs past the 1625232-byte
+    /// image").
+    #[test]
+    fn an_empty_read_past_the_end_of_a_track_in_memory_is_not_an_error() {
+        let m = MemorySource::new(vec![1u8; 100], "track05.raw".to_string());
+        assert!(m.read_at(1000, &mut []).is_ok(), "empty read, far past the end");
+        assert!(m.read_at(100, &mut []).is_ok(), "empty read, exactly at the end");
+        // Positive control: a read with bytes in it past the end is still refused.
+        assert!(m.read_at(99, &mut [0u8; 2]).is_err());
     }
 }

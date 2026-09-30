@@ -463,6 +463,26 @@ impl MemoryRecorder {
     /// title is frozen on -- so it does no I/O at all: marking is two shifts,
     /// and the writing is the ticker's job.
     pub fn record(&mut self, addr: u32, len: u32) {
+        self.note(addr, len, "reads into");
+    }
+
+    /// Note a block the title wrote with the CPU: a witness word the loader
+    /// painted there has changed (`marks.rs`). Same map, same merge -- a block
+    /// the title writes is a block the loader must not be in, however it was
+    /// written.
+    pub fn record_written(&mut self, addr: u32, len: u32) {
+        self.note(addr, len, "writes");
+    }
+
+    /// Everything known about this title so far: the file's row and what this
+    /// session has added to it.
+    pub fn known(&self) -> MemoryMap {
+        let mut merged = self.baseline;
+        merged.merge(&self.map);
+        merged
+    }
+
+    fn note(&mut self, addr: u32, len: u32, how: &str) {
         let before = self.map;
         self.map.mark(addr, len);
         if self.map == before {
@@ -476,7 +496,7 @@ impl MemoryRecorder {
         if new > self.reported_new {
             self.reported_new = new;
             log::info!(
-                "memory map: this title reads into 0x{addr:08x}, a 64 KB block that was \
+                "memory map: this title {how} 0x{addr:08x}, a 64 KB block that was \
                  not known before -- {new} new this session"
             );
         }

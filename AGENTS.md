@@ -37,8 +37,12 @@ A `u-exec` session:
      title, reported as approximate) and look up DreamShell's `memory` preset in
      `game-presets.tsv`.
    - Reject a base the title **names** (constants its code loads into the
-     loader's footprint, `literals_in_loader_footprint`), **writes** (blocks its
-     disc reads landed in, `game-memory.tsv`), whose **stack** would reach
+     loader's footprint, `literals_in_loader_footprint`; or a region start --
+     a 64 KB-aligned word anywhere in the image, `dispatch::region_starts` --
+     inside a high span or less than one block under it,
+     `region_reaching_loader`), **writes** (blocks its disc reads landed in,
+     and since 2026-09-30 blocks it wrote with the CPU, learned by `marks.rs`;
+     both in `game-memory.tsv`), whose **stack** would reach
      (`low_base_has_stack_headroom`: `sp_min - _end >= LOW_BASE_MIN_MARGIN`,
      4096), or that a **fill loop with constant bounds** covers
      (`constant_range_fills` + `low_loader_painted_by_title`). The last is the
@@ -49,7 +53,14 @@ A `u-exec` session:
      constant scan deliberately skips at a low base (loader AGENTS.md 4.6).
      Presets below `0x8c004000` cannot be built and send the loader to
      the largest free region instead; a split vote that includes such a preset
-     moves the loader off the low family (`low_family_contested`). Off the low
+     moves the loader off the low family (`low_family_contested`), and so does
+     a low base the set cannot be relocated to (`LoaderSet::can_provide`
+     relocates for real below `0x8c010000`: since 2026-09-30 the image does not
+     fit under the BIOS VBR). A high preset refused by the constant scan is
+     read as a window (`preset_window_base`): the loader goes against the
+     lowest address the title names above the preset, with no map margin --
+     0x8cfe0000 for Shenmue II (measured) and Crazy Taxi (not yet), under
+     their Maple DMA list at 0x8cff0000. Off the low
      family the search is seeded from `ISOLDR_HIGH_ADDR` for a title in the
      database and from `SCRATCH_BASE` for one that is not: no preset has an
      opinion there, it is one hop, and it is where Snow Surfers ran every CD-DA
@@ -146,7 +157,7 @@ Environment variables:
 ## 3. Tests
 
 `cargo test` runs the unit tests in `adpcm`, `cd`, `diag`, `dispatch`,
-`loaders`, `main`, `memmap`, `patchdb`, `ppf`, `presets`, `stackwatch`, `ui`
+`loaders`, `main`, `marks`, `memmap`, `patchdb`, `ppf`, `presets`, `stackwatch`, `ui`
 and `disc_formats::{cdi, deflate, gdi, scramble, source, zip}` (228 at the time
 of writing, one ignored). Tests that need a real dump skip when it is absent:
 the GDI and zip tests want `test/Sonic Adventure ….gdi` and
@@ -359,6 +370,13 @@ PAL): `patches/patches.tsv` plus `.ppf` files, found like the other data files
   the learned per-title map (256-bit, 64 KB per bit, merged by OR) and `sp_min`
   (merged by minimum), written by a ticker thread every 2 s rather than on the
   read path, so a killed session still leaves it.
+- **`marks.rs`** — what a title writes with the CPU (2026-09-30). Before
+  `EXEC` the loader paints witness words over every 64 KB block above the
+  title's image that is neither known used nor its own (`MARK`, dcload-ip
+  AGENTS.md 8); while the title runs, 16 blocks are checked each second and a
+  changed one is recorded as used. Not for Windows CE; `--no-marks`. Replies
+  come through a `PacketSink` that claims every `MARK`. The loader answers
+  between reads too (its idle listen, `IRQ_IDLE_LISTEN`), BBA only.
 - **`stackwatch.rs`** — reads `g_gd_sp_min`/`g_gd_sp_in_image` every 10 s in
   every session and records `sp_min`. A reading outside RAM is neither recorded
   nor a verdict, it is reported as "not the loader this session verified": a

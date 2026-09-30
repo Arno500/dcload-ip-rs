@@ -336,7 +336,14 @@ impl DiscFormat for Gdi {
             // One read for the whole run: an audio track is raw all the way
             // through, so unlike a data track there is nothing to skip
             // between sectors. The rest of the run stays zero.
-            source.read_at(at, out)?;
+            // Nothing of this run is in the file (it lies wholly in the pregap
+            // that was not dumped): silence, and no read at all. A zero-length
+            // read past the end is an error for an in-memory track, and that
+            // error was the loader's endless re-ask at the end of a looping
+            // track (Shenmue II's title screen, track 5).
+            if in_file > 0 {
+                source.read_at(at, out)?;
+            }
             done += run;
         }
         Ok(buffer)
@@ -561,6 +568,8 @@ mod tests {
         assert!(got[3 * 2352..].iter().all(|b| *b == 0), "the pregap is silence");
         // The next track begins exactly where the span ends.
         assert_eq!(g.read_audio(155, 1).expect("track 3"), vec![7u8; 2352]);
+        // Wholly in the pregap: silence too, whatever the source is.
+        assert!(g.read_audio(153, 2).expect("the pregap reads").iter().all(|b| *b == 0));
         // Positive control: the last track has no span to fill.
         assert!(g.read_audio(155, 2).is_err(), "past the last track's file");
 

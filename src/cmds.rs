@@ -16,6 +16,10 @@ pub enum DCLoadCmds {
     /// LONGWORDS, then that many longwords (`cmd_maple` in commands.c).
     Mapl(Option<Vec<u8>>),
     PerformanceCounter(),
+    /// Witness words in free RAM (`cmd_mark` in commands.c, `marks.rs`):
+    /// `size` bit 31 clear paints, set checks. The reply carries the bitmap
+    /// of changed 64 KB blocks when checking.
+    Mark(Option<Vec<u8>>),
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +44,7 @@ impl DCLoadCmds {
             DCLoadCmds::Reboot() => "RBOT",
             DCLoadCmds::Mapl(_) => "MAPL",
             DCLoadCmds::PerformanceCounter() => "PMCR",
+            DCLoadCmds::Mark(_) => "MARK",
         }
     }
 }
@@ -89,6 +94,11 @@ impl From<DCLoadCmd> for Vec<u8> {
                 b"MAPL".to_vec()
             }
             DCLoadCmds::PerformanceCounter() => b"PMCR".to_vec(),
+            DCLoadCmds::Mark(None) => b"MARK".to_vec(),
+            DCLoadCmds::Mark(Some(bits)) => {
+                data = bits;
+                b"MARK".to_vec()
+            }
         };
         // cmd_bytes.append(&mut val.address.to_ne_bytes().to_vec());
         // cmd_bytes.append(&mut val.size.to_ne_bytes().to_vec());
@@ -201,6 +211,10 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
                 }
             }
             b"PMCR" => DCLoadCmds::PerformanceCounter(),
+            b"MARK" => {
+                let payload = &input[12..];
+                DCLoadCmds::Mark((!payload.is_empty()).then(|| payload.to_vec()))
+            }
             _ => return Err("Unknown command".to_string()),
         };
         let address = u32::from_be_bytes(input[4..8].try_into().unwrap());

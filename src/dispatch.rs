@@ -1448,9 +1448,14 @@ fn declare_vga_and_say_so(header: &mut [u8]) {
 /// actually loads it. On Sonic Adventure 2 that is the whole difference between
 /// eight occurrences of 0x0cff0000 and the two sites that use them.
 pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<(u32, u32)> {
-    let spans = payload_spans(buf, address);
+    loaded_literals_in(buf, address, &crate::loaders::exclusive_footprint(base))
+}
 
-    let ranges = crate::loaders::exclusive_footprint(base);
+/// Constants naming RAM inside `ranges` (P1, `hi` exclusive) that an
+/// instruction loads: `(address named, loading site)`. The scan behind
+/// `literals_in_loader_footprint`, for any range.
+pub fn loaded_literals_in(buf: &[u8], address: u32, ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let spans = payload_spans(buf, address);
     if ranges.is_empty() {
         return vec![];
     }
@@ -1495,6 +1500,57 @@ pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<
     }
     out.sort_unstable();
     out.dedup();
+    out
+}
+
+/// 64 KB-aligned RAM addresses the title names anywhere in its image, as data
+/// words or literals alike: where its own regions START, in the cached window,
+/// sorted. Only above its load address -- below is the BIOS work area.
+///
+/// NOT CORROBORATED BY A LOAD, unlike `literals_in_loader_footprint`, and on
+/// purpose: Shenmue II keeps its high-RAM regions in a table of plain words
+/// (0x8cf00000 sixteen times, 0x8cfc0000 twenty, at 0x8c24e320 among others),
+/// which no `mov.l @(disp,PC)` loads, and 0x8cfc0000 is the one that mattered:
+/// the title writes 0x8cfd0000..0x8cfd07c0, just past the region's first
+/// block, and a loader at 0x8cfd0000 was overwritten there (2026-09-30).
+/// Alignment is the corroboration instead: a round 64 KB address is what an
+/// allocator's region looks like, and rarely what anything else does.
+///
+/// Computed once per image (the placement pass asks for every candidate).
+pub fn region_starts(buf: &[u8], address: u32) -> Vec<u32> {
+    // By identity AND a few bytes of content: a freed buffer's address can be
+    // handed to the next image.
+    type Key = (usize, usize, u32, u64);
+    static CACHE: std::sync::Mutex<Option<(Key, Vec<u32>)>> = std::sync::Mutex::new(None);
+    let tail = &buf[buf.len().saturating_sub(64)..];
+    let taste = buf[..buf.len().min(64)]
+        .iter()
+        .chain(tail)
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    let key = (buf.as_ptr() as usize, buf.len(), address, taste);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, v)) = cache.as_ref()
+        && *k == key
+    {
+        return v.clone();
+    }
+    let floor = (address & 0x1fff_ffff) | 0x8c00_0000;
+    let mut out: Vec<u32> = vec![];
+    for (_, data) in payload_spans(buf, address) {
+        for w in data.chunks_exact(4) {
+            let raw = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if raw & 0xffff != 0 || !matches!(raw & 0xff00_0000, 0x0c00_0000 | 0x8c00_0000 | 0xac00_0000) {
+                continue;
+            }
+            let at = (raw & 0x1fff_ffff) | 0x8c00_0000;
+            if at > floor {
+                out.push(at);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    *cache = Some((key, out.clone()));
     out
 }
 
@@ -2143,9 +2199,10 @@ pub fn audit_audio(disc: &dyn DiscFormat, only: Option<u8>) -> Result<u64, Strin
     Ok(total)
 }
 
-// Nine arguments, each something the session already decided: the disc, the
+// Eleven arguments, each something the session already decided: the disc, the
 // mount, where the loader is, the guards to keep alive, whether to serve
-// audio, where to record what is learned, what to sample, and the stack watch.
+// audio, where to record what is learned, what to sample, the stack watch,
+// the memory marks and the loader's own stages.
 // A struct would only move the list out of sight of this signature.
 #[allow(clippy::too_many_arguments)]
 pub fn receive_syscalls(
@@ -2158,6 +2215,7 @@ pub fn receive_syscalls(
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     mut diag: Option<crate::diag::Probe>,
     mut stack: Option<crate::stackwatch::StackWatch>,
+    mut marks: Option<crate::marks::MarkWatch>,
     stage: Vec<(u32, u32)>,
 ) -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     // A disc that could not be opened is not a silent no-op: the title is
@@ -2276,6 +2334,10 @@ pub fn receive_syscalls(
         if let Some(s) = stack.as_mut() {
             s.tick(conn);
         }
+        // And the memory marks, which post their own MARK check (`marks`).
+        if let Some(m) = marks.as_mut() {
+            m.tick(conn);
+        }
         // Whoever wants waking up soonest decides. `LoadMonitor` asks for
         // nothing while no burst is open -- the normal state of a running
         // title -- so without the panel this is still the block-forever it
@@ -2284,6 +2346,7 @@ pub fn receive_syscalls(
             load.poll_timeout(),
             diag.as_ref().and_then(|d| d.poll_timeout()),
             stack.as_ref().and_then(|s| s.poll_timeout()),
+            marks.as_ref().and_then(|m| m.poll_timeout()),
         ]
         .into_iter()
         .flatten()
