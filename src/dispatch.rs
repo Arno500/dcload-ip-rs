@@ -1119,6 +1119,12 @@ fn payload_spans(buf: &[u8], address: u32) -> Vec<(u32, &[u8])> {
     spans
 }
 
+/// A disc read's ReturnValue carries `READ_RETVAL_TAG | LBA` in its address, so
+/// the loader can refuse the late answer to another read into the same buffer
+/// (`GD_READ_TAG` in dcload-ip's commands.h). Bit 31 stays clear: older
+/// loaders only test the sign, and newer ones take 0 as "not named".
+const READ_RETVAL_TAG: u32 = 0x4000_0000;
+
 /// The four G2 slot windows a Katana title probes for an expansion device.
 const GAPS_SLOT_WINDOWS: [u32; 4] = [0xa100_0400, 0xa100_0800, 0xa100_1400, 0xa100_1800];
 /// `"GAPS"` read back as a little-endian word -- the signature the probe compares against.
@@ -2866,9 +2872,17 @@ pub fn receive_syscalls(
                                                 error!("could not re-apply the guard: {e}");
                                             }
                                         }
+                                        // NAME THE READ (2026-10-02). A late answer
+                                        // to an earlier read into the same buffer
+                                        // passes the loader's destination check
+                                        // (every chunk of a translated read lands
+                                        // in its stage, KOS reuses its cache
+                                        // blocks); this ReturnValue is what tells
+                                        // the loader it is not the read waiting
+                                        // (`g_retval_want`, dcload-ip's commands.c).
                                         conn.send_command(DCLoadCmd {
                                             cmd: DCLoadCmds::ReturnValue(),
-                                            address: 0,
+                                            address: READ_RETVAL_TAG | (start & 0x3fff_ffff),
                                             size: 0,
                                         })?;
                                         // AFTER the ReturnValue, deliberately.
