@@ -1837,6 +1837,89 @@ fn start_stack_watch(
     }
 }
 
+/// Tell the loader the title is a KOS binary (`g_gd_kos`, cdfs_syscalls.c):
+/// its disc reads then start without the first yield, as isoldr does for
+/// BIN_TYPE_KOS. KOS polls a DMA read once and, on PROCESSING, sleeps until
+/// an interrupt nothing raises; only its vblank handler then moves the read,
+/// from inside the interrupt. Never fatal: a loader without the symbol keeps
+/// the yield, and the log says so.
+fn tell_loader_kos(args: &Args, conn: &mut DcIoUDP, running_base: Option<u32>) -> bool {
+    let Some(base) = running_base else {
+        warn!("KOS title: the loader does not report its base, so it cannot be told");
+        return false;
+    };
+    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
+    let addr = loaders
+        .image_for(base)
+        .map_err(|e| e.to_string())
+        .and_then(|(elf, _)| loaders::symbols(&elf))
+        .and_then(|syms| {
+            syms.get("g_gd_kos")
+                .map(|&(addr, _)| addr)
+                .ok_or_else(|| "this loader has no g_gd_kos (an older build)".to_string())
+        });
+    match addr {
+        Ok(addr) => {
+            info!(
+                "KOS title: the loader starts its disc reads at once and takes its console \
+                 (g_gd_kos at 0x{addr:08x})"
+            );
+            match dispatch::apply_patches(conn, &[(addr, 1)]) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("could not set g_gd_kos: {e}");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "KOS title, but {e}: its disc reads will wait for KOS's vblank, from inside \
+                 the interrupt"
+            );
+            false
+        }
+    }
+}
+
+/// Lower a KOS title's top of RAM under the loader (`kos_mem_top_patches`):
+/// its heap and main stack otherwise reach 0x8cff0000..0x8d000000, through a
+/// high loader and through a low one's buffers. Never fatal.
+fn lower_kos_mem_top(conn: &mut DcIoUDP, running_base: Option<u32>, boot: &[u8], address: u32) {
+    let Some(base) = running_base else {
+        warn!("KOS title: the loader does not report its base; its top of RAM is left alone");
+        return;
+    };
+    let p1 = |a: u32| (a & 0x1fff_ffff) | 0x8c00_0000;
+    let load = p1(address);
+    // The lowest part of the loader above the title: the whole span of a high
+    // loader, the Maple/.hiram buffers of a low one.
+    let Some(top) = loaders::live_footprint(base)
+        .into_iter()
+        .map(|(start, _)| p1(start))
+        .filter(|&start| start > load)
+        .min()
+    else {
+        return;
+    };
+    match dispatch::kos_mem_top_patches(boot, load, top) {
+        Ok(patches) => {
+            info!(
+                "KOS title: top of RAM lowered from 0x8d000000 to 0x{top:08x}, under the \
+                 loader -- heap up to 0x{:08x}, {} KB less RAM",
+                top - 0x1_0000,
+                (0x8d00_0000 - top) / 1024
+            );
+            if let Err(e) = dispatch::apply_patches(conn, &patches) {
+                warn!("could not lower the KOS top of RAM: {e}");
+            }
+        }
+        Err(e) => warn!(
+            "KOS title, but {e}: its heap and stack may reach the loader at 0x{base:08x}"
+        ),
+    }
+}
+
 /// Paint the witness words and bring up their check, or say why not
 /// (`src/marks.rs`). Never fatal, like every instrument here.
 fn start_marks(
@@ -3098,6 +3181,23 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         dispatch::apply_probes(&mut udpsender, &args.probe, running_base)
                 {
                     warn!("could not place probes: {e}");
+                }
+                let kos = dispatch::is_kos_binary(&payload);
+                // A KOS title from a disc image keeps its console on this
+                // host only once the loader knows it is KOS: g_gd_kos also
+                // masks interrupts across a disc read's wait, so no thread's
+                // printf can enter the loader in the middle of one.
+                let kos_told = kos && has_disc && tell_loader_kos(&args, &mut udpsender, running_base);
+                if kos {
+                    lower_kos_mem_top(&mut udpsender, running_base, &payload, args.address);
+                }
+                // After the IP.BIN header, which lands in the dead image these
+                // words belong to once the loader has moved.
+                if let Some(base) = running_base
+                    && let Err(e) =
+                        dispatch::update_dcload_magic(&mut udpsender, base, !has_disc || kos_told)
+                {
+                    warn!("could not update the dcload magic: {e}");
                 }
                 // A VM2/VMUPro selects a game's saves when it is told which
                 // game is starting, and the title will ask it for a save long

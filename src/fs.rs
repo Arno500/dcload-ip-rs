@@ -775,7 +775,7 @@ fn exception_code_to_string(code: u32) -> &'static str {
 /// switches the whole buffer to hex, rather than mixing the two, so a
 /// four-byte pointer reads as a four-byte pointer instead of three dots and a
 /// letter. Both forms are shown when the bytes could be either.
-fn render_console_bytes(data: &[u8]) -> String {
+pub fn render_console_bytes(data: &[u8]) -> String {
     let is_text = !data.is_empty()
         && data
             .iter()

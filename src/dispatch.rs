@@ -1684,6 +1684,125 @@ pub fn apply_patches(
     Ok(())
 }
 
+/// KOS's top of RAM, as `startup.S` reads it: `arch_stack_16m` and
+/// `arch_stack_32m` (`stack.c`, 0x8d000000 and 0x8e000000), each named by a
+/// pointer in the literal pool, `new_stack_16m` then `new_stack_32m`.
+const KOS_STACK_16M: u32 = 0x8d00_0000;
+const KOS_STACK_32M: u32 = 0x8e00_0000;
+
+/// The two words that lower a KOS binary's top of RAM to `top`, so that
+/// nothing of the title reaches a loader above it.
+///
+/// KOS takes its initial stack from `arch_stack_16m` -- `arch_stack_32m` when
+/// the byte under one does not mirror the byte under the other -- and keeps it
+/// as `_arch_mem_top`; `mm_sbrk` refuses to grow the heap past `_arch_mem_top
+/// - THD_KERNEL_STACK_SIZE` (64 KB). Untouched, the heap may reach 0x8cff0000
+/// and the main stack lives above it, which is where a high loader sits: the
+/// GTA III port stopped after its first two disc reads with the loader silent
+/// (2026-10-02). `arch_stack_32m` becomes `top + 16 MB`, its mirror on a 16 MB
+/// console, so the memory test still answers 16 MB; on a 32 MB one it would
+/// answer 32 MB with the same lowered top -- not that any console here has one.
+///
+/// Like Windows CE's `ulRAMEnd` (src/wince.rs): the title is told less RAM,
+/// rather than the loader hoping it is not used. `load` is where `boot` is
+/// loaded (P1).
+pub fn kos_mem_top_patches(boot: &[u8], load: u32, top: u32) -> Result<Vec<(u32, u32)>, String> {
+    let word = |at: usize| boot.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    // The word a pointer names, if it names one inside the image.
+    let named = |p: u32| {
+        let off = p.wrapping_sub(load) as usize;
+        (p & 3 == 0 && off < boot.len()).then(|| word(off)).flatten()
+    };
+    let found: Vec<(u32, u32)> = (0..boot.len().saturating_sub(7))
+        .step_by(4)
+        .filter_map(|at| {
+            let (p16, p32) = (word(at)?, word(at + 4)?);
+            (named(p16)? == KOS_STACK_16M && named(p32)? == KOS_STACK_32M).then_some((p16, p32))
+        })
+        .collect();
+    match found[..] {
+        [(p16, p32)] => Ok(vec![(p16, top), (p32, top.wrapping_add(0x0100_0000))]),
+        [] => Err("no arch_stack_16m/arch_stack_32m pair in the literal pool".into()),
+        _ => Err(format!("{} candidate arch_stack pairs, refusing to guess", found.len())),
+    }
+}
+
+/// A KOS binary, by the three words of KOS's `startup.S` that look for dcload:
+/// `0x8c004004`, `0xdeadbeef`, `0x8c004008`, consecutive, 4-aligned. Every KOS
+/// program links them; a Katana title has no reason to name dcload at all.
+/// Checked on the GTA III port (once, at 0x8c0100c4) and on a Katana
+/// `1ST_READ.BIN` of 6.7 MB (absent). A preset's `type=1` says the same, but
+/// only for the titles DreamShell's database knows.
+pub fn is_kos_binary(boot: &[u8]) -> bool {
+    let words = [0x8c00_4004u32, DCLOAD_MAGIC, 0x8c00_4008];
+    boot.chunks_exact(4).collect::<Vec<_>>().windows(3).any(|w| {
+        w.iter()
+            .zip(words)
+            .all(|(b, v)| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == v)
+    })
+}
+
+/// The word a program tests at `DEFAULT_BASE + 4` to know that dcload is there
+/// (KOS: `DCLOADMAGICADDR`, `fs_dcload.c`); `DEFAULT_BASE + 8` holds the
+/// pointer it then calls for every dcload syscall.
+const DCLOAD_MAGIC: u32 = 0xdead_beef;
+
+/// Make the dcload magic at `DEFAULT_BASE + 4` tell the truth about the loader
+/// at `base`.
+///
+/// Once the loader has moved, those two words belong to the DEAD image of the
+/// loader the CD booted, and the IP.BIN header written at 0x8c008000 has
+/// overwritten part of that image's code. A KOS program that finds the magic
+/// sends its console through the stale pointer, into that dead image -- which
+/// then drives the BBA with its own stale state, under the live loader.
+///
+/// - `point_at_loader`: the magic and the live loader's own syscall pointer
+///   (from `base + 8`) go there, so the program's console and `/pc` reach this
+///   host. For a program uploaded without a disc image, and for a KOS title
+///   from one once the loader has been told it is KOS (`g_gd_kos`): KOS is
+///   preemptive, so a thread's printf could otherwise enter the loader in the
+///   middle of another thread's disc read, over the same `pkt_buf` -- with
+///   `g_gd_kos` the loader masks interrupts across that wait, and KOS masks
+///   its own dcload syscalls (2026-10-02).
+/// - Otherwise the magic is CLEARED: a title booted from a disc finds no
+///   dcload, as on a real boot.
+///
+/// Nothing to do when the loader is at `DEFAULT_BASE`: the words are its own.
+pub fn update_dcload_magic(
+    conn: &mut impl ExternalDcIo,
+    base: u32,
+    point_at_loader: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stock = crate::loaders::DEFAULT_BASE;
+    if (base & 0x1fff_ffff) == (stock & 0x1fff_ffff) {
+        return Ok(());
+    }
+    let magic_at = stock + 4;
+    if point_at_loader {
+        let phys = |a: u32| (a & 0x1fff_ffff) | 0x0c00_0000;
+        let span = (base & 0x1fff_ffff)..(base & 0x1fff_ffff) + crate::loaders::LOADER_SPAN;
+        match read_word(conn, phys(base + 8)) {
+            Some(syscall) if span.contains(&(syscall & 0x1fff_ffff)) => {
+                info!(
+                    "dcload magic at 0x{magic_at:08x} pointed at the loader at 0x{base:08x} \
+                     (syscalls -> 0x{syscall:08x}), not at the dead image the CD booted"
+                );
+                return apply_patches(conn, &[(magic_at + 4, syscall), (magic_at, DCLOAD_MAGIC)]);
+            }
+            got => warn!(
+                "the loader at 0x{base:08x} does not report a syscall entry inside \
+                 itself (read {}); clearing the dcload magic instead",
+                got.map_or("nothing".to_string(), |w| format!("0x{w:08x}"))
+            ),
+        }
+    }
+    info!(
+        "dcload magic at 0x{magic_at:08x} cleared: the loader is at 0x{base:08x}, and what \
+         is left at 0x{stock:08x} is the dead image the CD booted"
+    );
+    apply_patches(conn, &[(magic_at, 0)])
+}
+
 /// One 32-bit word out of the console's memory, or `None` if it could not be
 /// read. Used only to check a patch, so a failure is reported by the caller
 /// rather than aborting the run.
@@ -3240,6 +3359,16 @@ pub fn receive_syscalls(
                                     address: 0,
                                     size: 0,
                                 })?;
+                            }
+                            // NO ANSWER: the title did not wait for one. A lost
+                            // datagram is a lost line, never a stopped title.
+                            DCLoadClientCmds::Console(fd, bytes) => {
+                                let rendered = fs::render_console_bytes(&bytes);
+                                if fd == 2 {
+                                    error!("{}", rendered);
+                                } else {
+                                    info!("{}", rendered);
+                                }
                             }
                             DCLoadClientCmds::Exit => {
                                 info!("Received Exit syscall, terminating syscall receiver");
@@ -4889,6 +5018,48 @@ mod tests {
         assert_eq!(tone_sectors(1001, 1), two[RAW_SECTOR_SIZE..]);
         // ...and it is actually a signal, not a constant.
         assert!(two.chunks_exact(2).any(|w| w != &two[0..2]));
+    }
+
+    /// KOS's three words, aligned, anywhere: a KOS binary. Unaligned, cut
+    /// short or out of order: not.
+    #[test]
+    fn a_kos_binary_is_known_by_its_dcload_probe() {
+        let words = |ws: &[u32]| ws.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let mut boot = words(&[0x0009_0009, 0x8c00_4004, 0xdead_beef, 0x8c00_4008, 0]);
+        assert!(is_kos_binary(&boot));
+        boot.insert(0, 0);
+        assert!(!is_kos_binary(&boot), "unaligned");
+        assert!(!is_kos_binary(&words(&[0x8c00_4004, 0xdead_beef])));
+        assert!(!is_kos_binary(&words(&[0xdead_beef, 0x8c00_4004, 0x8c00_4008])));
+        assert!(!is_kos_binary(&[]));
+    }
+
+    /// The pool's two pointers name the two variables; both are rewritten, the
+    /// 32 MB one to the mirror of the new top. A pool word naming 0x8d000000
+    /// alone is not the pair.
+    #[test]
+    fn a_kos_top_of_ram_is_found_through_startups_literal_pool() {
+        let load = 0x8c01_0000;
+        let words = |ws: &[u32]| ws.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        // 0: pool (new_stack_16m, new_stack_32m); 8: a lone pointer; 12, 16: the
+        // variables, in the order GCC left them in GTA III (32m first).
+        let boot = words(&[load + 16, load + 12, load + 16, KOS_STACK_32M, KOS_STACK_16M]);
+        let got = kos_mem_top_patches(&boot, load, 0x8cfe_8000).expect("found");
+        assert_eq!(got, vec![(load + 16, 0x8cfe_8000), (load + 12, 0x8dfe_8000)]);
+        assert!(kos_mem_top_patches(&words(&[load + 4, KOS_STACK_16M]), load, 0x8cfe_8000).is_err());
+    }
+
+    /// The same on a real KOS binary, when `DCLOAD_TEST_KOS_BIN` names one
+    /// (unscrambled, loaded at 0x8c010000): the GTA III port's are at
+    /// 0x8c21856c and 0x8c218568.
+    #[test]
+    fn a_real_kos_binary_has_one_top_of_ram() {
+        let Ok(p) = std::env::var("DCLOAD_TEST_KOS_BIN") else { return };
+        let boot = std::fs::read(p).expect("read");
+        assert!(is_kos_binary(&boot));
+        let got = kos_mem_top_patches(&boot, 0x8c01_0000, 0x8cfe_8000).expect("found");
+        println!("{got:x?}");
+        assert_eq!(got.len(), 2);
     }
 
     /// The exact shape that disabled `--diag` on 2026-09-04.

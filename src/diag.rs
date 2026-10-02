@@ -163,6 +163,11 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             // window and was waited past: the late answer to an earlier
             // attempt. Absent from loaders before 2026-09-27.
             ("g_cdfs_read_stale", Fmt::Num),
+            // A LoadBinary refused while a disc read waited: the late answer
+            // to an EARLIER read, for another destination. Before the door
+            // it replaced the waiting read's window, and the read passed with
+            // nothing delivered. Absent from loaders before 2026-10-02.
+            ("g_gd_stale_lbin", Fmt::Num),
             ("g_cdfs_sync_chunks", Fmt::Num),
             ("g_cdfs_sync_reentered", Fmt::Num),
             // Non-zero while a disc read waits; CD-DA declines to fetch then.

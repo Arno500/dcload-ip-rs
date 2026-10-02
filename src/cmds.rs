@@ -274,6 +274,10 @@ pub enum DCLoadClientCmds {
     ReadAudio(u32, u32, u32, AudioFormat),
     ReadToc(u32, u32, u32),
     FSCommand(DCLoadClientFSCmds),
+    /// Console text a running title sends without waiting for an answer
+    /// (`DC25`, dcload-ip `syscalls.c`, `console_write`): fd, then the bytes.
+    /// Nothing is sent back.
+    Console(u32, Vec<u8>),
 }
 
 impl TryFrom<Vec<u8>> for DCLoadClientCmds {
@@ -371,6 +375,10 @@ impl TryFrom<Vec<u8>> for DCLoadClientCmds {
                 let (param1, param2, param3) = extract_3_u32(&input[4..])?;
                 Ok(DCLoadClientCmds::ReadToc(param1, param2, param3))
             }
+            b"DC25" => {
+                let fd = extract_1_u32(&input[4..])?;
+                Ok(DCLoadClientCmds::Console(fd, input[8..].to_vec()))
+            }
             b"DC21" => {
                 let param1 = extract_1_u32(&input[4..])?;
                 Ok(DCLoadClientCmds::FSCommand(DCLoadClientFSCmds::RewindDir(param1)))
@@ -462,4 +470,24 @@ fn extract_3_u32_1_string(
         .unwrap_or(string_data.len());
     let string_value = String::from_utf8(string_data[0..string_end].to_vec())?;
     Ok((val1, val2, val3, string_value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_text_carries_its_fd_and_every_byte() {
+        let mut wire = b"DC25".to_vec();
+        wire.extend_from_slice(&2u32.to_be_bytes());
+        wire.extend_from_slice(b"\n--\n");
+        match DCLoadClientCmds::try_from(wire).unwrap() {
+            DCLoadClientCmds::Console(fd, bytes) => {
+                assert_eq!(fd, 2);
+                assert_eq!(bytes, b"\n--\n");
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        assert!(DCLoadClientCmds::try_from(b"DC25\0\0".to_vec()).is_err(), "no fd");
+    }
 }

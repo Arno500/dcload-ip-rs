@@ -64,6 +64,25 @@ const V35: u32 = 0x8000_0006;
 /// Appears twice at the head of every track record.
 const START_MARK: [u8; 10] = [0, 0, 1, 0, 0, 0, 255, 255, 255, 255];
 
+/// The lead-in a track record's `start_lba` does NOT count.
+///
+/// A CDI numbers its tracks as LBAs: the first audio track is at 0, with its
+/// 150-sector pregap stored in front of it, and a selfboot's data track at
+/// 11702 holds a filesystem mastered at that same origin (PVD at 11718). A
+/// drive -- and so every syscall a title makes -- speaks FADs, LBA + 150, and
+/// a title adds the 150 to every extent it reads (KOS: `fs_iso9660.c`, `sector
+/// + 150`). Until 2026-10-02 this reader took the record's number for a FAD:
+/// reads relative to the TOC still landed (the TOC was 150 short too), and
+/// every extent read 150 sectors past its directory -- the GTA III port read
+/// zeros for its root directory and found no files.
+const LEAD_IN: u32 = 150;
+
+/// A FAD as the title asks for it, in the numbering the track records use.
+fn to_lba(fad: u32) -> Result<u32, String> {
+    fad.checked_sub(LEAD_IN)
+        .ok_or_else(|| format!("FAD {fad} is inside the lead-in"))
+}
+
 #[derive(Debug, Clone)]
 pub struct CdiTrack {
     pub session: u16,
@@ -358,6 +377,7 @@ impl DiscFormat for Cdi {
         // asked for, and the loop below only discovers that an LBA is in no
         // track after `out` has been sized for it.
         check_read_len(num_sectors)?;
+        let lba = to_lba(lba)?;
         let last = lba.saturating_add(num_sectors - 1);
         let track = self
             .tracks
@@ -406,22 +426,27 @@ impl DiscFormat for Cdi {
     }
 
     fn start_sector(&self) -> u32 {
-        self.tracks[self.boot].start_lba
+        self.tracks[self.boot].start_lba + LEAD_IN
+    }
+
+    /// The filesystem counts no lead-in, as on a `.gdi`. See `LEAD_IN`.
+    fn fs_lba(&self, iso_lba: u32) -> u32 {
+        iso_lba + LEAD_IN
     }
 
     /// Every track the descriptor block declares, audio included.
     ///
     /// A CDI track's `mode` is the disc's own: 0 is audio, 1 and 2 are the
     /// data modes. The numbering is positional -- the descriptor stores tracks
-    /// in disc order (see `parse_tracks`) -- and `start_lba` already counts the
-    /// lead-in, so unlike a `.gdi` there is nothing to add.
+    /// in disc order (see `parse_tracks`) -- and, as on a `.gdi`, the lead-in
+    /// is added to `start_lba` (see `LEAD_IN`).
     fn toc_tracks(&self) -> Vec<TocTrack> {
         self.tracks
             .iter()
             .enumerate()
             .map(|(i, t)| TocTrack {
                 number: (i + 1) as u8,
-                start_lba: t.start_lba,
+                start_lba: t.start_lba + LEAD_IN,
                 audio: t.mode == 0,
             })
             .collect()
@@ -438,6 +463,7 @@ impl DiscFormat for Cdi {
         if num_sectors == 0 {
             return Ok(vec![]);
         }
+        let lba = to_lba(lba)?;
         let mut out = vec![0u8; (num_sectors as usize) * RAW_SECTOR_SIZE];
         for (i, chunk) in out.chunks_mut(RAW_SECTOR_SIZE).enumerate() {
             let want = lba.saturating_add(i as u32);
@@ -575,6 +601,35 @@ mod tests {
         assert_eq!(data_offset(2336, 2), 8);
         assert_eq!(data_offset(2352, 1), 16); // sync + header
         assert_eq!(data_offset(2352, 2), 24); // + subheader
+    }
+
+    /// What a title does, on a real selfboot image: TOC start + 16 for the
+    /// volume descriptor, then extent + 150 for a directory. The second read
+    /// came back as zeros while this reader took a record's LBA for a FAD.
+    /// Skipped when the image is absent (`DCLOAD_TEST_CDI` names another).
+    #[test]
+    fn a_title_reads_extents_as_fads() {
+        let p = std::env::var("DCLOAD_TEST_CDI")
+            .unwrap_or_else(|_| "test/dca-liberty-cdr.cdi".into());
+        let Ok(src) = crate::disc_formats::source::FileSource::open(std::path::Path::new(&p))
+        else {
+            return;
+        };
+        let cdi = Cdi::new(Box::new(src)).expect("parse cdi");
+        let data = cdi.toc_tracks().into_iter().find(|t| !t.audio).expect("data track");
+        assert_eq!(data.start_lba, 11702 + 150, "the TOC speaks FADs");
+        assert_eq!(cdi.start_sector(), data.start_lba);
+
+        let pvd = cdi.read_sector(data.start_lba + 16, 1).expect("pvd");
+        assert!(iso9660::is_pvd(&pvd));
+        let root = iso9660::root_extent_lba(&pvd).expect("root extent");
+        let dir = cdi.read_sector(root + 150, 1).expect("root directory");
+        // The root opens with its own '.' record, which names the root's extent
+        // (34 bytes, more with Rock Ridge: 144 on this image).
+        assert!(dir[0] >= 34);
+        assert_eq!(u32::from_le_bytes(dir[2..6].try_into().unwrap()), root);
+
+        assert!(cdi.read_sector(149, 1).is_err(), "inside the lead-in");
     }
 
     #[test]
