@@ -50,7 +50,7 @@ impl MemoryMap {
     }
 
     /// Block index for a guest address, in any of the three windows.
-    fn index(addr: u32) -> Option<usize> {
+    pub(crate) fn index(addr: u32) -> Option<usize> {
         let phys = addr & 0x1fff_ffff;
         if phys < RAM_BASE {
             return None;
@@ -94,7 +94,7 @@ impl MemoryMap {
 
     /// The address a block starts at, in the cached window this host names RAM
     /// by everywhere else.
-    fn block_addr(block: usize) -> u32 {
+    pub(crate) fn block_addr(block: usize) -> u32 {
         0x8c00_0000 + block as u32 * BLOCK
     }
 

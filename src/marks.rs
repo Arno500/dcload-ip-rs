@@ -71,10 +71,6 @@ const RETRY: Duration = Duration::from_millis(500);
 const PAINT_TIMEOUT: Duration = Duration::from_millis(500);
 const PAINT_TRIES: usize = 3;
 
-fn block_addr(block: usize) -> u32 {
-    0x8c00_0000 + block as u32 * BLOCK
-}
-
 /// Which 64 KB blocks to paint: every whole block above the title's image,
 /// minus what is already known to be used and anything of the loader's.
 ///
@@ -86,12 +82,11 @@ fn block_addr(block: usize) -> u32 {
 pub fn blocks_to_paint(image_end: u32, base: u32, known: &MemoryMap) -> Vec<usize> {
     let end = (image_end & 0x1fff_ffff) | 0x8c00_0000;
     let first = (end.saturating_sub(0x8c00_0000)).div_ceil(BLOCK) as usize;
-    let loader = crate::loaders::live_footprint(base);
     (first..BLOCKS)
         .filter(|&b| !known.is_marked(b))
         .filter(|&b| {
-            let (lo, hi) = (block_addr(b), block_addr(b) + BLOCK);
-            !loader.iter().any(|&(l, h)| lo < h && l < hi)
+            let lo = MemoryMap::block_addr(b);
+            crate::loaders::overlapping_range(base, (lo, lo + BLOCK)).is_none()
         })
         .collect()
 }
@@ -111,7 +106,7 @@ fn runs(blocks: &[usize], max: usize) -> Vec<(usize, usize)> {
 fn command(first: usize, n: usize, check: bool) -> DCLoadCmd {
     DCLoadCmd {
         cmd: DCLoadCmds::Mark(None),
-        address: block_addr(first),
+        address: MemoryMap::block_addr(first),
         size: (n as u32 * BLOCK) | if check { CHECK } else { 0 },
     }
 }
@@ -264,7 +259,7 @@ impl MarkWatch {
             warn!(
                 "memory marks: the loader refused to check 0x{:08x}+0x{:x}; no more checks \
                  this session",
-                block_addr(first),
+                MemoryMap::block_addr(first),
                 n as u32 * BLOCK
             );
             self.clean.clear();
@@ -279,7 +274,7 @@ impl MarkWatch {
         }
         if let Ok(mut rec) = self.recorder.lock() {
             for &b in &written {
-                rec.record_written(block_addr(b), BLOCK);
+                rec.record_written(MemoryMap::block_addr(b), BLOCK);
             }
         }
         // Written once is written: never asked about again. The cursor stays
@@ -317,7 +312,7 @@ impl MarkWatch {
                 return;
             };
             self.asked = Some(slice);
-            self.sink.lock().expect("sink poisoned").want = Some(block_addr(slice.0));
+            self.sink.lock().expect("sink poisoned").want = Some(MemoryMap::block_addr(slice.0));
             self.started = Some(Instant::now());
             self.last_sent = Instant::now() - RETRY;
         }

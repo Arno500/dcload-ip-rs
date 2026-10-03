@@ -1,13 +1,9 @@
 pub struct Track {
-    #[allow(unused)]
     pub(crate) track_number: u8,
     pub(crate) start_lba: u32,
-    #[allow(unused)]
     pub(crate) track_type: u8,
-    #[allow(unused)]
     pub(crate) sector_size: u32,
     pub(crate) track: String,
-    #[allow(unused)]
     pub(crate) offset: u32,
     /// Opened lazily: a GDI names every track, and a session reads one data
     /// track and at most a few audio ones, so opening them all would cost an
@@ -136,9 +132,8 @@ pub trait DiscFormat {
     /// A `.gdi` records its track starts WITHOUT the 150-sector lead-in and the
     /// reader adds it back, but the filesystem on a GD-ROM is mastered in that
     /// same lead-in-less numbering -- so an extent LBA taken out of it is 150
-    /// short of the LBA that reads it. A `.cdi` descriptor counts the lead-in
-    /// and so does its filesystem, so there is nothing to add, and the default
-    /// is therefore the identity.
+    /// short of the LBA that reads it. The `.iso` and `.cdi` readers add the
+    /// same 150; the identity default only serves formats with no filesystem.
     ///
     /// Measured on the Sonic Adventure PAL GDI: track 3 starts at GDI LBA
     /// 45000 (logical 45150), its PVD is at track sector 16, and the root

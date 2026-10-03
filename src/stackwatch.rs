@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use crate::CHUNK_SIZE;
 use crate::cmds::{DCLoadCmd, DCLoadCmds, DCReturnCmd};
 use crate::io::{ExternalDcIo, PacketSink};
-use crate::memmap::MemoryRecorder;
+use crate::memmap::{MemoryMap, MemoryRecorder};
 
 /// How often the pair is read back.
 ///
@@ -228,7 +228,7 @@ impl StackVerdict {
         // build's `_global_bg_color` and three flag bytes -- 16 and 0x00010100
         // -- then declared the title's stack inside the loader. `note_stack`
         // already refused to record it; this refuses to report it.
-        if !(0x0c00_0000..0x0d00_0000).contains(&(sp & 0x1fff_ffff)) {
+        if MemoryMap::index(sp).is_none() {
             if !self.foreign {
                 self.foreign = true;
                 warn!(

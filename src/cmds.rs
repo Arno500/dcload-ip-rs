@@ -29,6 +29,12 @@ pub struct DCLoadCmd {
     pub size: u32,
 }
 
+impl DCLoadCmd {
+    pub fn new(cmd: DCLoadCmds, address: u32, size: u32) -> Self {
+        Self { cmd, address, size }
+    }
+}
+
 impl DCLoadCmds {
     /// The four-character code as it goes on the wire.
     pub fn name(&self) -> &'static str {

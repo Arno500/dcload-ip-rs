@@ -85,7 +85,12 @@ fn select_area(tracks: &[TocTrack], area: u32) -> Vec<TocTrack> {
         return tracks.to_vec();
     }
     let boundary = HIGH_DENSITY_LBA + 150;
-    let split = tracks.iter().any(|t| t.start_lba >= boundary)
+    // A GD-ROM's high-density area opens with a track at EXACTLY the boundary
+    // (track 3, GDI LBA 45000). A CD image whose tracks merely run past it --
+    // a .cdi with more than ten minutes of audio in its first session, data in
+    // the second -- is still one area, and splitting it would hand area 0 a
+    // table with no data track and area 1 one with no music.
+    let split = tracks.iter().any(|t| t.start_lba == boundary)
         && tracks.iter().any(|t| t.start_lba < boundary);
     if !split {
         return tracks.to_vec();
@@ -211,6 +216,20 @@ mod tests {
         assert_eq!(toc[1] >> 28, 0, "track 2 is audio, in the CD area");
         assert_eq!(toc[3] >> 28, 0, "track 4 is audio, in the GD area");
         assert_eq!(toc[18] >> 28, 4, "track 19 is data");
+    }
+
+    /// A .cdi whose data session starts past the GD boundary is still one area.
+    #[test]
+    fn a_cd_image_running_past_the_boundary_is_one_area() {
+        let tracks = vec![
+            TocTrack { number: 1, start_lba: 150, audio: true },
+            TocTrack { number: 2, start_lba: 60000, audio: false },
+        ];
+        for area in [0, 1] {
+            let toc = entries(&build_dc_toc(60000, 100000, &tracks, area));
+            assert_eq!(toc[99] >> 16 & 0xff, 1);
+            assert_eq!(toc[100] >> 16 & 0xff, 2);
+        }
     }
 
     /// A .cdi has one area, and asking for either must not empty it.

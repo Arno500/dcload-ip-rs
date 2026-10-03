@@ -1664,6 +1664,52 @@ fn note(loud: bool, msg: String) {
     }
 }
 
+/// The image the host would upload for `base` (`LoaderSet::image_for`), read
+/// and relocated once: once the loader is placed, the GD entry, the stages, the
+/// panel, the stack watch and the KOS flag all ask for the same one.
+fn running_loader_image(args: &Args, base: u32) -> Result<(Vec<u8>, String), String> {
+    type Cached = (u32, Result<(Vec<u8>, String), String>);
+    static LAST: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().expect("loader image cache poisoned");
+    if let Some((b, image)) = last.as_ref()
+        && *b == base
+    {
+        return image.clone();
+    }
+    let image = loaders::LoaderSet::discover(args.loader_dir.clone()).image_for(base);
+    *last = Some((base, image.clone()));
+    image
+}
+
+/// Where the running loader's GD emulation is entered: `_gd_bios_entry` in the
+/// image the host would upload for `base`, which is the one running (a loader
+/// that differs from the file is replaced, even at the same base).
+fn gd_bios_entry(args: &Args, base: u32) -> Result<u32, String> {
+    let (elf, label) = running_loader_image(args, base)?;
+    loaders::symbols(&elf)?
+        .get("gd_bios_entry")
+        .map(|&(addr, _)| addr)
+        .ok_or_else(|| format!("{label} predates it"))
+}
+
+/// The running loader's staging buffers for reads into translated addresses
+/// (`_gd_stage` in `.hiram`, `_gd_stage_big` above `_end`; dcload-ip
+/// cdfs_syscalls.c): the ranges of the loader a disc read is meant to land on.
+/// Empty for a loader that predates them.
+fn loader_stage(args: &Args, base: u32) -> Vec<(u32, u32)> {
+    let Ok((elf, _)) = running_loader_image(args, base) else {
+        return vec![];
+    };
+    let Ok(syms) = loaders::symbols(&elf) else {
+        return vec![];
+    };
+    ["gd_stage", "gd_stage_big"]
+        .iter()
+        .filter_map(|n| syms.get(*n).copied())
+        .filter(|&(_, n)| n > 0)
+        .collect()
+}
+
 /// Bring up the counter panel, or say why there is none.
 ///
 /// EVERY FAILURE HERE IS A WARNING. This is an instrument bolted onto a session
@@ -1680,35 +1726,6 @@ fn note(loud: bool, msg: String) {
 /// answering promptly the moment it has something better to do. Without
 /// `--diag` it starts switched off, and every failure here drops to `debug`:
 /// nobody asked, so nothing is missing.
-/// Where the running loader's GD emulation is entered: `_gd_bios_entry` in the
-/// image the host would upload for `base`, which is the one running (a loader
-/// that differs from the file is replaced, even at the same base).
-fn gd_bios_entry(args: &Args, base: u32) -> Result<u32, String> {
-    let (elf, label) = loaders::LoaderSet::discover(args.loader_dir.clone()).image_for(base)?;
-    loaders::symbols(&elf)?
-        .get("gd_bios_entry")
-        .map(|&(addr, _)| addr)
-        .ok_or_else(|| format!("{label} predates it"))
-}
-
-/// The running loader's staging buffers for reads into translated addresses
-/// (`_gd_stage` in `.hiram`, `_gd_stage_big` above `_end`; dcload-ip
-/// cdfs_syscalls.c): the ranges of the loader a disc read is meant to land on.
-/// Empty for a loader that predates them.
-fn loader_stage(args: &Args, base: u32) -> Vec<(u32, u32)> {
-    let Ok((elf, _)) = loaders::LoaderSet::discover(args.loader_dir.clone()).image_for(base) else {
-        return vec![];
-    };
-    let Ok(syms) = loaders::symbols(&elf) else {
-        return vec![];
-    };
-    ["gd_stage", "gd_stage_big"]
-        .iter()
-        .filter_map(|n| syms.get(*n).copied())
-        .filter(|&(_, n)| n > 0)
-        .collect()
-}
-
 fn start_diag(
     args: &Args,
     conn: &mut DcIoUDP,
@@ -1726,13 +1743,12 @@ fn start_diag(
         );
         return None;
     };
-    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
     // The SAME image the host would upload for this base -- a pre-linked ELF
     // when the set has one, otherwise the relocatable one moved in memory,
     // which reproduces a native link byte for byte. That is what makes the
     // comparison below meaningful for a relocated loader, where there is no ELF
     // on disk to aim an external tool at.
-    let (elf, label) = match loaders.image_for(base) {
+    let (elf, label) = match running_loader_image(args, base) {
         Ok(v) => v,
         Err(e) => {
             note(
@@ -1809,8 +1825,7 @@ fn start_stack_watch(
         debug!("no stack watch: this loader does not report its own load address");
         return None;
     };
-    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
-    let (elf, label) = match loaders.image_for(base) {
+    let (elf, label) = match running_loader_image(args, base) {
         Ok(v) => v,
         Err(e) => {
             debug!("no stack watch: no loader ELF to read the counter addresses out of: {e}");
@@ -1848,10 +1863,7 @@ fn tell_loader_kos(args: &Args, conn: &mut DcIoUDP, running_base: Option<u32>) -
         warn!("KOS title: the loader does not report its base, so it cannot be told");
         return false;
     };
-    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
-    let addr = loaders
-        .image_for(base)
-        .map_err(|e| e.to_string())
+    let addr = running_loader_image(args, base)
         .and_then(|(elf, _)| loaders::symbols(&elf))
         .and_then(|syms| {
             syms.get("g_gd_kos")

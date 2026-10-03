@@ -99,7 +99,9 @@ impl ExternalDcIo for DcIoUDP {
     fn poll(&self, timeout: Option<std::time::Duration>) -> Result<Events, std::io::Error> {
         self.poller
             .modify(&self.socket, Event::readable(self.key))?;
-        let mut events = Events::new();
+        // One socket is registered: the default capacity (1024) is a ~40 KB
+        // allocation per poll on Windows.
+        let mut events = Events::with_capacity(std::num::NonZeroUsize::MIN);
         // Wait for at least one I/O event.
         self.poller.wait(&mut events, timeout)?;
 

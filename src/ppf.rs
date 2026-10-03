@@ -359,7 +359,7 @@ impl Ppf {
     pub fn end(&self) -> u64 {
         self.records
             .iter()
-            .map(|r| r.offset + r.data.len() as u64)
+            .map(|r| r.offset.saturating_add(r.data.len() as u64))
             .max()
             .unwrap_or(0)
     }

@@ -147,7 +147,7 @@ Environment variables:
 | `DCLOAD_LOADER_DIR`, `DCLOAD_GAME_DB`, `DCLOAD_MEMORY_DB`, `DCLOAD_PATCH_DIR` | data file locations |
 | `DCLOAD_CDDA_TRIM=0` | do not send the CD-DA clock trim (§4) |
 | `DCLOAD_CDDA_SAFE=1` | send audio through the acknowledged path; times out against current loaders (§4) |
-| `DCLOAD_RT_BURST`, `DCLOAD_RT_DELAY_US` | runtime transfer pacing (default 10 packets, 1800 µs spin) |
+| `DCLOAD_RT_BURST`, `DCLOAD_RT_DELAY_US` | runtime transfer pacing (default 6 packets, 600 µs spin) |
 | `DCLOAD_VERIFY_READS=1` | read every served disc read back with `SBIQ` and compare |
 | `DCLOAD_ZERO_LBA`, `DCLOAD_REDIRECT_ABOVE` / `_TO` | diagnostics: blank one LBA's payload; redirect reads above an address |
 | `DCLOAD_LOAD_BAR_KB` (256, 0 = off), `DCLOAD_LOAD_IDLE_MS` (250) | in-game loading bar |
@@ -171,7 +171,7 @@ The `test/` directory is gitignored Dreamcast payload data. **Do not rename it
 to `tests/`**: Cargo would treat its contents as integration tests.
 
 Past `EXEC`, verification needs a console or flycast. Two things help without
-one: `dispatch::tests` drives `send_audio` through an in-memory
+one: `dispatch::cdda::tests` drives `send_audio` through an in-memory
 `ExternalDcIo`; and a small Python UDP stub on `127.0.0.1:53535` that answers
 `VERS`, echoes `LBIN` and answers `DBIN` with the first missing part can drive
 a whole `upload` (answering `DBIN size=0` unconditionally ends the upload after
@@ -359,9 +359,18 @@ PAL): `patches/patches.tsv` plus `.ppf` files, found like the other data files
 - **`main.rs`** — CLI, logging, placement decisions (`wanted_loader_base` and
   helpers), payload resolution and patching, `measure_rtt` (five 4-byte `SBIQ`
   round trips before EXEC: the link's baseline), and the session wiring.
-- **`dispatch.rs`** — upload (`send_data`, `send_data_one`), `receive_data`,
-  the syscall loop, CD-DA serving (`send_audio`, `CddaClock`, `SlewWatch`,
-  `audit_audio`), GAPS/VGA/literal scans, probes, `open_disc`.
+- **`dispatch/`** — everything on the wire after the socket is open; its
+  items are re-exported, so callers name them `dispatch::…`.
+  `session.rs`: handshake, loader placement, upload, `execute`, read-back
+  self-test. `transfer.rs`: `send_data`, `send_data_one`, `send_sectors`,
+  `receive_data`, `await_result`, pacing. `syscalls.rs`: the loop
+  (`receive_syscalls`), which hands each `ReadSector` to `sectors.rs`
+  (`SectorServer`: the read, the loader-collision and memory-map checks,
+  `DCLOAD_VERIFY_READS`, guard re-application) and each `ReadAudio` to
+  `cdda.rs` (`AudioServer`, `send_audio`, `CddaClock`, `SlewWatch`,
+  `audit_audio`). `patches.rs`: GAPS/VGA/GD-body/literal/fill scans,
+  `apply_patches`, KOS. `image.rs`: `open_disc`, `identify`. `probes.rs`:
+  `--probe`.
 - **`adpcm.rs`** — the ADPCM stream (§4).
 - **`loaders.rs`** — VERS payload parsing, the layout table (the host's copy of
   the loader Makefile's: `layout()`, `live_footprint()`, `HIRAM_RESERVED` 12 KB,
@@ -426,8 +435,8 @@ PAL): `patches/patches.tsv` plus `.ppf` files, found like the other data files
 
 Disc-reader facts that cost time:
 
-- **Filesystem LBAs are not `read_sector` LBAs**: +150 on `.gdi`/`.iso`, 0 on
-  `.cdi`. `DiscFormat::fs_lba` converts, once, in `iso9660.rs`. Getting it wrong
+- **Filesystem LBAs are not `read_sector` LBAs**: +150 on `.gdi`, `.iso`
+  and `.cdi` alike. `DiscFormat::fs_lba` converts, once, in `iso9660.rs`. Getting it wrong
   is silent (an empty directory).
 - **A GDI's boot track is the first data track at or above LBA 45000**, not the
   first or last data track (a disc with CD-DA in the high-density area is
@@ -521,8 +530,8 @@ open.
   wait freezes the title, and Windows rounds sleeps up to the timer tick:
   removing three sleeps per chunk took Sonic Adventure from 45.6 ms to 1.5 ms of
   freeze per 16 KB read. The upload path (before EXEC) still uses sleeps.
-- **The runtime pacing default is itself a cost**: one 1800 µs spin per 16 KB
-  read (`DCLOAD_RT_BURST`/`DCLOAD_RT_DELAY_US`), bought as headroom in the
+- **The runtime pacing default is itself a cost**: a 600 µs spin every 6
+  packets, two per 16 KB read (`DCLOAD_RT_BURST`/`DCLOAD_RT_DELAY_US`), bought as headroom in the
   loader's 16 KB RX ring, whose overflow does not recover gracefully.
 - **A failed disc transfer must not end the session**: the loader times out and
   re-asks. No ReturnValue is sent for an unanswered read, so a title never gets
