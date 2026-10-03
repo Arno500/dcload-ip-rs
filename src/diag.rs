@@ -174,9 +174,13 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("g_gd_in_transfer", Fmt::Num),
             // The stuck GD lock watchdog: `g_gd_lock_stuck` counts locks
             // released because they were held while the server was parked and
-            // unchanged for 250 ms; `_owner` says who held it (0 = the server
-            // itself). It has not fired in any recorded session.
+            // unchanged for 250 ms with no C caller inside; `_held_long` the
+            // same holds by a C syscall, left alone. Must stay 0: a C section
+            // of the lock runs masked since a title's handler deadlocked on an
+            // interrupted one (Shenmue II, 2026-10-03). `_owner`/`_ticks`: the
+            // last of either (0 = the server itself).
             ("g_gd_lock_stuck", Fmt::Num),
+            ("g_gd_lock_held_long", Fmt::Num),
             ("g_gd_lock_stuck_owner", Fmt::Num),
             ("g_gd_lock_stuck_ticks", Fmt::Num),
             ("g_gd_lock_owner", Fmt::Num),
@@ -264,6 +268,29 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             // Resumes of the reading thread with a chunk on the wire: under
             // a Katana title, one per ExecServer while a read is in flight.
             ("g_ga_wakes", Fmt::Num),
+            // GA_FAIL_PROBE builds only (dcload-ip Makefile): at each failed
+            // asynchronous chunk, what it had received and the RX state.
+            ("g_gaf_nolbin", Fmt::Num),
+            ("g_gaf_parts", Fmt::Num),
+            ("g_gaf_rxoff", Fmt::Num),
+            ("g_gaf_ringfull", Fmt::Num),
+            ("g_gaf_tick", Fmt::Num),
+            ("g_gaf_frames", Fmt::Num),
+            ("g_gaf_at_post", Fmt::HexList),
+            ("g_gaf_at_fail", Fmt::HexList),
+            ("g_gaf_iml", Fmt::HexList),
+            ("g_gaf_link", Fmt::HexList),
+            ("g_gaf_macbad", Fmt::Num),
+            ("g_gaf_tmu2_late", Fmt::Num),
+            ("g_gaf_tmu2", Fmt::HexList),
+            ("g_gaf_listens", Fmt::Num),
+            // GA_FAIL_PROBE: callers told BUSY -- held by a C section (0 with
+            // the mask) or by the server -- and the last one's PR and SR
+            // (IMASK > 0: it called from an interrupt).
+            ("g_gd_busy_c", Fmt::Num),
+            ("g_gd_busy_srv", Fmt::Num),
+            ("g_gd_busy_pr", Fmt::Hex),
+            ("g_gd_busy_sr", Fmt::Hex),
             // G2 DMA (loaders from 2026-09-28): frames received by DMA, and
             // DMAs that never ended (must stay 0). The tick finishing chunks
             // is g_ga_irq_done against g_ga_posts.

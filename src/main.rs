@@ -2888,12 +2888,13 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         match running_base {
             Some(base) => {
                 let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
-                running_base = Some(dispatch::ensure_loader_base(
-                    &mut udpsender,
-                    &loaders,
-                    base,
-                    want,
-                ));
+                match dispatch::ensure_loader_base(&mut udpsender, &loaders, base, want) {
+                    Ok(now) => running_base = Some(now),
+                    Err(e) => {
+                        error!("{e}");
+                        return Ok(ExitCode::FAILURE);
+                    }
+                }
             }
             None => warn!(
                 "this title wants the loader at 0x{want:08x}, but the loader on the \

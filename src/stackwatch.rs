@@ -252,12 +252,24 @@ impl StackVerdict {
         let margin = sp.saturating_sub(self.image_end);
         if !self.reported {
             self.reported = true;
-            info!(
-                "this title enters GD syscalls with SP 0x{sp:08x}; the loader at \
-                 0x{:08x} ends at 0x{:08x}, so it has {margin} bytes under that stack \
-                 (recorded, so the next run can place the loader knowing it)",
-                self.base, self.image_end
-            );
+            // A loader above the stack has no margin to report: the stack
+            // grows down, away from it. Saying "0 bytes under that stack" for
+            // a loader at 0x8cf50000 read as a warning (2026-10-03).
+            if self.base >= sp {
+                info!(
+                    "this title enters GD syscalls with SP 0x{sp:08x}; the loader at \
+                     0x{:08x} is above it, out of the way of a stack that grows down \
+                     (recorded, so the next run can place the loader knowing it)",
+                    self.base
+                );
+            } else {
+                info!(
+                    "this title enters GD syscalls with SP 0x{sp:08x}; the loader at \
+                     0x{:08x} ends at 0x{:08x}, so it has {margin} bytes under that stack \
+                     (recorded, so the next run can place the loader knowing it)",
+                    self.base, self.image_end
+                );
+            }
         }
         self.verdict(sp, in_image, margin);
     }

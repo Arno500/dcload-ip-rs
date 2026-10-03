@@ -1101,6 +1101,10 @@ pub struct LoaderSet {
     /// Every candidate considered, so a failure can say where it looked
     /// instead of naming one path and leaving the user to guess the rest.
     tried: Vec<PathBuf>,
+    /// Named by `--loader-dir` or `DCLOAD_LOADER_DIR` rather than found by
+    /// the search: the user asked for THIS set, so a session must not run on
+    /// whatever loader happens to be on the console instead.
+    explicit: bool,
 }
 
 impl LoaderSet {
@@ -1108,6 +1112,7 @@ impl LoaderSet {
         LoaderSet {
             tried: vec![dir.clone()],
             dir,
+            explicit: true,
         }
     }
 
@@ -1121,9 +1126,11 @@ impl LoaderSet {
     /// caller can report it together with the base it wanted, which is far
     /// more useful than "directory missing" on its own.
     pub fn discover(explicit: Option<String>) -> Self {
+        let env_dir = std::env::var("DCLOAD_LOADER_DIR").ok();
+        let named = explicit.is_some() || env_dir.is_some();
         let candidates = loader_dir_candidates(
             explicit,
-            std::env::var("DCLOAD_LOADER_DIR").ok(),
+            env_dir,
             std::env::current_exe().ok(),
             std::env::current_dir().ok(),
             env!("CARGO_MANIFEST_DIR"),
@@ -1137,11 +1144,16 @@ impl LoaderSet {
         LoaderSet {
             dir: chosen,
             tried: candidates,
+            explicit: named,
         }
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn explicit(&self) -> bool {
+        self.explicit
     }
 
     /// Every directory `discover` considered, for a diagnostic that names them

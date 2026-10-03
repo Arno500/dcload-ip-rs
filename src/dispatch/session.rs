@@ -319,13 +319,22 @@ fn wait_for_loader(
 
 /// Put a loader linked for `want` in control, hopping through an intermediate
 /// base when a direct move would overwrite the running one. Returns the base in
-/// control afterwards; on any failure the current loader is kept.
+/// control afterwards; when a chainload fails the current loader is kept.
+///
+/// A SET THAT CANNOT PROVIDE `want` IS AN ERROR, NOT A REASON TO STAY. It used
+/// to warn and keep the running loader, and the session went on to start the
+/// title with the loader wherever it happened to be. Measured 2026-10-03:
+/// `--loader-dir loaders-sa2-pick` named a directory that no longer existed,
+/// Sonic Adventure 2 was started with the loader at 0x8ce00000 instead of
+/// 0x8cae0000, booted, wrote over the loader (memory marks unanswered from
+/// then on) and the console rebooted. Staying is still allowed when nothing
+/// was asked for: no set named and the title content with the running base.
 pub fn ensure_loader_base(
     conn: &mut impl ExternalDcIo,
     loaders: &crate::loaders::LoaderSet,
     running: u32,
     want: u32,
-) -> u32 {
+) -> DcResult<u32> {
     // No early return for `running == want`: the same base is not the same
     // build, which is checked below against the image.
     if let Some(reason) = crate::loaders::known_unsupported(want) {
@@ -333,7 +342,7 @@ pub fn ensure_loader_base(
             "this title's preset asks for the loader at 0x{want:08x}, which is not \
              supported: {reason}. Staying at 0x{running:08x}; the title may still run."
         );
-        return running;
+        return Ok(running);
     }
     if !loaders.can_provide(want) {
         let available: Vec<String> = loaders
@@ -354,11 +363,10 @@ pub fn ensure_loader_base(
                 crate::loaders::RELOCATABLE_NAME
             )
         };
-        warn!(
-            "this title wants the loader at 0x{:08x} but {} {} (available: {}); \
-             staying at 0x{:08x}. Build the set with \
-             `make -C target-src/dcload loaders` and put it in a `loaders` \
-             directory at this project's root. Looked in: {}.",
+        let what = format!(
+            "this title wants the loader at 0x{:08x} but {} {} (available: {}). Build the \
+             set with `make -C target-src/dcload loaders` and put it in a `loaders` \
+             directory at this project's root, or name it with --loader-dir. Looked in: {}.",
             want,
             loaders.dir().display(),
             missing,
@@ -370,10 +378,16 @@ pub fn ensure_loader_base(
             } else {
                 available.join(", ")
             },
-            running,
             loaders.searched()
         );
-        return running;
+        if want != running || loaders.explicit() {
+            return Err(std::io::Error::other(format!(
+                "{what} Not starting the title with the loader at 0x{running:08x}."
+            ))
+            .into());
+        }
+        warn!("{what} Staying at 0x{running:08x}.");
+        return Ok(running);
     }
 
     // Each image is materialised once and reused for the upload.
@@ -395,16 +409,19 @@ pub fn ensure_loader_base(
     };
 
     let Some((want_bytes, _)) = fetch(want) else {
-        warn!("staying at 0x{running:08x}");
-        return running;
+        return Err(std::io::Error::other(format!(
+            "no loader for 0x{want:08x} could be read out of {}; not starting the title \
+             with the loader at 0x{running:08x}",
+            loaders.dir().display()
+        ))
+        .into());
     };
-    let want_image = match crate::loaders::image_extent_bytes(&want_bytes) {
-        Ok(extent) => extent,
-        Err(e) => {
-            warn!("cannot read the loader for 0x{want:08x}: {e}; staying at 0x{running:08x}");
-            return running;
-        }
-    };
+    let want_image = crate::loaders::image_extent_bytes(&want_bytes).map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot read the loader for 0x{want:08x}: {e}; not starting the title with \
+             the loader at 0x{running:08x}"
+        ))
+    })?;
     let scratch_image = fetch(crate::loaders::SCRATCH_BASE)
         .and_then(|(b, _)| crate::loaders::image_extent_bytes(&b).ok())
         .unwrap_or((u32::MAX, u32::MAX));
@@ -412,7 +429,7 @@ pub fn ensure_loader_base(
     let mut hops = crate::loaders::plan(running, want, want_image, scratch_image);
     if running == want {
         let Some((bytes, label)) = fetch(want) else {
-            return running;
+            return Ok(running);
         };
         match crate::diag::verify_image(conn, &bytes, &label) {
             Ok(()) => {
@@ -420,7 +437,7 @@ pub fn ensure_loader_base(
                     "loader is already at 0x{running:08x} and is {label}; nothing to \
                      chainload"
                 );
-                return running;
+                return Ok(running);
             }
             Err(e) => {
                 // A loader cannot be uploaded over itself: replace it through
@@ -460,7 +477,7 @@ pub fn ensure_loader_base(
                          Dreamcast: it will boot the CD at the stock base and the move \
                          becomes an ordinary one."
                     );
-                    return running;
+                    return Ok(running);
                 }
                 hops = relay;
             }
@@ -472,7 +489,7 @@ pub fn ensure_loader_base(
              over the running image, and no clear intermediate base is available; \
              staying at 0x{running:08x}"
         );
-        return running;
+        return Ok(running);
     }
     if hops.len() > 1 {
         debug!(
@@ -485,7 +502,7 @@ pub fn ensure_loader_base(
     for hop in hops {
         let Some((bytes, label)) = fetch(hop) else {
             warn!("staying at 0x{current:08x}");
-            return current;
+            return Ok(current);
         };
         info!("chainloading dcload to 0x{:08x} ({label})", hop);
         let entry = match upload_bytes(conn, &bytes, &label, hop, Some(current)) {
@@ -494,22 +511,22 @@ pub fn ensure_loader_base(
                 warn!(
                     "uploading the loader for 0x{hop:08x} failed: {e}; staying at 0x{current:08x}"
                 );
-                return current;
+                return Ok(current);
             }
         };
         // No console, no CDFS: the new loader comes up idle, as from the CD.
         if let Err(e) = execute(conn, entry, false, false) {
             warn!("EXEC of the loader at 0x{hop:08x} failed: {e}; staying at 0x{current:08x}");
-            return current;
+            return Ok(current);
         }
         if let Err(e) = wait_for_loader(conn, hop, Duration::from_secs(20)) {
             warn!("{e}");
-            return current;
+            return Ok(current);
         }
         current = hop;
     }
     info!("loader is now at 0x{:08x}", current);
-    current
+    Ok(current)
 }
 
 /// Copy the disc's IP.BIN to 0x8c008000, as isoldr does: the header sector,
@@ -793,4 +810,54 @@ pub fn send_version(
     conn: &mut impl ExternalDcIo,
 ) -> DcResult<Vec<DCReturnCmd>> {
     call_command(conn, version_command())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A console that must not be spoken to: refusing to start happens before
+    /// any packet.
+    struct Silent;
+
+    impl ExternalDcIo for Silent {
+        fn poll(&self, _t: Option<Duration>) -> Result<polling::Events, std::io::Error> {
+            panic!("polled the console")
+        }
+        fn handle_data(
+            &mut self,
+            _e: &polling::Events,
+        ) -> Result<Vec<DCReturnCmd>, std::io::Error> {
+            panic!("read from the console")
+        }
+        fn send_command(&self, _c: DCLoadCmd) -> DcResult<usize> {
+            panic!("sent to the console")
+        }
+    }
+
+    fn empty_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 2026-10-03: `--loader-dir` named a directory with nothing in it, the
+    /// title was started on the loader already at 0x8ce00000 instead of
+    /// 0x8cae0000, wrote over it and the console rebooted.
+    #[test]
+    fn a_missing_set_refuses_to_move_the_loader() {
+        let set = crate::loaders::LoaderSet::new(empty_dir("dcload-no-set-move"));
+        let e = ensure_loader_base(&mut Silent, &set, 0x8ce0_0000, 0x8cae_0000).unwrap_err();
+        assert!(e.to_string().contains("Not starting the title"), "{e}");
+    }
+
+    /// Named explicitly, an empty set is refused even where nothing would move:
+    /// the user asked for that set, and the loader on the console is not from it.
+    #[test]
+    fn a_named_empty_set_refuses_even_to_stay() {
+        let set = crate::loaders::LoaderSet::new(empty_dir("dcload-no-set-stay"));
+        assert!(set.explicit());
+        assert!(ensure_loader_base(&mut Silent, &set, 0x8ce0_0000, 0x8ce0_0000).is_err());
+    }
 }

@@ -165,7 +165,15 @@ impl<'a> SectorServer<'a> {
         self.watch_destination(start, dc_address, buf.len() as u32);
         // `send_sectors` fails only if the socket does. No ReturnValue then:
         // the loader times out and asks again rather than take a short buffer.
-        match send_sectors(conn, &buf, dc_address) {
+        // HOW LONG THE ANSWER TOOK TO LEAVE (2026-10-03). Sonic Adventure 2's
+        // asynchronous reads failed with the LoadBinary received and nothing
+        // after it -- not one part, not the ReturnValue -- while the chip was
+        // receiving and its ring empty. Either the rest never left this host
+        // in time or it was lost on the way; this says which.
+        let sending = std::time::Instant::now();
+        let sent = send_sectors(conn, &buf, dc_address);
+        let send_time = sending.elapsed();
+        match sent {
             Ok(_) => {
                 if read_diag().verify {
                     verify_read(conn, start, dc_address, &buf);
@@ -175,6 +183,21 @@ impl<'a> SectorServer<'a> {
                 // late one to an earlier read into the same buffer.
                 let tag = READ_RETVAL_TAG | (start & 0x3fff_ffff);
                 conn.send_command(DCLoadCmd::new(DCLoadCmds::ReturnValue(), tag, 0))?;
+                let total = sending.elapsed();
+                if total > std::time::Duration::from_millis(20) {
+                    warn!(
+                        "ReadSector LBA 0x{start:08x} -> 0x{dc_address:08x}: the answer took \
+                         {:.1} ms to send ({:.1} ms for the LoadBinary and parts) -- the \
+                         loader gives up on a chunk after 250 ms",
+                        total.as_secs_f64() * 1000.0,
+                        send_time.as_secs_f64() * 1000.0
+                    );
+                } else {
+                    debug!(
+                        "ReadSector LBA 0x{start:08x}: answer sent in {:.2} ms",
+                        total.as_secs_f64() * 1000.0
+                    );
+                }
                 // After the ReturnValue: the title is frozen until it lands.
                 self.load.record(buf.len(), start);
             }
