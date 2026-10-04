@@ -46,6 +46,24 @@ ADPCM decoding).
      (`preset_window_base`). Off the low family the search starts at
      `ISOLDR_HIGH_ADDR` for a known title, `SCRATCH_BASE` otherwise.
    - Windows CE (§5) and KOS (§5) titles have their own rules.
+   - **Variants and the core** (`variants.rs`, loader AGENTS.md 4.18-4.19).
+     After the base is chosen, `choose_variant` picks the image of the set made
+     for the console's adapter (VERS `address`), the kind of title (boot binary:
+     KOS, CE, else Katana) and the disc's audio (`--no-cdda` counts):
+     `dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf`, resident (no
+     screen, no DHCP: `variants::patch_resident` writes the console's `-H`
+     address and port into `.data` after relocation). **The core**
+     (`dcload-core-{bba,lan}-katana.elf`, pinned at `0x8c004000`, never
+     relocated) is chosen only on evidence (`core_verdict`): recorded `sp_min`
+     clearing it (physical addresses: a stack in high RAM clears it), no startup
+     paint over it, no audio, and a learned map busy in the top 64 blocks;
+     `--loader-core` forces, `--no-loader-core` forbids. `--loader-variant
+     universal` and `--probe` keep the universal image; so do hops. A missing
+     file falls back to it. The running core's footprint is read from its own
+     ELF and held in `variants::ACTIVE`: disc-read collisions, memory marks (not
+     served by a core), the IP.BIN write (header room only) and hop planning use
+     it instead of `layout()`. A disc swap to a disc with audio under a variant
+     without CD-DA plays none.
    - Chainload: relocate `loaders/dcload-relocatable.elf` in memory
      (`loaders::relocate`) and upload it, **always hopping via `0x8ce00000`**
      (a direct low→high move overwrites the running loader's packet buffers).

@@ -86,7 +86,7 @@ pub fn blocks_to_paint(image_end: u32, base: u32, known: &MemoryMap) -> Vec<usiz
         .filter(|&b| !known.is_marked(b))
         .filter(|&b| {
             let lo = MemoryMap::block_addr(b);
-            crate::loaders::overlapping_range(base, (lo, lo + BLOCK)).is_none()
+            crate::loaders::overlapping_under_title(base, (lo, lo + BLOCK)).is_none()
         })
         .collect()
 }

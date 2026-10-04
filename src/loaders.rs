@@ -480,6 +480,12 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
     if to == from {
         return Ok(elf.to_vec());
     }
+    if crate::variants::is_core_image(elf) {
+        return Err(format!(
+            "a core loader is pinned at 0x{from:08x} (its hole, its stacks and its jump table are \
+             at fixed addresses): it cannot be moved to 0x{to:08x}"
+        ));
+    }
     if to % 4 != 0 {
         return Err(format!("0x{to:08x} is not 4-byte aligned"));
     }
@@ -855,6 +861,13 @@ pub struct VersionReply {
     /// Which video cable the console is on. `None` likewise on an older build,
     /// and the caller must treat that as "unknown", never as "not VGA".
     pub cable: Option<Cable>,
+    /// The network adapter, from VERS's `address` field (`installed_adapter`:
+    /// the octal 0300 LAN Adapter / 0400 BBA). Set by the caller that holds the
+    /// whole command, not by `parse_version_payload`.
+    pub adapter: Option<u32>,
+    /// Which build this is (the third field). `None` on a loader from before it
+    /// was reported.
+    pub variant: Option<crate::variants::VariantWord>,
 }
 
 /// The 4-byte fields dcload appends to its VERS payload, in order: the base it
@@ -893,6 +906,8 @@ pub fn parse_version_payload(data: &[u8], size: usize) -> VersionReply {
         text,
         base: field(0).filter(|b| plausible_base(*b)),
         cable: field(1).and_then(Cable::from_code),
+        adapter: None,
+        variant: field(2).and_then(crate::variants::VariantWord::from_word),
     }
 }
 
@@ -1105,6 +1120,12 @@ pub struct LoaderSet {
     /// the search: the user asked for THIS set, so a session must not run on
     /// whatever loader happens to be on the console instead.
     explicit: bool,
+    /// The variant asked for the TARGET base (the last hop); every other hop,
+    /// and every base without one, is the universal image. See `use_variant`.
+    variant: Option<(crate::variants::Variant, u32)>,
+    /// What a resident variant is told before upload: the console's address and
+    /// the port its syscalls answer on (`variants::patch_resident`).
+    resident: Option<([u8; 4], u16)>,
 }
 
 impl LoaderSet {
@@ -1113,6 +1134,8 @@ impl LoaderSet {
             tried: vec![dir.clone()],
             dir,
             explicit: true,
+            variant: None,
+            resident: None,
         }
     }
 
@@ -1145,7 +1168,56 @@ impl LoaderSet {
             dir: chosen,
             tried: candidates,
             explicit: named,
+            variant: None,
+            resident: None,
         }
+    }
+
+    /// Serve `variant` for `target` (and the universal image for every other
+    /// base: the hops, which must talk to either adapter and show a screen).
+    pub fn use_variant(&mut self, variant: crate::variants::Variant, target: u32) {
+        self.variant = Some((variant, target));
+    }
+
+    /// Tell resident variants the console's address and syscall port.
+    pub fn set_resident(&mut self, ip: [u8; 4], port: u16) {
+        self.resident = Some((ip, port));
+    }
+
+    /// The variant asked for, if `base` is its target.
+    pub fn variant_for(&self, base: u32) -> Option<crate::variants::Variant> {
+        self.variant.filter(|&(_, t)| t == base).map(|(v, _)| v)
+    }
+
+    /// Is the file of the variant for `base` here?
+    pub fn has_variant(&self, v: &crate::variants::Variant) -> bool {
+        self.dir.join(v.file_name()).is_file()
+    }
+
+    /// The variant's image for `base`: relocated (a HIGH variant), or as it is
+    /// (the CORE, pinned), with the console's address written in.
+    pub fn variant_image(
+        &self,
+        v: &crate::variants::Variant,
+        base: u32,
+    ) -> Result<(Vec<u8>, String), String> {
+        let p = self.dir.join(v.file_name());
+        let bytes = std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+        let (mut image, label) = if v.core {
+            if base != DEFAULT_BASE {
+                return Err(format!("the core is pinned at 0x{DEFAULT_BASE:08x}, not 0x{base:08x}"));
+            }
+            (bytes, p.display().to_string())
+        } else {
+            (
+                relocate(&bytes, base)?,
+                format!("{} relocated to 0x{base:08x}", p.display()),
+            )
+        };
+        if let Some((ip, port)) = self.resident {
+            crate::variants::patch_resident(&mut image, ip, port)?;
+        }
+        Ok((image, label))
     }
 
     pub fn dir(&self) -> &Path {
@@ -1187,6 +1259,10 @@ impl LoaderSet {
     /// whole point of it: the set stops being a menu of addresses someone
     /// thought of in advance. Both families, since 2026-08-28.
     pub fn can_provide(&self, base: u32) -> bool {
+        if let Some(v) = self.variant_for(base) {
+            return self.has_variant(&v)
+                && if v.core { base == DEFAULT_BASE } else { is_high(base) && could_relocate_to(base) };
+        }
         if self.has(base) {
             return true;
         }
@@ -1215,6 +1291,9 @@ impl LoaderSet {
     /// relocatable image is moved in memory -- see `relocate`, which reproduces
     /// a native link byte for byte.
     pub fn image_for(&self, base: u32) -> Result<(Vec<u8>, String), String> {
+        if let Some(v) = self.variant_for(base) {
+            return self.variant_image(&v, base);
+        }
         if self.has(base) {
             let p = self.path_for(base);
             return std::fs::read(&p)
@@ -1247,6 +1326,16 @@ impl LoaderSet {
     /// `None` when there is no image to read or it carries no symbols: the
     /// caller must then skip the test rather than assume either answer.
     pub fn image_end_for(&self, base: u32) -> Option<u32> {
+        if let Some(v) = self.variant_for(base) {
+            let bytes = std::fs::read(self.dir.join(v.file_name())).ok()?;
+            if v.core {
+                return crate::variants::footprint_from_elf(&bytes).ok().map(|f| f.resident_end);
+            }
+            let syms = symbols(&bytes).ok()?;
+            let end = syms.get("end")?.0;
+            let linked_at = syms.get("dcload_base")?.0;
+            return base.checked_add(end.checked_sub(linked_at)?);
+        }
         let path = self
             .available()
             .first()
@@ -1430,7 +1519,17 @@ fn physical(addr: u32) -> u32 {
 /// chainload.
 pub fn overlapping_range(base: u32, image: (u32, u32)) -> Option<(u32, u32)> {
     let (lo, hi) = (physical(image.0), physical(image.1));
-    live_footprint(base)
+    crate::variants::live_ranges(base)
+        .into_iter()
+        .find(|range| physical(range.0) < hi && lo < physical(range.1))
+}
+
+/// `overlapping_range` for what a TITLE can reach while it runs: what survives
+/// under it, not the loader's start-up buffers (a CORE's Maple buffer and
+/// main-loop stack are the title's ground once it runs).
+pub fn overlapping_under_title(base: u32, image: (u32, u32)) -> Option<(u32, u32)> {
+    let (lo, hi) = (physical(image.0), physical(image.1));
+    crate::variants::under_title_ranges(base)
         .into_iter()
         .find(|range| physical(range.0) < hi && lo < physical(range.1))
 }
@@ -2156,6 +2255,21 @@ mod tests {
         let size = payload.len();
         payload.resize(1440, 0);
         assert_eq!(parse_version_payload(&payload, size).cable, None);
+    }
+
+    #[test]
+    fn the_variant_word_is_the_third_field() {
+        let mut payload = b"dcload-ip 2.0.4 using Broadband Adapter (HIT-0400)\0".to_vec();
+        payload.extend_from_slice(&0x8ce0_0000u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes()); // VGA
+        let old = parse_version_payload(&payload, payload.len());
+        assert_eq!(old.variant, None, "a loader that sends no word is not guessed");
+        let word = 0xA500_0000u32 | 2 | 1 << 4 | 1 << 9 | 1 << 12 | 1 << 13;
+        payload.extend_from_slice(&word.to_be_bytes());
+        let r = parse_version_payload(&payload, payload.len());
+        assert_eq!(r.base, Some(0x8ce0_0000));
+        let v = r.variant.expect("variant");
+        assert!(v.is_core() && v.resident && v.bba && v.disc && !v.cdda);
     }
 
     #[test]

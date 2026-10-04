@@ -220,10 +220,9 @@ fn version_in(replies: Vec<DCReturnCmd>) -> Option<crate::loaders::VersionReply>
         if let Some(cmd) = reply.cmd
             && let DCLoadCmds::Version(Some(data)) = cmd.cmd
         {
-            Some(crate::loaders::parse_version_payload(
-                data.as_ref(),
-                cmd.size as usize,
-            ))
+            let mut reply = crate::loaders::parse_version_payload(data.as_ref(), cmd.size as usize);
+            reply.adapter = Some(cmd.address);
+            Some(reply)
         } else {
             None
         }
@@ -330,6 +329,48 @@ fn wait_for_loader(
 /// then on) and the console rebooted. Staying is still allowed when nothing
 /// was asked for: no set named and the title content with the running base.
 pub fn ensure_loader_base(
+    conn: &mut impl ExternalDcIo,
+    loaders: &crate::loaders::LoaderSet,
+    running: u32,
+    want: u32,
+) -> DcResult<u32> {
+    let now = ensure_loader_base_inner(conn, loaders, running, want)?;
+    // What is in control NOW decides what the host may assume about RAM: a
+    // core owns the system hole and nothing in high RAM (variants.rs).
+    if let Ok(reply) = query_loader(conn) {
+        note_running_loader(loaders, &reply);
+    }
+    Ok(now)
+}
+
+/// Record what the running loader's own ELF says it owns, when it is a core
+/// (`variants::set_active`); anything else is described by `layout()`.
+pub fn note_running_loader(
+    loaders: &crate::loaders::LoaderSet,
+    reply: &crate::loaders::VersionReply,
+) {
+    let core = reply.variant.is_some_and(|v| v.is_core());
+    let driver = reply.adapter.and_then(crate::variants::Driver::from_installed);
+    let footprint = match (core, driver, reply.base) {
+        (true, Some(driver), Some(base)) => {
+            let v = crate::variants::pick_variant(driver, &Default::default(), true);
+            loaders
+                .variant_image(&v, base)
+                .ok()
+                .and_then(|(bytes, _)| crate::variants::footprint_from_elf(&bytes).ok())
+        }
+        _ => None,
+    };
+    if let Some(fp) = &footprint {
+        info!(
+            "a core loader is running: resident to 0x{:08x}, IP.BIN room {} bytes",
+            fp.resident_end, fp.ipbin_room
+        );
+    }
+    crate::variants::set_active(footprint);
+}
+
+fn ensure_loader_base_inner(
     conn: &mut impl ExternalDcIo,
     loaders: &crate::loaders::LoaderSet,
     running: u32,
@@ -543,19 +584,29 @@ pub fn load_ip_bin(
 ) -> DcResult<bool> {
     const IP_BIN_ADDR: u32 = 0x0c008000;
 
-    match running_base {
-        Some(base) if base < 0x8c010000 => {
-            warn!(
-                "loader at 0x{base:08x} occupies the IP.BIN region; \
-                 not loading IP.BIN for this title"
-            );
-            return Ok(false);
-        }
+    // How much of 0x8c008000 the running loader leaves to the IP.BIN: all of it
+    // for a high loader, only the header's room for a CORE (its code is on both
+    // sides of the hole), nothing for a low loader whose image covers it.
+    let room = match running_base {
+        Some(base) => crate::variants::ipbin_room(base) as usize,
         None => {
             warn!("the loader does not report where it is; not loading IP.BIN");
             return Ok(false);
         }
-        _ => {}
+    };
+    if room == 0 {
+        warn!(
+            "loader at 0x{:08x} occupies the IP.BIN region; not loading IP.BIN for this title",
+            running_base.unwrap_or(0)
+        );
+        return Ok(false);
+    }
+    if full && room < 2048 {
+        warn!(
+            "the loader leaves {room} bytes of the IP.BIN region; the full bootstrap \
+             cannot be loaded, only the header"
+        );
+        return Ok(false);
     }
 
     if !full {
@@ -565,6 +616,7 @@ pub fn load_ip_bin(
         if vga {
             declare_vga_and_say_so(&mut sector);
         }
+        sector.truncate(room);
 
         info!(
             "IP.BIN header -> 0x{IP_BIN_ADDR:08x} ({} bytes), as isoldr does on a direct boot",

@@ -238,7 +238,7 @@ impl<'a> SectorServer<'a> {
             a >= lo && a.saturating_add(len) <= lo + stage_len
         });
         if !staged
-            && let Some(hit) = crate::loaders::overlapping_range(
+            && let Some(hit) = crate::loaders::overlapping_under_title(
                 loader_base,
                 (dc_address, dc_address.saturating_add(len)),
             )

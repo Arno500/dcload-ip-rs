@@ -255,7 +255,7 @@ pub(super) fn declare_vga_and_say_so(header: &mut [u8]) {
 /// overwrites the loader with nothing reported anywhere, so this is checked
 /// before the title runs. A literal counts only when a `mov.l @(disp,PC)` loads it.
 pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<(u32, u32)> {
-    loaded_literals_in(buf, address, &crate::loaders::exclusive_footprint(base))
+    loaded_literals_in(buf, address, &crate::variants::exclusive_ranges(base))
 }
 
 /// Constants naming RAM inside `ranges` (P1, `hi` exclusive) that an
