@@ -99,6 +99,7 @@ game.gdi` (`u-exec --host …` is rejected).
 | `relocate <elf> <base> -o <out>` | write the in-memory relocation out |
 | `selftest-readback` | write patterns to free RAM and read them back |
 | `reboot` | `RBOT` |
+| `swap-disc <image>` | change the disc a running `u-exec <image>` session serves (§12) |
 
 Global options: `-H/--host`, `-v`/`-vv`, `-p/--port`, `-i/--infinite`,
 `-a/--address`, `--loader-dir`, `--game-db`, `--memory-db`, `--patch-dir`,
@@ -374,6 +375,21 @@ No negotiation: check the mode first when a console does not answer.
 - **A disc read landing on the loader** is an error; within 256 KB of a high
   loader, a warning.
 - `cdi2iso.c` at the root is untracked third-party GPLv2 reference, not built.
+
+## 12. Disc swap
+
+`swap-disc <image>` (`control.rs`) sends `SWAP <path>` to the session on
+`127.0.0.1:--control-port` (`DCLOAD_CONTROL_PORT`, default 53536, 0 = off; the
+session listens only when it serves a disc image). The session thread
+(`dispatch/swap.rs`) opens the image first (a `DiscFormat` is not `Send`), asks
+the loader with `DISC` (generation in `address`; reply `size` 0 accepted, 1
+busy: asked again every 250 ms, `0xffffffff` refused; 10 s limit), and installs
+the new image, TOC and audio state only on 0. The loader then plays the lid
+(loader AGENTS.md 4.17). The memory map learned for the title keeps recording
+under the first disc's identity. Needs a loader with `DISC`; an older one never
+answers. A read at LBA `0x3ffffffe` (BootROM service 2, loader
+AGENTS.md 4.17) is served from `DiscFormat::boot_sector()` and tagged with the
+number the loader sent.
 
 ## 11. VM2 / VMUPro
 

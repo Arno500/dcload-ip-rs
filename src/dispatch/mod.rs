@@ -68,6 +68,7 @@ mod patches;
 mod probes;
 mod sectors;
 mod session;
+mod swap;
 mod syscalls;
 mod transfer;
 
@@ -77,5 +78,6 @@ pub use patches::*;
 pub use probes::*;
 use sectors::*;
 pub use session::*;
+use swap::DiscSwap;
 pub use syscalls::*;
 pub use transfer::*;

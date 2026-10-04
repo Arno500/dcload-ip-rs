@@ -519,6 +519,14 @@ impl AudioServer {
         }
     }
 
+    /// The served disc changed: the encoder and its cache of answers belong to
+    /// the old one, and the first key-on of the new disc restarts them anyway.
+    pub(super) fn forget_disc(&mut self) {
+        self.adpcm = crate::adpcm::Stream::new();
+        self.slew = SlewWatch::new();
+        self.slew_audited = false;
+    }
+
     /// Answer one `ReadAudio`. Only a failed socket is an `Err`.
     pub(super) fn serve(
         &mut self,

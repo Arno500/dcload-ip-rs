@@ -9,6 +9,7 @@ use clap_num::maybe_hex;
 extern crate log;
 
 mod cmds;
+mod control;
 mod adpcm;
 mod cd;
 mod diag;
@@ -316,6 +317,11 @@ struct Args {
     /// Adjustable live from the panel with `+` and `-`.
     #[arg(long, default_value_t = 2.0, value_name = "SECONDS")]
     diag_interval: f64,
+
+    /// TCP port on 127.0.0.1 where a `u-exec` session serving a disc image
+    /// listens for `swap-disc`; 0 turns it off.
+    #[arg(long, default_value_t = control::default_port(), value_name = "PORT")]
+    control_port: u16,
 
     #[command(subcommand)]
     command: Commands,
@@ -1565,6 +1571,16 @@ enum Commands {
     },
     /// Reboot the console (only works when dcload is in control)
     Reboot {},
+    /// Change the disc image a running `u-exec` session serves: the console's
+    /// lid opens, then closes on the new disc, and the title reads it afresh.
+    ///
+    /// Talks to the session on this machine (`--control-port`), not to the
+    /// console.
+    SwapDisc {
+        /// The new image (.gdi / .cdi / .iso, or a .zip -- `#member` picks one)
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        disc: String,
+    },
     /// Write known patterns to free RAM and read them straight back, across
     /// several sizes and misalignments. Uploads no title and starts nothing --
     /// it only answers "can a read-back off this console be believed at all".
@@ -2709,6 +2725,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Commands::Identify { ref disc } = args.command {
         return Ok(identify_only(&args, disc));
     }
+    if let Commands::SwapDisc { ref disc } = args.command {
+        return Ok(control::swap_disc_client(args.control_port, disc));
+    }
     if let Commands::Relocate {
         ref elf,
         to,
@@ -3329,6 +3348,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 stack,
                                 marks,
                                 running_base.map(|b| loader_stage(&args, b)).unwrap_or_default(),
+                                if has_disc { control::serve(args.control_port) } else { None },
                             )?;
                             return Ok(ExitCode::SUCCESS);
                         }
@@ -3376,6 +3396,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 false => Ok(ExitCode::FAILURE),
             };
         }
+        Commands::SwapDisc { .. } => unreachable!("handled before the socket opens"),
         Commands::Reboot {} => {
             info!("Sending reboot command");
             dispatch::reboot(&mut udpsender)?;

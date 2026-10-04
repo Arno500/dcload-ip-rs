@@ -185,6 +185,16 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("g_gd_lock_stuck_ticks", Fmt::Num),
             ("g_gd_lock_owner", Fmt::Num),
             ("g_gd_lock_gen", Fmt::Num),
+            // Disc swap (loader AGENTS.md 4.17), absent from loaders before
+            // 2026-10-04: swaps accepted, answered "busy", accepted but the
+            // lid not started yet (stays 1 = GetDrvStat never found the loader
+            // between commands), the lid count (2 = open, 241 = closed, 1023
+            // saturated) and commands answered UNIT ATTENTION.
+            ("g_disc_swaps", Fmt::Num),
+            ("g_disc_swap_busy", Fmt::Num),
+            ("g_disc_pending", Fmt::Num),
+            ("g_disc_lid", Fmt::Num),
+            ("g_disc_ua", Fmt::Num),
             // How the boot-time stop of the REAL drive went (the loader's
             // AGENTS.md 4.14): 4 = COMPLETED, the healthy answer. 0 means it
             // never ran -- an older loader, or one built WITH_GD_SPINDOWN=0.

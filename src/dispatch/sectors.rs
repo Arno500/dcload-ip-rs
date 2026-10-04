@@ -76,6 +76,13 @@ impl<'a> SectorServer<'a> {
         }
     }
 
+    /// The served disc changed (`DISC`): its extent is the new one's.
+    pub(super) fn set_extent(&mut self, toc_start: u32, toc_sectors: u32) {
+        self.toc_start = toc_start;
+        self.toc_sectors = toc_sectors;
+        self.pvd_lba = toc_start.saturating_add(16);
+    }
+
     /// Answer one `ReadSector`. Only a failed socket is an `Err`: a read that
     /// cannot be served is refused or left to time out, and the session stays.
     pub(super) fn serve(
@@ -87,6 +94,15 @@ impl<'a> SectorServer<'a> {
         size: u32,
     ) -> DcResult<()> {
         let (toc_start, toc_sectors, pvd_lba) = (self.toc_start, self.toc_sectors, self.pvd_lba);
+        // BootROM service 2 (`syBtCheckDisc`): the loader asks for "the sector
+        // the disc boots from" and only the disc knows which that is. The tag
+        // of the answer keeps the number the loader used.
+        let wire_start = start;
+        let start = if start == BOOT_SECTOR_LBA {
+            disc.boot_sector()
+        } else {
+            start
+        };
         debug!(
             "Received ReadSector syscall: start=0x{:08x}, dc_address=0x{:08x}, size={}",
             start, dc_address, size
@@ -181,7 +197,7 @@ impl<'a> SectorServer<'a> {
                 self.reapply_guards(conn, start, dc_address, buf.len() as u32);
                 // Tagged with the LBA so the loader can tell this answer from a
                 // late one to an earlier read into the same buffer.
-                let tag = READ_RETVAL_TAG | (start & 0x3fff_ffff);
+                let tag = READ_RETVAL_TAG | (wire_start & 0x3fff_ffff);
                 conn.send_command(DCLoadCmd::new(DCLoadCmds::ReturnValue(), tag, 0))?;
                 let total = sending.elapsed();
                 if total > std::time::Duration::from_millis(20) {

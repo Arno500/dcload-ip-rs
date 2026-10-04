@@ -22,15 +22,17 @@ pub fn receive_syscalls(
     mut stack: Option<crate::stackwatch::StackWatch>,
     mut marks: Option<crate::marks::MarkWatch>,
     stage: Vec<(u32, u32)>,
+    swap_requests: Option<std::sync::mpsc::Receiver<crate::control::SwapRequest>>,
 ) -> DcResult<()> {
     // A disc that failed to open (already reported) answers every read with
     // an error.
     let disc = cd_disc.unwrap_or_else(|| get_disc_format(StubDisc {}));
     // Worked out once, here: on a zipped GDI each of these can build a deflate
     // index, which must not happen inside a syscall.
-    let toc_start = disc.start_sector();
-    let toc_sectors = disc.num_sectors();
-    let toc_all_tracks = disc.toc_tracks();
+    let mut disc = disc;
+    let mut toc_start = disc.start_sector();
+    let mut toc_sectors = disc.num_sectors();
+    let mut toc_all_tracks = disc.toc_tracks();
     debug!("CDFS source: start_sector={toc_start} num_sectors={toc_sectors}");
     if toc_all_tracks.is_empty() {
         debug!(
@@ -61,6 +63,10 @@ pub fn receive_syscalls(
     let mut sectors =
         SectorServer::new(toc_start, toc_sectors, running_base, guards, memory, stage);
     let mut audio = AudioServer::new(cdda);
+    let mut swap = swap_requests.map(DiscSwap::new);
+    if let Some(s) = swap.as_ref() {
+        s.install(conn);
+    }
     loop {
         // Instruments post their own requests here, at the top, where no
         // transfer owns the conversation; their replies are claimed in the IO
@@ -74,8 +80,26 @@ pub fn receive_syscalls(
         if let Some(m) = marks.as_mut() {
             m.tick(conn);
         }
+        if let Some(s) = swap.as_mut()
+            && let Some(done) = s.tick(conn)
+        {
+            let swap::Accepted { disc: new_disc, spec, reply } = done;
+            disc = new_disc;
+            toc_start = disc.start_sector();
+            toc_sectors = disc.num_sectors();
+            toc_all_tracks = disc.toc_tracks();
+            sectors.set_extent(toc_start, toc_sectors);
+            audio.forget_disc();
+            let audio_tracks = toc_all_tracks.iter().filter(|t| t.audio).count();
+            info!(
+                "disc changed to {spec}: {} tracks, {audio_tracks} of them audio",
+                toc_all_tracks.len()
+            );
+            reply.send(Ok(format!("disc changed to {spec}")));
+        }
         // The soonest wake-up anyone wants; none at all blocks.
         let timeout = [
+            swap.as_ref().map(|s| s.poll_timeout()),
             sectors.load.poll_timeout(),
             diag.as_ref().and_then(|d| d.poll_timeout()),
             stack.as_ref().and_then(|s| s.poll_timeout()),

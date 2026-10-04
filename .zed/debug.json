@@ -14,7 +14,6 @@
       // "--loader-base",
       // "0x8cfe8000",
       "--infinite",
-      // "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\loaders-diag",
       "--diag",
       "u-exec",
       "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].zip"
@@ -53,32 +52,6 @@
     "sourceLanguages": ["rust"],
   },
   {
-    "label": "Test GAPS",
-    "adapter": "CodeLLDB",
-    "request": "launch",
-    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
-    "build": {
-      "command": "cargo",
-      "args": ["build"],
-    },
-    "args": [
-      "--host",
-      "192.168.1.64",
-      "--loader-base",
-      "0x8c004000",
-      "u-exec",
-      "$ZED_WORKTREE_ROOT\\gaps-kill.bin",
-      "-c"
-    ],
-    "cwd": "$ZED_WORKTREE_ROOT",
-    "env": {
-      "RUST_BACKTRACE": "1",
-      "RUST_LOG": "debug",
-      "DCLOAD_IP_RS_TRACE_STALL": "1",
-    },
-    "sourceLanguages": ["rust"],
-  },
-  {
     "label": "Launch Sonic Adventure 2",
     "adapter": "CodeLLDB",
     "request": "launch",
@@ -90,13 +63,14 @@
     "args": [
       "--host",
       "192.168.1.64",
+      "--infinite",
+      "--diag",
+      // "--no-marks",
       // "--patch",
       // "0x8c138388=0xe000000b",
       // "--boot-ipbin",c
-      // "--loader-dir",
-      // "$ZED_WORKTREE_ROOT/loaders-noheap",
       // "--loader-base",
-      // "0x8cef8000",
+      // "0x8cae0000",
       "u-exec",
       "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].zip"
       // "C:\\Users\\arnod\\Downloads\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN",
@@ -162,6 +136,110 @@
     "sourceLanguages": ["rust"],
   },
   {
+    "label": "Launch Sega Rally 2",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "--infinite",
+      "--diag",
+      // "--boot-ipbin",
+      // "--loader-base", "0x8cfe0000",
+      "u-exec",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sega Rally 2 v1.000 (1999)(Sega)(PAL)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      // "DCLOAD_CDDA_SAFE": "1"
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Shenmue II Disc 1 (flycast)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "--infinite",
+      "--diag",
+      // "--boot-ipbin",
+      // "--loader-base", "0x8cf90000",
+      "u-exec",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Shenmue II v1.001 (2001)(Sega)(PAL)(M4)(Disc 1 of 4)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      // "DCLOAD_CDDA_SAFE": "1"
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Shenmue II Disc 1",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "--infinite",
+      "--diag",
+      // "--boot-ipbin",
+      // "--loader-base", "0x8cfe0000",
+      "u-exec",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Shenmue II v1.001 (2001)(Sega)(PAL)(M4)(Disc 1 of 4)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+      // "DCLOAD_CDDA_SAFE": "1"
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Swap Shenmue II to Disc 4 (needs a running session)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    // Start "Launch Shenmue II Disc 1" first. This one only talks to that
+    // session (127.0.0.1:53536, --control-port): the console's lid opens, then
+    // closes on disc 4.
+    "args": [
+      "swap-disc",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Shenmue II v1.001 (2001)(Sega)(PAL)(M4)(Disc 4 of 4)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
     "label": "Launch another game",
     "adapter": "CodeLLDB",
     "request": "launch",
@@ -174,12 +252,12 @@
       "--host",
       "192.168.1.64",
       "--infinite",
-      // "--diag",
-      "--loader-dir", "loaders-wince",
+      "--diag",
       // "--boot-ipbin",
-      // "--loader-base", "0x8c004000",
+      // "--loader-base", "0x8cfe0000",
       "u-exec",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sega Rally 2 v1.000 (1999)(Sega)(PAL)[!].zip",
+      "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Grand Theft Auto 2 v1.003 (2000)(Take 2)(PAL)(M5)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -205,15 +283,42 @@
       // flycast needs a set built with DREAMCAST_IP=192.168.1.130 and
       // CDDA_TICKS_X8192=580480; build it into a directory of its own and
       // name it here. Only "loaders" (DHCP, console clock) is kept.
-      "--loader-dir", "loaders-wince",
       "u-exec",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Sega Rally 2 v1.000 (1999)(Sega)(PAL)[!].zip",
+      "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Shenmue II v1.001 (2001)(Sega)(PAL)(M4)(Disc 1 of 4)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
       "RUST_BACKTRACE": "1",
       "RUST_LOG": "debug",
       // "DCLOAD_CDDA_SAFE": "1"
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Snow Surfers",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.64",
+      "--infinite",
+      // "--no-cdda",
+      "--diag",
+      // "--boot-ipbin",
+      // "--loader-base", "0x8c004000",
+      "u-exec",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Snow Surfers v1.001 (1999)(Sega)(PAL)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
     },
     "sourceLanguages": ["rust"],
   },
@@ -232,7 +337,33 @@
       "--infinite",
       // "--no-cdda",
       "--diag",
-      // "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\",
+      // "--boot-ipbin",
+      // "--loader-base", "0x8c004000",
+      "u-exec",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Crazy Taxi 2 v1.000 (2001)(Sega)(PAL)(M5)[!].zip",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_BACKTRACE": "1",
+      "RUST_LOG": "debug",
+    },
+    "sourceLanguages": ["rust"],
+  },
+  {
+    "label": "Launch Crazy Taxi 2 (flycast)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/debug/dcload-ip-rs",
+    "build": {
+      "command": "cargo",
+      "args": ["build"],
+    },
+    "args": [
+      "--host",
+      "192.168.1.130",
+      "--infinite",
+      // "--no-cdda",
+      "--diag",
       // "--boot-ipbin",
       // "--loader-base", "0x8c004000",
       "u-exec",
@@ -258,7 +389,6 @@
       "--host",
       "192.168.1.64",
       "--infinite",
-      // "--loader-dir", "E:\\Nextcloud\\Projets\\Dreamcast\\dcload-ip-rs\\loaders-adj25",
       "u-exec",
       "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"

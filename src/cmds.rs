@@ -20,6 +20,10 @@ pub enum DCLoadCmds {
     /// `size` bit 31 clear paints, set checks. The reply carries the bitmap
     /// of changed 64 KB blocks when checking.
     Mark(Option<Vec<u8>>),
+    /// The disc image was swapped (`cmd_disc` in commands.c, `dispatch/swap.rs`):
+    /// `address` is the generation, and in the reply `size` is 0 accepted,
+    /// 1 busy (a GD command is in flight), `0xffffffff` refused.
+    Disc(),
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +55,7 @@ impl DCLoadCmds {
             DCLoadCmds::Mapl(_) => "MAPL",
             DCLoadCmds::PerformanceCounter() => "PMCR",
             DCLoadCmds::Mark(_) => "MARK",
+            DCLoadCmds::Disc() => "DISC",
         }
     }
 }
@@ -100,6 +105,7 @@ impl From<DCLoadCmd> for Vec<u8> {
                 b"MAPL".to_vec()
             }
             DCLoadCmds::PerformanceCounter() => b"PMCR".to_vec(),
+            DCLoadCmds::Disc() => b"DISC".to_vec(),
             DCLoadCmds::Mark(None) => b"MARK".to_vec(),
             DCLoadCmds::Mark(Some(bits)) => {
                 data = bits;
@@ -217,6 +223,7 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
                 }
             }
             b"PMCR" => DCLoadCmds::PerformanceCounter(),
+            b"DISC" => DCLoadCmds::Disc(),
             b"MARK" => {
                 let payload = &input[12..];
                 DCLoadCmds::Mark((!payload.is_empty()).then(|| payload.to_vec()))

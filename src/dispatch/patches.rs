@@ -53,6 +53,10 @@ fn pc_load(op: u16, at: usize) -> Option<(u16, usize)> {
 /// the loader). Bit 31 stays clear for older loaders.
 pub(super) const READ_RETVAL_TAG: u32 = 0x4000_0000;
 
+/// The LBA the loader sends for BootROM service 2 (`syBtCheckDisc`, loader
+/// AGENTS.md 4.17): "the sector this disc boots from". `GD_BOOT_SECTOR_LBA`.
+pub(super) const BOOT_SECTOR_LBA: u32 = 0x3fff_fffe;
+
 /// The four G2 slot windows a Katana title probes for an expansion device.
 const GAPS_SLOT_WINDOWS: [u32; 4] = [0xa100_0400, 0xa100_0800, 0xa100_1400, 0xa100_1800];
 /// `"GAPS"` as a little-endian word, the signature the probe compares against.
