@@ -451,7 +451,7 @@ impl DeflateIndex {
             )));
         }
 
-        info!(
+        debug!(
             "{label}: {} indexed, {} checkpoints, CRC-32 verified",
             indicatif::HumanBytes(uncompressed_len),
             checkpoints.len()

@@ -47,28 +47,15 @@ ADPCM decoding).
      `ISOLDR_HIGH_ADDR` for a known title, `SCRATCH_BASE` otherwise.
    - Windows CE (§5) and KOS (§5) titles have their own rules, and so does a
      title with an HLib heap (§5): the loader goes at its bottom.
-   - **Variants and the core** (`variants.rs`, loader AGENTS.md 4.18-4.19).
-     After the base is chosen, `choose_variant` picks the image of the set made
-     for the console's adapter (VERS `address`), the kind of title (boot binary:
-     KOS, CE, else Katana) and the disc's audio (`--no-cdda` counts):
-     `dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf`, resident (no
-     screen, no DHCP: `variants::patch_resident` writes the console's `-H`
-     address and port into `.data` after relocation). **The core**
-     (`dcload-core-{bba,lan}-katana.elf`, pinned at `0x8c004000`, never
-     relocated) is chosen only on evidence (`core_verdict`): recorded `sp_min`
-     clearing it (physical addresses: a stack in high RAM clears it), no startup
-     paint over it, no audio, and a learned map busy in the top 64 blocks;
-     `--loader-core` forces, `--no-loader-core` forbids. With a core, the high
-     base the title would have had is written into its `core_shadow`
-     (`variants::patch_core_shadow`): the core copies itself there at EXEC and
-     is copied back on the title's first BIOS call, after boot code that runs
-     over 0x8c004000 (Shenmue II). `--loader-variant
-     universal` and `--probe` keep the universal image; so do hops. A missing
-     file falls back to it. The running core's footprint is read from its own
-     ELF and held in `variants::ACTIVE`: disc-read collisions, memory marks (not
-     served by a core), the IP.BIN write (header room only) and hop planning use
-     it instead of `layout()`. A disc swap to a disc with audio under a variant
-     without CD-DA plays none.
+   - **The resident image** (`variants.rs`, loader AGENTS.md 4.18). After the
+     base is chosen, `choose_loader_image` serves `dcload-resident.elf` (no
+     screen, no DHCP; `variants::patch_resident` writes the console's `-H`
+     address and port into `.data` after relocation) for a disc image's title
+     at a high base; every hop, `--loader-image universal`, `--probe`, a plain
+     file, a low base or a missing file is `dcload-relocatable.elf`. When VERS
+     says the resident image runs, its symbols are read from its own file
+     (`note_running_loader`, `variants::running_image`). The per-title variants
+     and the core were withdrawn on 2026-10-05.
    - Chainload: relocate `loaders/dcload-relocatable.elf` in memory
      (`loaders::relocate`) and upload it, **always hopping via `0x8ce00000`**
      (a direct low→high move overwrites the running loader's packet buffers).
@@ -285,7 +272,7 @@ upload, verified, re-applied on reload, and listed by `identify`
   and the start, first block and size are moved above it (`patches`); a loader
   pinned at the heap's top lowers the end and size instead, and one in the
   middle is only warned about. The heap's own bounds are not reported by the
-  constant scan, and such a base keeps the core out unless `--loader-core`.
+  constant scan.
   Shenmue II (PAL 1.001): pool at `0x8c051968`, heap `0x8c360000..0x8cebffe0`,
   loader `0x8c360000`, start `0x8c370000` -- measured to run through disc 4.
   Its fixed regions rule out the alternatives: above `0x8cec0000` cutscenes and
@@ -389,7 +376,13 @@ No negotiation: check the mode first when a console does not answer.
 - `-v`/`-vv` or `RUST_LOG`. Commands log through `Display`; `DoneBinary` is at
   TRACE.
 - A slow read-back chunk is re-requested, so a late duplicate is dropped at
-  DEBUG, not reported as unexpected.
+  DEBUG, not reported as unexpected. A read-back ends only on a DoneBinary
+  naming its own range (0/0 from an older loader): the one a previous read
+  left in the socket used to end the next read early, costing a repair pass
+  and a 500 ms timeout per patched word.
+- INFO is for what a user acts on (connection, placement, title patches,
+  problems); each step's detail (verified pokes, read timings, memory map,
+  indexing) is at DEBUG, per-read bytes at TRACE.
 - `.vscode/`, `.continue/`, `.zed/` hold personal launch configurations: do not
   commit them as is.
 - **Terminal** (`ui.rs` owns it): one `MultiProgress`; logs print inside

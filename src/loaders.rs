@@ -254,6 +254,10 @@ pub fn is_high(base: u32) -> bool {
 /// pattern, and this image is not a base.
 pub const RELOCATABLE_NAME: &str = "dcload-relocatable.elf";
 
+/// The same loader without its screen and DHCP (`make loaders`, loader
+/// AGENTS.md 4.18): what runs under a title. The hops stay the universal image.
+pub const RESIDENT_NAME: &str = "dcload-resident.elf";
+
 /// Where a relocated loader may be put, and the step between candidates.
 ///
 /// The floor is `ISOLDR_DEFAULT_ADDR`, which is DreamShell's own answer to
@@ -479,12 +483,6 @@ pub fn relocate(elf: &[u8], to: u32) -> Result<Vec<u8>, String> {
     let from = rd(24); // e_entry: crt0 is first, so this is the base
     if to == from {
         return Ok(elf.to_vec());
-    }
-    if crate::variants::is_core_image(elf) {
-        return Err(format!(
-            "a core loader is pinned at 0x{from:08x} (its hole, its stacks and its jump table are \
-             at fixed addresses): it cannot be moved to 0x{to:08x}"
-        ));
     }
     if to % 4 != 0 {
         return Err(format!("0x{to:08x} is not 4-byte aligned"));
@@ -1120,14 +1118,13 @@ pub struct LoaderSet {
     /// the search: the user asked for THIS set, so a session must not run on
     /// whatever loader happens to be on the console instead.
     explicit: bool,
-    /// The variant asked for the TARGET base (the last hop); every other hop,
-    /// and every base without one, is the universal image. See `use_variant`.
-    variant: Option<(crate::variants::Variant, u32)>,
-    /// What a resident variant is told before upload: the console's address and
+    /// The base the RESIDENT image is served for (the last hop, where the
+    /// title's loader goes); every other hop, and every base without it, is the
+    /// universal image. See `use_resident`.
+    resident_at: Option<u32>,
+    /// What the resident image is told before upload: the console's address and
     /// the port its syscalls answer on (`variants::patch_resident`).
     resident: Option<([u8; 4], u16)>,
-    /// Where a core copies itself at EXEC (`variants::patch_core_shadow`).
-    core_shadow: Option<u32>,
 }
 
 impl LoaderSet {
@@ -1136,9 +1133,8 @@ impl LoaderSet {
             tried: vec![dir.clone()],
             dir,
             explicit: true,
-            variant: None,
+            resident_at: None,
             resident: None,
-            core_shadow: None,
         }
     }
 
@@ -1171,72 +1167,46 @@ impl LoaderSet {
             dir: chosen,
             tried: candidates,
             explicit: named,
-            variant: None,
+            resident_at: None,
             resident: None,
-            core_shadow: None,
         }
     }
 
-    /// Serve `variant` for `target` (and the universal image for every other
-    /// base: the hops, which must talk to either adapter and show a screen).
-    pub fn use_variant(&mut self, variant: crate::variants::Variant, target: u32) {
-        self.variant = Some((variant, target));
-    }
-
-    /// Tell resident variants the console's address and syscall port.
-    pub fn set_resident(&mut self, ip: [u8; 4], port: u16) {
+    /// Serve the resident image for `target`, telling it the console's address
+    /// and syscall port (it has no DHCP); the universal image for every other
+    /// base: the hops, which show a screen and may need DHCP.
+    pub fn use_resident(&mut self, target: u32, ip: [u8; 4], port: u16) {
+        self.resident_at = Some(target);
         self.resident = Some((ip, port));
     }
 
-    /// Have the core copy itself to `shadow` at EXEC (high RAM the title leaves
-    /// alone until it first calls the GD driver).
-    pub fn set_core_shadow(&mut self, shadow: u32) {
-        self.core_shadow = Some(shadow);
+    /// Is the resident image the one served for `base`?
+    pub fn resident_for(&self, base: u32) -> bool {
+        self.resident_at == Some(base) && self.has_resident()
     }
 
-    /// The variant asked for, if `base` is its target.
-    pub fn variant_for(&self, base: u32) -> Option<crate::variants::Variant> {
-        self.variant.filter(|&(_, t)| t == base).map(|(v, _)| v)
+    /// The resident image, if `make loaders` built it.
+    pub fn resident_path(&self) -> Option<PathBuf> {
+        let p = self.dir.join(RESIDENT_NAME);
+        p.is_file().then_some(p)
     }
 
-    /// Is the file of the variant for `base` here?
-    pub fn has_variant(&self, v: &crate::variants::Variant) -> bool {
-        self.dir.join(v.file_name()).is_file()
+    pub fn has_resident(&self) -> bool {
+        self.resident_path().is_some()
     }
 
-    /// The variant's image for `base`: relocated (a HIGH variant), or as it is
-    /// (the CORE, pinned), with the console's address written in.
-    pub fn variant_image(
-        &self,
-        v: &crate::variants::Variant,
-        base: u32,
-    ) -> Result<(Vec<u8>, String), String> {
-        let p = self.dir.join(v.file_name());
+    /// The resident image relocated to `base`, the console's address written in.
+    pub fn resident_image(&self, base: u32) -> Result<(Vec<u8>, String), String> {
+        let p = self
+            .resident_path()
+            .ok_or_else(|| format!("no {RESIDENT_NAME} in {}", self.dir.display()))?;
         let bytes = std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-        let (mut image, label) = if v.core {
-            if base != DEFAULT_BASE {
-                return Err(format!("the core is pinned at 0x{DEFAULT_BASE:08x}, not 0x{base:08x}"));
-            }
-            (bytes, p.display().to_string())
-        } else {
-            (
-                relocate(&bytes, base)?,
-                format!("{} relocated to 0x{base:08x}", p.display()),
-            )
-        };
-        if let Some((ip, port)) = self.resident {
-            crate::variants::patch_resident(&mut image, ip, port)?;
-        }
-        if let (true, Some(shadow)) = (v.core, self.core_shadow) {
-            if !crate::variants::patch_core_shadow(&mut image, shadow)? {
-                log::warn!(
-                    "{} has no `core_shadow`: a title whose boot code runs at \
-                     0x8c004000 will overwrite it (rebuild with `make loaders`)",
-                    p.display()
-                );
-            }
-        }
-        Ok((image, label))
+        let mut image = relocate(&bytes, base)?;
+        let (ip, port) = self
+            .resident
+            .ok_or("the resident image needs the console's address, and none was given")?;
+        crate::variants::patch_resident(&mut image, ip, port)?;
+        Ok((image, format!("{} relocated to 0x{base:08x}", p.display())))
     }
 
     pub fn dir(&self) -> &Path {
@@ -1278,9 +1248,8 @@ impl LoaderSet {
     /// whole point of it: the set stops being a menu of addresses someone
     /// thought of in advance. Both families, since 2026-08-28.
     pub fn can_provide(&self, base: u32) -> bool {
-        if let Some(v) = self.variant_for(base) {
-            return self.has_variant(&v)
-                && if v.core { base == DEFAULT_BASE } else { is_high(base) && could_relocate_to(base) };
+        if self.resident_for(base) {
+            return is_high(base) && could_relocate_to(base);
         }
         if self.has(base) {
             return true;
@@ -1310,8 +1279,8 @@ impl LoaderSet {
     /// relocatable image is moved in memory -- see `relocate`, which reproduces
     /// a native link byte for byte.
     pub fn image_for(&self, base: u32) -> Result<(Vec<u8>, String), String> {
-        if let Some(v) = self.variant_for(base) {
-            return self.variant_image(&v, base);
+        if self.resident_for(base) {
+            return self.resident_image(base);
         }
         if self.has(base) {
             let p = self.path_for(base);
@@ -1345,11 +1314,8 @@ impl LoaderSet {
     /// `None` when there is no image to read or it carries no symbols: the
     /// caller must then skip the test rather than assume either answer.
     pub fn image_end_for(&self, base: u32) -> Option<u32> {
-        if let Some(v) = self.variant_for(base) {
-            let bytes = std::fs::read(self.dir.join(v.file_name())).ok()?;
-            if v.core {
-                return crate::variants::footprint_from_elf(&bytes).ok().map(|f| f.resident_end);
-            }
+        if self.resident_for(base) {
+            let bytes = std::fs::read(self.resident_path()?).ok()?;
             let syms = symbols(&bytes).ok()?;
             let end = syms.get("end")?.0;
             let linked_at = syms.get("dcload_base")?.0;
@@ -1538,17 +1504,16 @@ fn physical(addr: u32) -> u32 {
 /// chainload.
 pub fn overlapping_range(base: u32, image: (u32, u32)) -> Option<(u32, u32)> {
     let (lo, hi) = (physical(image.0), physical(image.1));
-    crate::variants::live_ranges(base)
+    live_footprint(base)
         .into_iter()
         .find(|range| physical(range.0) < hi && lo < physical(range.1))
 }
 
-/// `overlapping_range` for what a TITLE can reach while it runs: what survives
-/// under it, not the loader's start-up buffers (a CORE's Maple buffer and
-/// main-loop stack are the title's ground once it runs).
+/// `overlapping_range` for what a TITLE can reach while it runs. The same
+/// ranges: every part of a loader survives under a title.
 pub fn overlapping_under_title(base: u32, image: (u32, u32)) -> Option<(u32, u32)> {
     let (lo, hi) = (physical(image.0), physical(image.1));
-    crate::variants::under_title_ranges(base)
+    live_footprint(base)
         .into_iter()
         .find(|range| physical(range.0) < hi && lo < physical(range.1))
 }
@@ -2283,12 +2248,12 @@ mod tests {
         payload.extend_from_slice(&0u32.to_be_bytes()); // VGA
         let old = parse_version_payload(&payload, payload.len());
         assert_eq!(old.variant, None, "a loader that sends no word is not guessed");
-        let word = 0xA500_0000u32 | 2 | 1 << 4 | 1 << 9 | 1 << 12 | 1 << 13;
+        let word = 0xA500_0000u32 | 1 | 1 << 9 | 1 << 10 | 1 << 12 | 1 << 13;
         payload.extend_from_slice(&word.to_be_bytes());
         let r = parse_version_payload(&payload, payload.len());
         assert_eq!(r.base, Some(0x8ce0_0000));
         let v = r.variant.expect("variant");
-        assert!(v.is_core() && v.resident && v.bba && v.disc && !v.cdda);
+        assert!(v.layout == 1 && v.resident && v.bba && v.lan && v.disc && !v.cdda);
     }
 
     #[test]

@@ -47,6 +47,9 @@ pub(super) struct SectorServer<'a> {
     /// Closest a read has come to the loader, and whether that was said.
     nearest_read: u32,
     warned_near: bool,
+    /// The loader was taken out of the title's own heap, which now starts
+    /// right above it: a read landing there is no near miss.
+    out_of_heap: bool,
     /// Groups reads into loading bursts for the bar; also sets the poll timeout.
     pub(super) load: ui::LoadMonitor,
 }
@@ -56,6 +59,7 @@ impl<'a> SectorServer<'a> {
         toc_start: u32,
         toc_sectors: u32,
         running_base: Option<u32>,
+        out_of_heap: bool,
         guards: &'a [GuardWord],
         memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
         stage: Vec<(u32, u32)>,
@@ -72,6 +76,7 @@ impl<'a> SectorServer<'a> {
             warned_overlap: HashSet::new(),
             nearest_read: u32::MAX,
             warned_near: false,
+            out_of_heap,
             load: ui::LoadMonitor::new(),
         }
     }
@@ -103,7 +108,7 @@ impl<'a> SectorServer<'a> {
         } else {
             start
         };
-        debug!(
+        trace!(
             "Received ReadSector syscall: start=0x{:08x}, dc_address=0x{:08x}, size={}",
             start, dc_address, size
         );
@@ -156,7 +161,7 @@ impl<'a> SectorServer<'a> {
             _ => dc_address,
         };
         if self.logged_lbas.insert(start) && buf.len() >= 8 {
-            debug!(
+            trace!(
                 "ReadSector LBA=0x{start:08x} first8={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                 buf[0],
                 buf[1],
@@ -212,7 +217,9 @@ impl<'a> SectorServer<'a> {
                     );
                 } else {
                     debug!(
-                        "ReadSector LBA 0x{start:08x}: answer sent in {:.2} ms",
+                        "ReadSector LBA 0x{start:08x} -> 0x{dc_address:08x} ({} bytes): \
+                         answer sent in {:.2} ms",
+                        buf.len(),
                         total.as_secs_f64() * 1000.0
                     );
                 }
@@ -284,7 +291,7 @@ impl<'a> SectorServer<'a> {
             if gap < self.nearest_read {
                 self.nearest_read = gap;
             }
-            if !self.warned_near && self.nearest_read < TOO_NEAR {
+            if !self.warned_near && !self.out_of_heap && self.nearest_read < TOO_NEAR {
                 self.warned_near = true;
                 warn!(
                     "this title's disc reads come within {} KB of the \

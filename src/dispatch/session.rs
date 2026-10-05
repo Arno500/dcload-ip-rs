@@ -335,47 +335,41 @@ pub fn ensure_loader_base(
     want: u32,
 ) -> DcResult<u32> {
     let now = ensure_loader_base_inner(conn, loaders, running, want)?;
-    // What is in control NOW decides what the host may assume about RAM: a
-    // core owns the system hole and nothing in high RAM (variants.rs).
+    // What is in control NOW decides where the host reads its symbols from:
+    // the resident image's are not the universal one's (variants.rs).
     if let Ok(reply) = query_loader(conn) {
         note_running_loader(loaders, &reply);
     }
     Ok(now)
 }
 
-/// Record what the running loader's own ELF says it owns, when it is a core
-/// (`variants::set_active`); anything else is described by `layout()`.
+/// Remember which image the running loader is, when it is the resident one:
+/// its symbols (the counters, the GD entry, the staging buffers) are not at the
+/// universal image's addresses (`variants::set_running_image`).
 pub fn note_running_loader(
     loaders: &crate::loaders::LoaderSet,
     reply: &crate::loaders::VersionReply,
 ) {
-    // The variant VERS names, read from its own file (a core's or a HIGH
-    // variant's symbols are not the universal image's).
-    let image = match (reply.variant.and_then(|w| w.variant()), reply.base) {
-        (Some(v), Some(base)) => match loaders.variant_image(&v, base) {
-            Ok((bytes, label)) => Some((base, bytes, label)),
+    let image = match (reply.variant.filter(|w| w.resident), reply.base) {
+        (Some(_), Some(base)) => match loaders
+            .resident_path()
+            .ok_or_else(|| format!("no {} here", crate::loaders::RESIDENT_NAME))
+            .and_then(|p| {
+                let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
+                crate::loaders::relocate(&bytes, base)
+                    .map(|b| (base, b, format!("{} at 0x{base:08x}", p.display())))
+            }) {
+            Ok(image) => Some(image),
             Err(e) => {
                 warn!(
-                    "the running loader is {} at 0x{base:08x}, but its file cannot be \
-                     read ({e}); symbols will come from the universal image",
-                    v.label()
+                    "the running loader is the resident image at 0x{base:08x}, but it cannot \
+                     be read ({e}); symbols will come from the universal image"
                 );
                 None
             }
         },
         _ => None,
     };
-    let footprint = image
-        .as_ref()
-        .and_then(|(_, bytes, _)| crate::variants::footprint_from_elf(bytes).ok())
-        .filter(|fp| fp.is_core());
-    if let Some(fp) = &footprint {
-        info!(
-            "a core loader is running: resident to 0x{:08x}, IP.BIN room {} bytes",
-            fp.resident_end, fp.ipbin_room
-        );
-    }
-    crate::variants::set_active(footprint);
     crate::variants::set_running_image(image);
 }
 
@@ -554,7 +548,7 @@ fn ensure_loader_base_inner(
             warn!("staying at 0x{current:08x}");
             return Ok(current);
         };
-        info!("chainloading dcload to 0x{:08x} ({label})", hop);
+        debug!("chainloading dcload to 0x{:08x} ({label})", hop);
         let entry = match upload_bytes(conn, &bytes, &label, hop, Some(current)) {
             Ok((entry, _)) => entry,
             Err(e) => {
@@ -594,10 +588,10 @@ pub fn load_ip_bin(
     const IP_BIN_ADDR: u32 = 0x0c008000;
 
     // How much of 0x8c008000 the running loader leaves to the IP.BIN: all of it
-    // for a high loader, only the header's room for a CORE (its code is on both
-    // sides of the hole), nothing for a low loader whose image covers it.
+    // for a high loader, nothing for a low loader whose image covers it.
     let room = match running_base {
-        Some(base) => crate::variants::ipbin_room(base) as usize,
+        Some(base) if crate::loaders::is_high(base) => 2048,
+        Some(_) => 0,
         None => {
             warn!("the loader does not report where it is; not loading IP.BIN");
             return Ok(false);
@@ -610,14 +604,6 @@ pub fn load_ip_bin(
         );
         return Ok(false);
     }
-    if full && room < 2048 {
-        warn!(
-            "the loader leaves {room} bytes of the IP.BIN region; the full bootstrap \
-             cannot be loaded, only the header"
-        );
-        return Ok(false);
-    }
-
     if !full {
         let mut sector = crate::disc_formats::types::find_ip_bin(disc).ok_or_else(|| {
             std::io::Error::other(format!("{disc_path}: no IP.BIN header to load"))
@@ -627,7 +613,7 @@ pub fn load_ip_bin(
         }
         sector.truncate(room);
 
-        info!(
+        debug!(
             "IP.BIN header -> 0x{IP_BIN_ADDR:08x} ({} bytes), as isoldr does on a direct boot",
             sector.len()
         );

@@ -135,11 +135,28 @@ fn send_data_one(
                 }
                 continue;
             }
-            if cmds.iter().any(|c| {
-                c.cmd.as_ref().is_some_and(|inner| {
-                    matches!(inner.cmd, DCLoadCmds::LoadBinary()) && inner.address == address
+            // The first batch may be the leftover of an earlier exchange (the
+            // DoneBinary that ends a read-back): look at what follows before
+            // sending the LoadBinary again, or its second echo is left over in
+            // turn.
+            let echo = |cmds: &[DCReturnCmd]| {
+                cmds.iter().any(|c| {
+                    c.cmd.as_ref().is_some_and(|inner| {
+                        matches!(inner.cmd, DCLoadCmds::LoadBinary()) && inner.address == address
+                    })
                 })
-            }) {
+            };
+            let mut seen = echo(&cmds);
+            for _ in 0..3 {
+                if seen {
+                    break;
+                }
+                match await_result(conn, Some(Duration::from_millis(100))) {
+                    Ok(more) => seen = echo(&more),
+                    Err(_) => break,
+                }
+            }
+            if seen {
                 acked = true;
                 break;
             }
@@ -400,11 +417,23 @@ fn chunk_is_ours(address: u32, size: usize, chunk_addr: u32, chunk_len: usize) -
         && chunk_len == CHUNK_SIZE.min(size - offset)
 }
 
+/// Does this DoneBinary end THIS read? The loader names the range it served;
+/// an older one sends 0/0, accepted as before.
+fn done_is_ours(address: u32, size: usize, done: &DCLoadCmd) -> bool {
+    (done.address == address && done.size as usize == size) || (done.address == 0 && done.size == 0)
+}
+
 /// The commands in the next batch from the console. An error is logged and
 /// reads as an empty batch.
 fn next_cmds(conn: &mut impl ExternalDcIo, timeout: Option<Duration>) -> Vec<DCLoadCmd> {
     match await_result(conn, timeout) {
         Ok(cmds) => cmds.into_iter().filter_map(|c| c.cmd).collect(),
+        // A timeout is what the repair passes are for; they report a read
+        // that never completes.
+        Err(e) if is_timeout(&*e) => {
+            debug!("read-back: nothing within {:?}", timeout.unwrap_or_default());
+            vec![]
+        }
         Err(e) => {
             warn!("Error waiting for data chunk: {}", e);
             vec![]
@@ -469,15 +498,18 @@ pub fn receive_data(
             match &cmd.cmd {
                 DCLoadCmds::SendBinary(Some(chunk)) => match read.store(&cmd, &chunk[..]) {
                     Some(n) => bar.inc(n as u64),
-                    None => warn!(
+                    None => debug!(
                         "chunk at 0x{:08x}+{} is not an answer to the \
                          read-back of 0x{:08x}+{}, ignoring",
                         cmd.address, cmd.size, address, size
                     ),
                 },
-                DCLoadCmds::DoneBinary() => {
+                DCLoadCmds::DoneBinary() if done_is_ours(address, size, &cmd) => {
                     saw_done = true;
                     break;
+                }
+                DCLoadCmds::DoneBinary() => {
+                    trace!("DoneBinary for 0x{:08x}+{} left over, ignoring", cmd.address, cmd.size)
                 }
                 _ => warn!("Unexpected command received while waiting for data: {:?}", cmd),
             }
@@ -502,51 +534,25 @@ pub fn receive_data(
         passes += 1;
         for i in read.missing() {
             debug!("Missing chunk {}", i);
-            let len = if size.is_multiple_of(CHUNK_SIZE) {
-                CHUNK_SIZE as u32
-            } else {
-                size as u32 - (i as u32 * CHUNK_SIZE as u32)
-            };
+            let len = CHUNK_SIZE.min(size - i * CHUNK_SIZE) as u32;
             let at = address + (i as u32 * CHUNK_SIZE as u32);
             conn.send_command(DCLoadCmd::new(DCLoadCmds::SendBinaryQuiet(None), at, len))?;
 
             for cmd in next_cmds(conn, timeout) {
                 match &cmd.cmd {
-                    DCLoadCmds::SendBinary(Some(chunk)) => {
-                        let Some(n) = read.store(&cmd, &chunk[..]) else {
-                            warn!(
-                                "chunk at 0x{:08x}+{} is not an answer to \
-                                 the re-request of 0x{:08x}+{}, ignoring",
-                                cmd.address, cmd.size, address, size
-                            );
-                            continue;
-                        };
-                        bar.inc(n as u64);
-                        // Then its DoneBinary, or the late first answer to this chunk.
-                        for late in next_cmds(conn, timeout) {
-                            match late.cmd {
-                                DCLoadCmds::DoneBinary() => {}
-                                DCLoadCmds::SendBinary(Some(_))
-                                    if chunk_is_ours(
-                                        address,
-                                        size,
-                                        late.address,
-                                        late.size as usize,
-                                    ) =>
-                                {
-                                    debug!(
-                                        "duplicate answer for 0x{:08x}+{} ignored",
-                                        late.address, late.size
-                                    );
-                                }
-                                _ => warn!(
-                                    "Unexpected command received after receiving data: {:?}",
-                                    late
-                                ),
-                            }
-                        }
-                    }
-                    DCLoadCmds::DoneBinary() => break,
+                    DCLoadCmds::SendBinary(Some(chunk)) => match read.store(&cmd, &chunk[..]) {
+                        Some(n) => bar.inc(n as u64),
+                        // A late duplicate of an earlier answer, or of another read.
+                        None => debug!(
+                            "chunk at 0x{:08x}+{} is not an answer to \
+                             the re-request of 0x{:08x}+{}, ignoring",
+                            cmd.address, cmd.size, address, size
+                        ),
+                    },
+                    // Its terminator. Waiting for one more batch after the
+                    // chunk cost a whole timeout whenever the two came together.
+                    DCLoadCmds::DoneBinary() if done_is_ours(at, len as usize, &cmd) => break,
+                    DCLoadCmds::DoneBinary() => {}
                     _ => warn!("Unexpected command received while waiting for data: {:?}", cmd),
                 }
             }

@@ -239,7 +239,7 @@ pub(super) fn declare_vga_and_say_so(header: &mut [u8]) {
             "--vga: IP.BIN peripherals 0x{before:07X} -> 0x{after:07X}, declaring VGA box support"
         ),
         Some((before, _)) => {
-            info!("--vga: IP.BIN already declares VGA box support (peripherals 0x{before:07X})")
+            debug!("--vga: IP.BIN already declares VGA box support (peripherals 0x{before:07X})")
         }
         None => warn!(
             "--vga: IP.BIN's peripheral field is not the hex string it should be; \
@@ -255,7 +255,7 @@ pub(super) fn declare_vga_and_say_so(header: &mut [u8]) {
 /// overwrites the loader with nothing reported anywhere, so this is checked
 /// before the title runs. A literal counts only when a `mov.l @(disp,PC)` loads it.
 pub fn literals_in_loader_footprint(buf: &[u8], address: u32, base: u32) -> Vec<(u32, u32)> {
-    loaded_literals_in(buf, address, &crate::variants::exclusive_ranges(base))
+    loaded_literals_in(buf, address, &crate::loaders::exclusive_footprint(base))
 }
 
 /// Constants naming RAM inside `ranges` (P1, `hi` exclusive) that an
@@ -418,7 +418,7 @@ pub fn apply_patches(
         let after = read_word(conn, addr);
 
         match (before, after) {
-            (_, Some(got)) if got == value => info!(
+            (_, Some(got)) if got == value => debug!(
                 "patch: 0x{addr:08x} = 0x{value:08x}, verified (was {})",
                 before.map_or("unreadable".to_string(), |b| format!("0x{b:08x}"))
             ),
@@ -564,7 +564,7 @@ pub fn update_dcload_magic(
         let span = (base & 0x1fff_ffff)..(base & 0x1fff_ffff) + crate::loaders::LOADER_SPAN;
         match read_word(conn, phys(base + 8)) {
             Some(syscall) if span.contains(&(syscall & 0x1fff_ffff)) => {
-                info!(
+                debug!(
                     "dcload magic at 0x{magic_at:08x} pointed at the loader at 0x{base:08x} \
                      (syscalls -> 0x{syscall:08x}), not at the dead image the CD booted"
                 );
@@ -577,7 +577,7 @@ pub fn update_dcload_magic(
             ),
         }
     }
-    info!(
+    debug!(
         "dcload magic at 0x{magic_at:08x} cleared: the loader is at 0x{base:08x}, and what \
          is left at 0x{stock:08x} is the dead image the CD booted"
     );

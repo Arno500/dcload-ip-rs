@@ -15,6 +15,7 @@ pub fn receive_syscalls(
     cd_disc: Option<Box<dyn DiscFormat>>,
     mount: Option<String>,
     running_base: Option<u32>,
+    out_of_heap: bool,
     guards: &[GuardWord],
     cdda: CddaSource,
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
@@ -41,7 +42,7 @@ pub fn receive_syscalls(
         );
     } else {
         let audio = toc_all_tracks.iter().filter(|t| t.audio).count();
-        info!(
+        debug!(
             "disc has {} tracks, {audio} of them audio",
             toc_all_tracks.len()
         );
@@ -61,7 +62,15 @@ pub fn receive_syscalls(
     fs_syscall_state.opendirs.resize_with(256, || None);
     fs_syscall_state.openfiles.resize_with(256, || None);
     let mut sectors =
-        SectorServer::new(toc_start, toc_sectors, running_base, guards, memory, stage);
+        SectorServer::new(
+        toc_start,
+        toc_sectors,
+        running_base,
+        out_of_heap,
+        guards,
+        memory,
+        stage,
+    );
     let mut audio = AudioServer::new(cdda);
     let mut swap = swap_requests.map(DiscSwap::new);
     if let Some(s) = swap.as_ref() {

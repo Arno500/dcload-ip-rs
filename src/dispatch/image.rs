@@ -44,7 +44,7 @@ pub fn open_disc(spec: &str) -> Result<Box<dyn DiscFormat>, String> {
                 })?,
             None => pick_zip_image(&archive, path_str)?,
         };
-        info!("{path_str}: reading '{member}' from inside the archive");
+        debug!("{path_str}: reading '{member}' from inside the archive");
         return open_zip_member(archive, &member);
     }
 

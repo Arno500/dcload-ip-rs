@@ -103,26 +103,13 @@ struct Args {
     #[arg(long)]
     no_relocate: bool,
 
-    /// Which loader image of the set to chainload: `auto` takes the variant
-    /// made for this console's network adapter, this kind of title and this
-    /// disc's CD audio (`dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf`,
-    /// no start-up screen, no DHCP), `universal` always the one image that
-    /// serves everything (`dcload-relocatable.elf`). A missing file falls back
-    /// to the universal image either way.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "universal"])]
-    loader_variant: String,
-
-    /// Put the CORE loader in the system hole under 0x8c00c000 (nothing in high
-    /// RAM), for a Katana title that fills high RAM and overwrites any loader
-    /// there (Shenmue II after a disc swap). Without this the host picks it
-    /// only on evidence: a stack depth and a busy RAM map learned by earlier
-    /// sessions.
-    #[arg(long, conflicts_with = "no_loader_core")]
-    loader_core: bool,
-
-    /// Never use the CORE loader, whatever the evidence.
-    #[arg(long)]
-    no_loader_core: bool,
+    /// Which loader image the title runs on: `resident` (default) is
+    /// `dcload-resident.elf`, the loader without its screen and DHCP, told the
+    /// console's address by the host; `universal` keeps `dcload-relocatable.elf`,
+    /// which every hop uses anyway. A missing file falls back to the universal
+    /// image.
+    #[arg(long, default_value = "resident", value_parser = ["resident", "universal"])]
+    loader_image: String,
 
     /// Poke a 32-bit word into RAM after the title is uploaded and just before
     /// it runs: `--patch 0x8c0c0d6c=0x0009000b` (that word is `rts; nop`, i.e.
@@ -432,7 +419,7 @@ fn resolve_payload(
     };
     if let Some(boot) = boot {
         info!(
-            "{file}: booting {} ({} bytes, LBA {})",
+            "{file}: booting {} ({}, LBA {})",
             boot.name,
             indicatif::HumanBytes(boot.bytes.len() as u64),
             boot.lba
@@ -991,166 +978,42 @@ fn console_ip(host: &str) -> Option<[u8; 4]> {
     })
 }
 
-/// How many of the top 64 blocks of RAM (0x8cc00000..0x8d000000) a title's
-/// learned map has marked: how busy high RAM is for it.
-fn high_busy_blocks(map: &memmap::MemoryMap) -> u32 {
-    (memmap::BLOCKS - 64..memmap::BLOCKS).filter(|&b| map.is_marked(b)).count() as u32
-}
-
-/// Choose the loader VARIANT for the title and the base it goes to
-/// (AGENTS.md 4.18, 4.19). Returns the base to chainload to: `base` itself,
-/// or 0x8c004000 when the CORE is chosen. The set is told which variant to
-/// serve for that base; every other base (the hops) stays the universal image.
+/// Choose the image the title's loader is (loader AGENTS.md 4.18): the
+/// resident one for a disc image's title at a high base, the universal one
+/// otherwise. The hops stay universal: they show a screen and may need DHCP.
 ///
-/// Anything that stops a variant -- no adapter in VERS, no disc, a boot binary
-/// that cannot be read, no IPv4 address for the console, a missing file -- is
-/// the universal image, which is what ran before variants existed.
-fn choose_variant(
-    args: &Args,
-    loaders: &mut loaders::LoaderSet,
-    reply: &loaders::VersionReply,
-    disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
-    base: u32,
-) -> u32 {
-    use variants::{Driver, TitleFacts};
-    if args.loader_variant == "universal" || args.no_relocate {
-        return base;
+/// Anything that stops it -- no disc, a low base, a probe, no IPv4 address for
+/// the console, no file -- is the universal image, said in the log.
+fn choose_loader_image(args: &Args, loaders: &mut loaders::LoaderSet, has_disc: bool, base: u32) {
+    if args.loader_image == "universal" || args.no_relocate {
+        return;
     }
-    if !args.probe.is_empty() {
-        // A probe reports through the loader's syscall trampoline, which only
-        // the universal image (and KOS's) still serves.
-        debug!("loader variant: --probe needs the universal image");
-        return base;
-    }
-    let (Some((disc, disc_path)), Some(driver)) = (
-        disc,
-        reply.adapter.and_then(Driver::from_installed),
-    ) else {
-        debug!("loader variant: no disc or no adapter in VERS; the universal image");
-        return base;
+    let why_not = if !has_disc {
+        Some("not a disc image".to_string())
+    } else if !args.probe.is_empty() {
+        // A probe reports through the loader's syscall trampoline.
+        Some("--probe".to_string())
+    } else if !loaders::is_high(base) {
+        Some(format!("0x{base:08x} is a low base"))
+    } else if !loaders.has_resident() {
+        Some(format!("no {} in {}", loaders::RESIDENT_NAME, loaders.dir().display()))
+    } else {
+        None
     };
+    if let Some(why) = why_not {
+        debug!("loader image: the universal one ({why})");
+        return;
+    }
     let Some(ip) = console_ip(&args.host) else {
         warn!(
-            "loader variant: cannot resolve {} to an IPv4 address, which a resident \
+            "loader image: cannot resolve {} to an IPv4 address, which the resident \
              loader needs (it has no DHCP); using the universal image",
             args.host
         );
-        return base;
+        return;
     };
-    let boot = match disc_formats::boot::extract(disc, args.descramble.into(), args.wince_mode()) {
-        Ok(b) => b,
-        Err(e) => {
-            debug!("loader variant: boot binary unreadable ({e}); the universal image");
-            return base;
-        }
-    };
-    let facts = TitleFacts {
-        kos: dispatch::is_kos_binary(&boot.bytes),
-        wince: boot.wince && boot.skipped > 0,
-        audio: !args.no_cdda && disc.toc_tracks().iter().any(|t| t.audio),
-    };
-    loaders.set_resident(ip, args.port);
-
-    // A base taken out of the title's own heap is a place made for the loader:
-    // the core would sit in the system hole, which such a title may keep for
-    // itself (Shenmue II's kernel and debug monitor live there).
-    let heap_base = !args.no_heap_guard
-        && dispatch::hlib_heap(&boot.bytes, args.address).and_then(|h| h.loader_base()) == Some(base);
-    if heap_base && !args.loader_core {
-        debug!("loader variant: not the core: the loader has a place in the title's heap");
-    }
-
-    // THE CORE, on evidence.
-    if !args.no_loader_core && (!heap_base || args.loader_core) {
-        let core = variants::pick_variant(driver, &facts, true);
-        if loaders.has_variant(&core) {
-            let verdict = (|| -> Result<(), String> {
-                let (bytes, _) = loaders.variant_image(&core, loaders::DEFAULT_BASE)?;
-                let fp = variants::footprint_from_elf(&bytes)?;
-                let painted = fill_over_image(
-                    loaders::DEFAULT_BASE,
-                    fp.resident_end,
-                    &dispatch::constant_range_fills(&boot.bytes, args.address),
-                )
-                .map(|(lo, hi, site)| {
-                    painted_reason(loaders::DEFAULT_BASE, (lo, hi, site, fp.resident_end))
-                });
-                let (sp_min, busy) = match dispatch::identify(disc, disc_path) {
-                    Ok(id) => {
-                        let db = memmap::MemoryDb::load(&memory_db_path(args, loaders));
-                        let row = db.get(&id.md5);
-                        (
-                            row.as_ref().and_then(|r| r.sp_min),
-                            row.as_ref().map(|r| high_busy_blocks(&r.map)),
-                        )
-                    }
-                    Err(_) => (None, None),
-                };
-                variants::core_verdict(
-                    &facts,
-                    fp.resident_end,
-                    sp_min,
-                    painted,
-                    busy,
-                    args.loader_core,
-                )
-            })();
-            match verdict {
-                Ok(()) => {
-                    info!(
-                        "loader variant: {} at 0x{:08x} -- the title's RAM is left whole, \
-                         nothing of the loader in high RAM",
-                        core.label(),
-                        loaders::DEFAULT_BASE
-                    );
-                    // The high base this title would have had is free until its
-                    // first GD call: the core's copy waits there, for boot code
-                    // that runs over the system hole.
-                    if loaders::is_high(base) {
-                        info!(
-                            "loader variant: the core's shadow at 0x{base:08x}, restored \
-                             on the title's first BIOS call"
-                        );
-                        loaders.set_core_shadow(base);
-                    } else {
-                        warn!(
-                            "loader variant: no high base for the core's shadow; a title \
-                             that runs its boot code at 0x8c004000 will overwrite the core"
-                        );
-                    }
-                    loaders.use_variant(core, loaders::DEFAULT_BASE);
-                    return loaders::DEFAULT_BASE;
-                }
-                Err(why) if args.loader_core => {
-                    error!("--loader-core: not usable for this title: {why}; going on without it");
-                }
-                Err(why) => debug!("loader variant: not the core: {why}"),
-            }
-        } else if args.loader_core {
-            error!(
-                "--loader-core: {} is not in {}; run `make loaders`",
-                core.file_name(),
-                loaders.dir().display()
-            );
-        }
-    }
-
-    // A HIGH variant for a high base (a low base is the universal image).
-    if loaders::is_high(base) {
-        let v = variants::pick_variant(driver, &facts, false);
-        if loaders.has_variant(&v) {
-            info!("loader variant: {} at 0x{base:08x}", v.label());
-            if facts.audio {
-                debug!("this disc has audio: a disc swapped in later still plays it");
-            } else {
-                debug!("no audio tracks on this disc: a swap to a disc with some plays none");
-            }
-            loaders.use_variant(v, base);
-        } else {
-            debug!("loader variant: {} is not in the set; the universal image", v.file_name());
-        }
-    }
-    base
+    loaders.use_resident(base, ip, args.port);
+    info!("loader image: resident (no screen, no DHCP) at 0x{base:08x}");
 }
 
 fn wanted_loader_base(
@@ -1348,7 +1211,7 @@ fn wanted_loader_base(
     // directory including the ones it was about to load from -- a line whose
     // entire purpose is to answer "which loaders were actually there" giving
     // the one answer that is never right. "none" now means nothing is there.
-    info!("loader candidates in {}: {}", loaders.dir().display(), {
+    debug!("loader candidates in {}: {}", loaders.dir().display(), {
         let mut parts: Vec<String> = loaders
             .available()
             .iter()
@@ -1374,19 +1237,19 @@ fn wanted_loader_base(
     // `None` until some session has read it back off the console.
     let sp_min = seen_db.get(&identity.md5).and_then(|r| r.sp_min);
     if let Some(sp) = sp_min {
-        info!(
+        debug!(
             "this title has been seen entering GD syscalls with a stack pointer as low \
              as 0x{sp:08x}"
         );
     }
     match seen.as_ref() {
-        Some(m) => info!(
+        Some(m) => debug!(
             "memory map: this title has been seen using {} of 256 blocks of RAM ({}, {} games)",
             m.blocks_marked(),
             memory_path.display(),
             seen_db.len()
         ),
-        None => info!(
+        None => debug!(
             "memory map: nothing recorded for this game yet ({}, {} games); \
              this session will start one",
             memory_path.display(),
@@ -1944,7 +1807,7 @@ fn running_loader_image(args: &Args, base: u32) -> Result<(Vec<u8>, String), Str
     type Cached = (u32, Result<(Vec<u8>, String), String>);
     static LAST: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
     if let Some(image) = variants::running_image(base) {
-        // Not cached: VERS says which variant runs, and that can change.
+        // Not cached: VERS says which image runs, and that can change.
         return Ok(image);
     }
     let mut last = LAST.lock().expect("loader image cache poisoned");
@@ -2232,10 +2095,6 @@ fn start_marks(
         debug!("no memory marks: Windows CE's kernel owns this RAM, and its loader's place is fixed");
         return None;
     }
-    if variants::core_running(base) {
-        debug!("no memory marks: the core loader does not serve MARK, and keeps nothing in high RAM");
-        return None;
-    }
     let known = if args.mark_all {
         memmap::MemoryMap::new()
     } else {
@@ -2248,7 +2107,7 @@ fn start_marks(
     let t = std::time::Instant::now();
     match marks::paint(conn, &blocks) {
         Ok(()) => {
-            info!(
+            debug!(
                 "memory marks: {} blocks of 64 KB above the title's image painted in {:.0} ms; \
                  the ones it writes will be recorded as used",
                 blocks.len(),
@@ -3116,22 +2975,24 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let reply_info = reply.clone();
     let version_text = reply.text;
     let mut running_base = reply.base;
-    info!(
-        "Successfully connected to dcload-ip on host {} using port {}",
-        args.host, args.port
-    );
-    match reply.cable {
-        Some(cable) => info!("video cable: {}", cable.name()),
+    let cable = match reply.cable {
+        Some(cable) => format!(", {} cable", cable.name()),
         // Not a warning: it only matters if --vga auto is asked for something,
         // and the decision itself says so when it is.
-        None => debug!("this loader does not report which video cable is plugged in"),
-    }
+        None => {
+            debug!("this loader does not report which video cable is plugged in");
+            String::new()
+        }
+    };
     match running_base {
-        Some(base) => info!("dcload-ip version: {} (loaded at 0x{:08x})", version_text, base),
+        Some(base) => info!(
+            "connected to {}:{}: {version_text}, loaded at 0x{base:08x}{cable}",
+            args.host, args.port
+        ),
         None => info!(
-            "dcload-ip version: {} (does not report its load address; \
-             this build cannot be relocated per game)",
-            version_text
+            "connected to {}:{}: {version_text}{cable} (does not report its load \
+             address; this build cannot be relocated per game)",
+            args.host, args.port
         ),
     }
 
@@ -3182,8 +3043,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // than as the wrong loader running. `want == running` costs one round trip
     // and no upload when the image already matches.
     let mut loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
-    // A core already running owns the system hole, not high RAM: say so before
-    // anything is placed or uploaded.
+    // A resident image already running: its symbols come from its own file.
     dispatch::note_running_loader(&loaders, &reply_info);
     if matches!(args.command, Commands::UExec { .. })
         && let Some(want) = wanted_loader_base(
@@ -3193,13 +3053,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
         .or(running_base)
     {
-        let want = choose_variant(
-            &args,
-            &mut loaders,
-            &reply_info,
-            disc_reader.as_deref().zip(redirect_disc.as_deref()),
-            want,
-        );
+        choose_loader_image(&args, &mut loaders, disc_reader.is_some(), want);
         match running_base {
             Some(base) => {
                 match dispatch::ensure_loader_base(&mut udpsender, &loaders, base, want) {
@@ -3389,7 +3243,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             h.start, h.end
                         ),
                         Ok(p) => {
-                            info!(
+                            debug!(
                                 "HLib heap 0x{:08x}..0x{:08x}: taking the loader at 0x{base:08x} \
                                  out of it ({})",
                                 h.start,
@@ -3543,6 +3397,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // `--patch` words inside the image are guarded too: Shenmue II
                 // reloads its main program after the swap to disc 4, and a
                 // poke made once before EXEC came back as the disc has it.
+                // The heap now starts right above the loader: reads landing
+                // there are the title's allocator at work, not a near miss.
+                let loader_out_of_heap = !heap_guard.is_empty();
                 let guards = dispatch::guard_words(
                     &[
                         gaps_guard,
@@ -3616,7 +3473,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             .get(&id.md5)
                             .map(|r| r.map)
                             .unwrap_or_default();
-                        info!("learning this title's memory map into {}", path.display());
+                        debug!("learning this title's memory map into {}", path.display());
                         std::sync::Arc::new(std::sync::Mutex::new(memmap::MemoryRecorder::new(
                             path, &id.md5, &id.title, baseline,
                         )))
@@ -3632,7 +3489,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 if let Some(base) = running_base
                     && let Some(rtt) = measure_rtt(&mut udpsender, base)
                 {
-                    info!(
+                    debug!(
                         "link: round trip {:.2} ms at rest -- what a disc or audio fetch \
                          cannot go below",
                         rtt.as_secs_f64() * 1e3
@@ -3691,6 +3548,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 disc_reader,
                                 mount.clone(),
                                 running_base,
+                                loader_out_of_heap,
                                 &guards,
                                 if args.no_cdda {
                                     dispatch::CddaSource::Off
