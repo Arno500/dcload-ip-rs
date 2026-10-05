@@ -63,6 +63,7 @@ fn hex<'a>(bytes: impl IntoIterator<Item = &'a u8>) -> String {
 }
 
 mod cdda;
+mod heap;
 mod image;
 mod patches;
 mod probes;
@@ -73,6 +74,7 @@ mod syscalls;
 mod transfer;
 
 pub use cdda::*;
+pub use heap::*;
 pub use image::*;
 pub use patches::*;
 pub use probes::*;

@@ -39,7 +39,7 @@ pub(super) struct SectorServer<'a> {
     /// The loader's own staging buffers (`_gd_stage`, `_gd_stage_big`).
     stage: Vec<(u32, u32)>,
     /// Patched words to put back when a read reloads them.
-    guards: &'a [(u32, u32)],
+    guards: &'a [GuardWord],
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     logged_lbas: HashSet<u32>,
     /// Destinations already reported as landing on the loader (said once each).
@@ -56,7 +56,7 @@ impl<'a> SectorServer<'a> {
         toc_start: u32,
         toc_sectors: u32,
         running_base: Option<u32>,
-        guards: &'a [(u32, u32)],
+        guards: &'a [GuardWord],
         memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
         stage: Vec<(u32, u32)>,
     ) -> Self {
@@ -178,6 +178,9 @@ impl<'a> SectorServer<'a> {
                 );
             }
         }
+        let mut buf = buf;
+        self.guard_in_flight(start, dc_address, &mut buf);
+        let buf = buf;
         self.watch_destination(start, dc_address, buf.len() as u32);
         // `send_sectors` fails only if the socket does. No ReturnValue then:
         // the loader times out and asks again rather than take a short buffer.
@@ -194,7 +197,6 @@ impl<'a> SectorServer<'a> {
                 if read_diag().verify {
                     verify_read(conn, start, dc_address, &buf);
                 }
-                self.reapply_guards(conn, start, dc_address, buf.len() as u32);
                 // Tagged with the LBA so the loader can tell this answer from a
                 // late one to an earlier read into the same buffer.
                 let tag = READ_RETVAL_TAG | (wire_start & 0x3fff_ffff);
@@ -299,30 +301,23 @@ impl<'a> SectorServer<'a> {
         }
     }
 
-    /// Re-apply patched words a read has just reloaded from disc, before the
-    /// ReturnValue lets the title run them.
-    fn reapply_guards(&self, conn: &mut impl ExternalDcIo, start: u32, dc_address: u32, len: u32) {
-        let reloaded: Vec<(u32, u32)> = self.guards
-            .iter()
-            .copied()
-            .filter(|&(at, _)| {
-                let lo = dc_address & 0x1fff_ffff;
-                let hi = lo.saturating_add(len);
-                (lo..hi).contains(&(at & 0x1fff_ffff))
-            })
-            .collect();
-        if !reloaded.is_empty() {
-            warn!(
-                "this read reloads {} patched word(s) \
-                 (LBA 0x{start:08x} -> 0x{dc_address:08x}, \
-                 {} B); re-applying them before the title can \
-                 run the bytes just delivered",
-                reloaded.len(),
-                len
+    /// Put back, inside this read's data, the patched words it reloads
+    /// (`patch_in_flight`): the title runs them only after the ReturnValue,
+    /// and they arrive with the bytes they belong to.
+    fn guard_in_flight(&self, start: u32, dc_address: u32, buf: &mut [u8]) {
+        let (put, left) = patch_in_flight(self.guards, dc_address, buf);
+        if put > 0 {
+            info!(
+                "this read reloads {put} patched word(s) (LBA 0x{start:08x} -> \
+                 0x{dc_address:08x}, {} B); put back in the data sent",
+                buf.len()
             );
-            if let Err(e) = apply_patches(conn, &reloaded) {
-                error!("could not re-apply the guard: {e}");
-            }
+        }
+        if left > 0 {
+            warn!(
+                "LBA 0x{start:08x} -> 0x{dc_address:08x} lands on {left} patched word(s) \
+                 with other data than the image held there: left as read"
+            );
         }
     }
 }

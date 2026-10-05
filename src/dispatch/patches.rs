@@ -6,7 +6,7 @@ use super::*;
 
 /// The bytes that will be in RAM and where each run lands: a raw binary whole
 /// at `address`, an ELF section by section. Every scan goes through this.
-fn payload_spans(buf: &[u8], address: u32) -> Vec<(u32, &[u8])> {
+pub(super) fn payload_spans(buf: &[u8], address: u32) -> Vec<(u32, &[u8])> {
     let mut spans: Vec<(u32, &[u8])> = vec![];
     if let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(buf) {
         if let Some(headers) = elf.section_headers() {
@@ -28,17 +28,17 @@ fn le16(data: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([data[i], data[i + 1]])
 }
 
-fn le32(data: &[u8], i: usize) -> u32 {
+pub(super) fn le32(data: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]])
 }
 
 /// The 4-aligned words of `data`, with their offsets.
-fn words(data: &[u8]) -> impl Iterator<Item = (usize, u32)> + '_ {
+pub(super) fn words(data: &[u8]) -> impl Iterator<Item = (usize, u32)> + '_ {
     (0..data.len().saturating_sub(3)).step_by(4).map(move |i| (i, le32(data, i)))
 }
 
 /// Whether `w` names main RAM, through any of its three windows.
-fn names_ram(w: u32) -> bool {
+pub(super) fn names_ram(w: u32) -> bool {
     matches!(w & 0xff00_0000, 0x0c00_0000 | 0x8c00_0000 | 0xac00_0000)
 }
 
@@ -435,6 +435,73 @@ pub fn apply_patches(
     Ok(())
 }
 
+/// A patched word of the title's image, to be put back whenever a disc read
+/// reloads it: what it must hold (`value`) and what the image held there
+/// (`was`). A read is patched only where it reloads `was` exactly -- the same
+/// address may receive some other file, which must arrive untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardWord {
+    pub at: u32,
+    pub value: u32,
+    pub was: Option<u32>,
+}
+
+/// Guard words for `words`, with what `payload` (uploaded at `base`) held at
+/// each. A word outside the payload has no original and is never put back:
+/// a read landing there is some other data.
+pub fn guard_words(words: &[(u32, u32)], payload: &[u8], base: u32) -> Vec<GuardWord> {
+    words
+        .iter()
+        .map(|&(at, value)| {
+            let was = phys(at)
+                .checked_sub(phys(base))
+                .map(|o| o as usize)
+                .and_then(|o| payload.get(o..o + 4))
+                .map(|b| le32(b, 0));
+            GuardWord { at, value, was }
+        })
+        .collect()
+}
+
+/// Put the guarded words a read reloads back INTO ITS DATA, before it is sent.
+///
+/// It used to be a LoadBinary of its own after the read's parts, which the
+/// loader refuses while that read waits (its door, `g_bin_read_want`):
+/// Shenmue II reloads its main program after the swap to disc 4, and both
+/// guards it carried came back unpatched (2026-10-05). In the read's own bytes
+/// the word arrives with the data, in the same transfer, and costs nothing.
+///
+/// Returns how many words were put back and how many were left because the
+/// read did not reload the original there.
+pub fn patch_in_flight(guards: &[GuardWord], dc_address: u32, buf: &mut [u8]) -> (usize, usize) {
+    let lo = phys(dc_address);
+    let (mut put, mut left) = (0, 0);
+    for g in guards {
+        let Some(was) = g.was else { continue };
+        // (byte of the word, index in this read) for the bytes inside it; a
+        // word split across two reads is put back half by each.
+        let (orig, new) = (was.to_le_bytes(), g.value.to_le_bytes());
+        let inside: Vec<(usize, usize)> = (0..4u32)
+            .filter_map(|i| {
+                let idx = phys(g.at).wrapping_add(i).checked_sub(lo)? as usize;
+                (idx < buf.len()).then_some((i as usize, idx))
+            })
+            .collect();
+        if inside.is_empty() {
+            continue;
+        }
+        if inside.iter().any(|&(i, idx)| buf[idx] != orig[i] && buf[idx] != new[i]) {
+            left += 1;
+            continue;
+        }
+        for (i, idx) in inside {
+            buf[idx] = new[i];
+        }
+        put += 1;
+    }
+    (put, left)
+}
+
 /// KOS's `arch_stack_16m` and `arch_stack_32m` (`stack.c`), which `startup.S`
 /// names through two consecutive pointers in its literal pool.
 const KOS_STACK_16M: u32 = 0x8d00_0000;
@@ -528,6 +595,40 @@ fn read_word(conn: &mut impl ExternalDcIo, addr: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shenmue II after the swap to disc 4: its main program comes back off
+    /// the disc, and the patched word in it must come back patched -- but
+    /// only where the read reloads what the image held.
+    #[test]
+    fn a_reload_carries_the_patched_word_and_other_data_does_not() {
+        let mut payload = vec![0u8; 0x100];
+        payload[0x70..0x74].copy_from_slice(&0x8ceb_ffe0u32.to_le_bytes());
+        let guards = guard_words(
+            &[(0x8c01_0070, 0x8cea_ffe0), (0x8c10_0000, 1)],
+            &payload,
+            0x8c01_0000,
+        );
+        assert_eq!(guards[0].was, Some(0x8ceb_ffe0));
+        assert_eq!(guards[1].was, None, "outside the image: never put back");
+
+        // The reload, in the P2 window, 0x40 bytes in.
+        let mut buf = payload[0x40..0xc0].to_vec();
+        assert_eq!(patch_in_flight(&guards, 0xac01_0040, &mut buf), (1, 0));
+        assert_eq!(le32(&buf, 0x30), 0x8cea_ffe0);
+
+        // Some other file at the same address: left as it is.
+        let mut other = vec![0x55u8; 0x80];
+        assert_eq!(patch_in_flight(&guards, 0x8c01_0040, &mut other), (0, 1));
+        assert!(other.iter().all(|&b| b == 0x55));
+
+        // A word split across two reads: each puts back its half.
+        let mut head = payload[0x40..0x72].to_vec();
+        let mut tail = payload[0x72..0x80].to_vec();
+        assert_eq!(patch_in_flight(&guards, 0x8c01_0040, &mut head), (1, 0));
+        assert_eq!(patch_in_flight(&guards, 0x8c01_0072, &mut tail), (1, 0));
+        assert_eq!(&head[0x30..0x32], &0x8cea_ffe0u32.to_le_bytes()[..2]);
+        assert_eq!(&tail[0..2], &0x8cea_ffe0u32.to_le_bytes()[2..]);
+    }
 
     #[test]
     fn a_kos_binary_is_known_by_its_dcload_probe() {

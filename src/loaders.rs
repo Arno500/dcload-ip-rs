@@ -1126,6 +1126,8 @@ pub struct LoaderSet {
     /// What a resident variant is told before upload: the console's address and
     /// the port its syscalls answer on (`variants::patch_resident`).
     resident: Option<([u8; 4], u16)>,
+    /// Where a core copies itself at EXEC (`variants::patch_core_shadow`).
+    core_shadow: Option<u32>,
 }
 
 impl LoaderSet {
@@ -1136,6 +1138,7 @@ impl LoaderSet {
             explicit: true,
             variant: None,
             resident: None,
+            core_shadow: None,
         }
     }
 
@@ -1170,6 +1173,7 @@ impl LoaderSet {
             explicit: named,
             variant: None,
             resident: None,
+            core_shadow: None,
         }
     }
 
@@ -1182,6 +1186,12 @@ impl LoaderSet {
     /// Tell resident variants the console's address and syscall port.
     pub fn set_resident(&mut self, ip: [u8; 4], port: u16) {
         self.resident = Some((ip, port));
+    }
+
+    /// Have the core copy itself to `shadow` at EXEC (high RAM the title leaves
+    /// alone until it first calls the GD driver).
+    pub fn set_core_shadow(&mut self, shadow: u32) {
+        self.core_shadow = Some(shadow);
     }
 
     /// The variant asked for, if `base` is its target.
@@ -1216,6 +1226,15 @@ impl LoaderSet {
         };
         if let Some((ip, port)) = self.resident {
             crate::variants::patch_resident(&mut image, ip, port)?;
+        }
+        if let (true, Some(shadow)) = (v.core, self.core_shadow) {
+            if !crate::variants::patch_core_shadow(&mut image, shadow)? {
+                log::warn!(
+                    "{} has no `core_shadow`: a title whose boot code runs at \
+                     0x8c004000 will overwrite it (rebuild with `make loaders`)",
+                    p.display()
+                );
+            }
         }
         Ok((image, label))
     }

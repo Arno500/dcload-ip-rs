@@ -161,6 +161,8 @@ pub struct StackVerdict {
     foreign: bool,
     /// A virtual stack (an MMU title) has been reported.
     virtual_sp: bool,
+    /// `g_gd_self_refused` as last read: refusals already reported.
+    refused_seen: u32,
 }
 
 impl StackVerdict {
@@ -178,6 +180,7 @@ impl StackVerdict {
             warned: false,
             foreign: false,
             virtual_sp: false,
+            refused_seen: 0,
         }
     }
 
@@ -274,6 +277,45 @@ impl StackVerdict {
         self.verdict(sp, in_image, margin);
     }
 
+    /// One reading of `g_gd_self_refused` / `_lo` / `_hi`: disc reads the
+    /// loader refused because they would have landed on it (absent from
+    /// loaders before 2026-10-05).
+    ///
+    /// THE ONLY TRACE SUCH A READ LEAVES. The loader tells the title FAILED and
+    /// never sends the request, so `SectorServer::watch_destination` cannot see
+    /// it and the map would not learn the range: Shenmue II showed "corrupted
+    /// data" over 382 sectors aimed through a loader at 0x8c7d0000, and the next
+    /// run would have chosen the same place. Recorded as a write: the title
+    /// wants that memory, and the loader must not be there next time.
+    pub fn observe_refused(&mut self, count: u32, lo: u32, hi: u32) {
+        if count <= self.refused_seen {
+            // Equal: nothing new. Lower: a different loader answered (a reset,
+            // a reboot to the BIOS menu); start over from its count.
+            self.refused_seen = count;
+            return;
+        }
+        let new = count - self.refused_seen;
+        self.refused_seen = count;
+        if MemoryMap::index(lo).is_none() || hi <= lo {
+            return;
+        }
+        error!(
+            "THE LOADER REFUSED {new} DISC READ(S) THAT WOULD HAVE LANDED ON IT, the \
+             last into 0x{lo:08x}..0x{hi:08x} ({} B), through the loader at 0x{:08x}. \
+             The title was told the read failed (expect a read error on screen). The \
+             range has been recorded: re-run without --loader-base and the loader will \
+             be placed elsewhere.",
+            hi - lo,
+            self.base
+        );
+        if let Some(rec) = self.recorder.as_ref()
+            && let Ok(mut rec) = rec.lock()
+        {
+            rec.record_written(lo, hi - lo);
+        }
+        self.persist();
+    }
+
     /// Say it once, and say what to do about it.
     fn verdict(&mut self, sp: u32, in_image: u32, margin: u32) {
         if in_image > 0 {
@@ -338,6 +380,9 @@ pub struct StackWatch {
     /// business, not this file's.
     at_sp_min: u32,
     at_in_image: u32,
+    /// `g_gd_self_refused`, `_lo`, `_hi`, defined beside the two above, when
+    /// this loader has them.
+    at_refused: Option<[u32; 3]>,
     /// Where the loader is, and where its image ends. Both from the ELF that
     /// was verified against the running image, so the margin below is a
     /// measurement and not an assumption about which build is on the console.
@@ -369,8 +414,24 @@ impl StackWatch {
         let in_image = want("g_gd_sp_in_image")?;
         let image_end = want("end")?;
         let verdict = StackVerdict::new(base, image_end, recorder);
-        let lo = sp_min.min(in_image);
-        let hi = sp_min.max(in_image) + 4;
+        let mut lo = sp_min.min(in_image);
+        let mut hi = sp_min.max(in_image) + 4;
+        // The refusal counters, in the same request when they are close
+        // enough to be: one request stays one packet.
+        let at_refused = match (
+            want("g_gd_self_refused"),
+            want("g_gd_self_refused_lo"),
+            want("g_gd_self_refused_hi"),
+        ) {
+            (Ok(n), Ok(l), Ok(h)) => {
+                let (rlo, rhi) = (lo.min(n).min(l).min(h), hi.max(n.max(l).max(h) + 4));
+                ((rhi - rlo) as usize <= CHUNK_SIZE).then(|| {
+                    (lo, hi) = (rlo, rhi);
+                    [n, l, h]
+                })
+            }
+            _ => None,
+        };
         let span = (hi - lo) as usize;
         // Adjacent in practice -- both are plain `unsigned int` globals, in
         // declaration order. Refusing a wide range rather than reading it keeps
@@ -394,6 +455,7 @@ impl StackWatch {
             span,
             at_sp_min: sp_min,
             at_in_image: in_image,
+            at_refused,
             verdict,
             // The first sample is asked for as soon as the title is running:
             // the value is latched on its very first GD syscall, and a verdict
@@ -533,6 +595,12 @@ impl StackWatch {
             return;
         };
         self.verdict.observe(sp, in_image);
+        if let Some([n, l, h]) = self.at_refused
+            && let (Some(n), Some(l), Some(h)) =
+                (self.word(blob, n), self.word(blob, l), self.word(blob, h))
+        {
+            self.verdict.observe_refused(n, l, h);
+        }
     }
 }
 
@@ -597,6 +665,31 @@ mod tests {
             MemoryDb::load(&path).get("md5").and_then(|r| r.sp_min),
             Some(0x8c00_b000)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused read teaches the map the range the title wanted, once per
+    /// new refusal -- Shenmue II's 382 sectors through a loader at 0x8c7d0000.
+    #[test]
+    fn a_refused_read_is_recorded_as_the_titles_memory() {
+        let dir = std::env::temp_dir().join("dcload-stackverdict-refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = recorder(&dir);
+        let mut v = StackVerdict::new(0x8c7d_0000, 0x8c7d_71a4, Some(rec.clone()));
+        // Nothing refused yet: nothing learned.
+        v.observe_refused(0, 0, 0);
+        assert!(rec.lock().unwrap().known().is_empty());
+        v.observe_refused(1, 0x8c7c_8a00, 0x8c88_7a00);
+        let map = MemoryDb::load(&dir.join("game-memory.tsv")).get("md5").unwrap().map;
+        assert!(map.hits(0x8c7d_0000, 0x1_0000, 0), "the loader's own block is the title's");
+        assert!(map.hits(0x8c88_0000, 0x1_0000, 0), "and so is the far end of the read");
+        assert!(!map.hits(0x8c89_0000, 0x1_0000, 0), "but not past it");
+        // The same count again is not news; a lower one (another loader) resets.
+        v.observe_refused(1, 0x8c00_0000, 0x8c10_0000);
+        assert!(!rec.lock().unwrap().known().hits(0x8c00_0000, 0x1_0000, 0));
+        v.observe_refused(0, 0, 0);
+        assert_eq!(v.refused_seen, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

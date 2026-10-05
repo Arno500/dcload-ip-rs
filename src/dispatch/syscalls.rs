@@ -15,7 +15,7 @@ pub fn receive_syscalls(
     cd_disc: Option<Box<dyn DiscFormat>>,
     mount: Option<String>,
     running_base: Option<u32>,
-    guards: &[(u32, u32)],
+    guards: &[GuardWord],
     cdda: CddaSource,
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     mut diag: Option<crate::diag::Probe>,

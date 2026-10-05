@@ -175,6 +175,16 @@ struct Args {
     #[arg(long)]
     no_gaps_guard: bool,
 
+    /// Do not take the loader out of a title's "HLib" heap.
+    ///
+    /// By default, a title whose allocator (found by its literal pool) owns all
+    /// the RAM it leaves free gets the loader at the bottom of that heap, and
+    /// the heap's start moved above it (Shenmue II); a loader pinned at the
+    /// heap's top lowers its end instead. Pass this to place the loader by the
+    /// other rules and leave the allocator as shipped.
+    #[arg(long)]
+    no_heap_guard: bool,
+
     /// Do not tell a VM2/VMUPro which game is starting.
     ///
     /// By default, with a disc image, the host probes the four Maple ports for
@@ -192,6 +202,14 @@ struct Args {
     /// `game-memory.tsv`. Pass this to leave that RAM as it was.
     #[arg(long)]
     no_marks: bool,
+
+    /// Paint every block above the title's image, the ones `game-memory.tsv`
+    /// already says the title uses included (a diagnostic). By default those
+    /// are left alone, so nothing says WHERE inside them the title writes; with
+    /// this, a RAM dump taken while the title runs (flycast) shows it to 256
+    /// bytes. What is learned is recorded as usual.
+    #[arg(long, conflicts_with = "no_marks")]
+    mark_all: bool,
 
     /// Treat a Windows CE title like any other boot binary.
     ///
@@ -1033,8 +1051,17 @@ fn choose_variant(
     };
     loaders.set_resident(ip, args.port);
 
+    // A base taken out of the title's own heap is a place made for the loader:
+    // the core would sit in the system hole, which such a title may keep for
+    // itself (Shenmue II's kernel and debug monitor live there).
+    let heap_base = !args.no_heap_guard
+        && dispatch::hlib_heap(&boot.bytes, args.address).and_then(|h| h.loader_base()) == Some(base);
+    if heap_base && !args.loader_core {
+        debug!("loader variant: not the core: the loader has a place in the title's heap");
+    }
+
     // THE CORE, on evidence.
-    if !args.no_loader_core {
+    if !args.no_loader_core && (!heap_base || args.loader_core) {
         let core = variants::pick_variant(driver, &facts, true);
         if loaders.has_variant(&core) {
             let verdict = (|| -> Result<(), String> {
@@ -1076,6 +1103,21 @@ fn choose_variant(
                         core.label(),
                         loaders::DEFAULT_BASE
                     );
+                    // The high base this title would have had is free until its
+                    // first GD call: the core's copy waits there, for boot code
+                    // that runs over the system hole.
+                    if loaders::is_high(base) {
+                        info!(
+                            "loader variant: the core's shadow at 0x{base:08x}, restored \
+                             on the title's first BIOS call"
+                        );
+                        loaders.set_core_shadow(base);
+                    } else {
+                        warn!(
+                            "loader variant: no high base for the core's shadow; a title \
+                             that runs its boot code at 0x8c004000 will overwrite the core"
+                        );
+                    }
                     loaders.use_variant(core, loaders::DEFAULT_BASE);
                     return loaders::DEFAULT_BASE;
                 }
@@ -1350,6 +1392,46 @@ fn wanted_loader_base(
             memory_path.display(),
             seen_db.len()
         ),
+    }
+    // A TITLE WHOSE ALLOCATOR OWNS ALL THE RAM IT LEAVES FREE HAS NO FREE BASE,
+    // and says so in its own image: the "HLib" literal pool (dispatch::heap).
+    // The loader goes at the heap's bottom and the heap starts above it; the
+    // pool words are patched before EXEC and guarded (Shenmue II, 2026-10-05:
+    // every fixed high base was overwritten once the heap filled at disc 4).
+    // Before the preset and the map: the map has this title using the heap's
+    // blocks, which it no longer will, and a preset is isoldr's answer to RAM
+    // this rule takes out of the title's hands.
+    if !args.no_heap_guard && !framed_wince
+        && let Some(heap) = dispatch::hlib_heap(&boot, args.address)
+    {
+        let stack_inside = |b: u32| {
+            sp_min.is_some_and(|sp| {
+                let sp = (sp & 0x1fff_ffff) | 0x8000_0000;
+                sp >= b && sp < b + loaders::LOADER_SPAN
+            })
+        };
+        match heap.loader_base() {
+            Some(b) if loaders.can_provide(b) && !stack_inside(b) => {
+                info!(
+                    "this title's allocator owns 0x{:08x}..0x{:08x} (HLib heap); putting the \
+                     loader at 0x{b:08x}, its bottom, and starting the heap above it",
+                    heap.start, heap.end
+                );
+                return Some(b);
+            }
+            Some(b) => warn!(
+                "HLib heap 0x{:08x}..0x{:08x}: a loader at its bottom (0x{b:08x}) {}; placing \
+                 it by the usual rules, where the heap may reach it",
+                heap.start,
+                heap.end,
+                if stack_inside(b) { "would sit under the title's stack" } else { "cannot be built" }
+            ),
+            None => warn!(
+                "HLib heap 0x{:08x}..0x{:08x}: too small to take the loader out of; placing it \
+                 by the usual rules, where the heap may reach it",
+                heap.start, heap.end
+            ),
+        }
     }
     // NOTHING IN THE DATABASE PRESCRIBES AN ADDRESS, SO THE LOADER STAYS -- BUT
     // "STAYS" IS A DECISION, and this is the first point at which this host
@@ -1861,6 +1943,10 @@ fn note(loud: bool, msg: String) {
 fn running_loader_image(args: &Args, base: u32) -> Result<(Vec<u8>, String), String> {
     type Cached = (u32, Result<(Vec<u8>, String), String>);
     static LAST: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+    if let Some(image) = variants::running_image(base) {
+        // Not cached: VERS says which variant runs, and that can change.
+        return Ok(image);
+    }
     let mut last = LAST.lock().expect("loader image cache poisoned");
     if let Some((b, image)) = last.as_ref()
         && *b == base
@@ -2150,7 +2236,11 @@ fn start_marks(
         debug!("no memory marks: the core loader does not serve MARK, and keeps nothing in high RAM");
         return None;
     }
-    let known = recorder.lock().ok()?.known();
+    let known = if args.mark_all {
+        memmap::MemoryMap::new()
+    } else {
+        recorder.lock().ok()?.known()
+    };
     let blocks = marks::blocks_to_paint(image_end, base, &known);
     if blocks.is_empty() {
         return None;
@@ -2266,6 +2356,21 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             println!(
                 "gd body  : {n} direct call site(s) to the BIOS GD driver (0x8c0010f0), \
                  pointed at the loader's emulation at upload"
+            );
+        }
+        if !framed_wince && let Some(h) = dispatch::hlib_heap(b, args.address) {
+            println!(
+                "heap     : HLib 0x{:08x}..0x{:08x}; loader {}",
+                h.start,
+                h.end,
+                match (args.no_heap_guard, h.loader_base()) {
+                    (true, _) => "placed by the usual rules (--no-heap-guard)".to_string(),
+                    (false, Some(base)) => format!(
+                        "at 0x{base:08x}, heap start moved to 0x{:08x}",
+                        base + loaders::LOADER_SPAN
+                    ),
+                    (false, None) => "placed by the usual rules (heap too small)".to_string(),
+                }
             );
         }
         if framed_wince {
@@ -3145,6 +3250,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             // BEFORE the upload, so what goes over the wire is what runs --
             // see `apply_ppf_patches`. These words join the GAPS and cable
             // guards below, because a title can reload its own image.
+            // What the disc holds, for the guards: a reload brings these bytes
+            // back, not the patched ones (`dispatch::patch_in_flight`).
+            let as_on_disc = payload.clone();
             let ppf_guard = apply_ppf_patches(&args, &mut payload, identity.as_ref());
             let has_disc = redirect_disc.is_some();
             match dispatch::upload_bytes(
@@ -3266,9 +3374,46 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // one pass over the image for constants naming RAM the loader
                 // occupies, kept honest by requiring an instruction to actually
                 // load them.
+                //
+                // A title's HLib heap (dispatch::heap) is taken off the loader
+                // first: its own bounds then name the loader's RAM, and are the
+                // words patched below, not a title writing there.
+                let heap = (!args.no_heap_guard && !wince)
+                    .then(|| dispatch::hlib_heap(&payload, args.address))
+                    .flatten();
+                let mut heap_guard: Vec<(u32, u32)> = vec![];
+                if let (Some(h), Some(base)) = (heap, running_base) {
+                    match h.patches(base) {
+                        Ok(p) if p.is_empty() => debug!(
+                            "HLib heap 0x{:08x}..0x{:08x}: the loader at 0x{base:08x} is outside it",
+                            h.start, h.end
+                        ),
+                        Ok(p) => {
+                            info!(
+                                "HLib heap 0x{:08x}..0x{:08x}: taking the loader at 0x{base:08x} \
+                                 out of it ({})",
+                                h.start,
+                                h.end,
+                                p.iter()
+                                    .map(|(at, v)| format!("0x{at:08x}=0x{v:08x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            heap_guard = p;
+                        }
+                        Err(why) => warn!(
+                            "HLib heap 0x{:08x}..0x{:08x}: the loader at 0x{base:08x} cannot be \
+                             taken out of it: {why}. Expect the heap to overwrite it.",
+                            h.start, h.end
+                        ),
+                    }
+                }
                 if let Some(base) = running_base {
-                    let hits =
+                    let mut hits =
                         dispatch::literals_in_loader_footprint(&payload, args.address, base);
+                    if let Some(h) = heap.filter(|_| !heap_guard.is_empty()) {
+                        hits.retain(|&(at, _)| !h.names_own_bound(at));
+                    }
                     if !hits.is_empty() {
                         error!(
                             "THIS TITLE ADDRESSES RAM THE LOADER IS SITTING IN. The loader at \
@@ -3305,6 +3450,11 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     {
                         warn!("could not neutralise the GAPS probe: {e}");
                     }
+                }
+                if !heap_guard.is_empty()
+                    && let Err(e) = dispatch::apply_patches(&mut udpsender, &heap_guard)
+                {
+                    warn!("could not take the loader out of the title's heap: {e}");
                 }
                 // Same mechanism, same reason for surviving a reload: what
                 // this changes is one halfword of the title's own image, and a
@@ -3390,7 +3540,23 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         warn!("could not patch the Windows CE image: {e}");
                     }
                 }
-                let guards = [gaps_guard, vga_guard, ppf_guard, gd_guard, wince_guard].concat();
+                // `--patch` words inside the image are guarded too: Shenmue II
+                // reloads its main program after the swap to disc 4, and a
+                // poke made once before EXEC came back as the disc has it.
+                let guards = dispatch::guard_words(
+                    &[
+                        gaps_guard,
+                        heap_guard,
+                        vga_guard,
+                        ppf_guard,
+                        gd_guard,
+                        wince_guard,
+                        args.patch.clone(),
+                    ]
+                    .concat(),
+                    &as_on_disc,
+                    args.address,
+                );
                 // Last, so a patch always wins over the bytes it replaces --
                 // whether they came from the title, from IP.BIN, or from both.
                 if !args.patch.is_empty()

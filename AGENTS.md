@@ -45,7 +45,8 @@ ADPCM decoding).
      preset refused by the constant scan is read as a window
      (`preset_window_base`). Off the low family the search starts at
      `ISOLDR_HIGH_ADDR` for a known title, `SCRATCH_BASE` otherwise.
-   - Windows CE (§5) and KOS (§5) titles have their own rules.
+   - Windows CE (§5) and KOS (§5) titles have their own rules, and so does a
+     title with an HLib heap (§5): the loader goes at its bottom.
    - **Variants and the core** (`variants.rs`, loader AGENTS.md 4.18-4.19).
      After the base is chosen, `choose_variant` picks the image of the set made
      for the console's adapter (VERS `address`), the kind of title (boot binary:
@@ -57,7 +58,11 @@ ADPCM decoding).
      relocated) is chosen only on evidence (`core_verdict`): recorded `sp_min`
      clearing it (physical addresses: a stack in high RAM clears it), no startup
      paint over it, no audio, and a learned map busy in the top 64 blocks;
-     `--loader-core` forces, `--no-loader-core` forbids. `--loader-variant
+     `--loader-core` forces, `--no-loader-core` forbids. With a core, the high
+     base the title would have had is written into its `core_shadow`
+     (`variants::patch_core_shadow`): the core copies itself there at EXEC and
+     is copied back on the title's first BIOS call, after boot code that runs
+     over 0x8c004000 (Shenmue II). `--loader-variant
      universal` and `--probe` keep the universal image; so do hops. A missing
      file falls back to it. The running core's footprint is read from its own
      ELF and held in `variants::ACTIVE`: disc-read collisions, memory marks (not
@@ -73,9 +78,12 @@ ADPCM decoding).
    - `--loader-base` pins a base; `--no-relocate` keeps whatever runs.
 4. **Payload** — `resolve_payload`: a file as is, or the boot binary an image
    names (`disc_formats::boot::extract`). Then, in the buffer before upload:
-   PPF (§6), the GAPS guard (loader AGENTS.md 4.12), VGA, GD-body, CE and KOS
-   patches (§5), descrambling. Every patched word is re-applied whenever a
-   later disc read reloads it.
+   PPF (§6), the GAPS guard (loader AGENTS.md 4.12), the HLib heap, VGA,
+   GD-body, CE and KOS patches (§5), descrambling. Every patched word, `--patch` words inside the
+   image included, is put back whenever a later disc read reloads it: in the
+   read's own data before it is sent (`patch_in_flight`), and only where the
+   read brings back what the disc holds there. A separate LoadBinary after the
+   read is refused by the loader's door while that read waits.
 5. **Upload** — `dispatch::upload_bytes` → `send_data`: ELF section by section
    (`loaders::is_uploadable`), anything else at `--address` (default
    `0x0c010000`). `LBIN`, `PBIN` parts, then `DBIN` probes and resends.
@@ -267,6 +275,22 @@ upload, verified, re-applied on reload, and listed by `identify`
   interrupt this transport never raises. Reads into the loader's `_gd_stage*`
   buffers are not collisions (`loader_stage`). `--no-wince` uploads it whole.
   Open questions: the loader's `docs/wince-investigation.md`.
+- **HLib heap** (`dispatch/heap.rs`, on by default, `--no-heap-guard`). A
+  Katana allocator that owns all the RAM a title leaves free, recognised by its
+  literal pool: start, start + 0x20 (first block), end, the first block's size
+  (end − (start + 0x20)), and the tags `"fREe"`, `"USE "`, `"HLib"` within
+  0x40 bytes; exactly one pool or nothing. The loader goes at the first 64 KB
+  boundary at or above the heap's start (`loader_base`, in `wanted_loader_base`,
+  before presets and the learned map, unless the recorded stack sits there),
+  and the start, first block and size are moved above it (`patches`); a loader
+  pinned at the heap's top lowers the end and size instead, and one in the
+  middle is only warned about. The heap's own bounds are not reported by the
+  constant scan, and such a base keeps the core out unless `--loader-core`.
+  Shenmue II (PAL 1.001): pool at `0x8c051968`, heap `0x8c360000..0x8cebffe0`,
+  loader `0x8c360000`, start `0x8c370000` -- measured to run through disc 4.
+  Its fixed regions rule out the alternatives: above `0x8cec0000` cutscenes and
+  stack, and a disc-4 loading buffer ending at `0x8cf046c0` runs over the
+  heap's top.
 - **KOS** (`is_kos_binary`). The loader is told via `g_gd_kos`; KOS's top of
   RAM is lowered under the loader (`kos_mem_top_patches`); the dcload magic at
   `0x8c004004` is pointed at the live loader (`update_dcload_magic`) so KOS's
@@ -306,7 +330,10 @@ files (`patchdb.rs`, `ppf.rs`: PPF 1.0/2.0/3.0).
 - **`stackwatch.rs`** — reads the loader's `g_gd_sp_min` every 10 s and
   records it. A value outside RAM means a different loader is answering (the
   title went back to the BIOS) and is not recorded; a CE thread stack (MMU
-  on) is reported once and not recorded.
+  on) is reported once and not recorded. In the same request it reads
+  `g_gd_self_refused`/`_lo`/`_hi` (disc reads the loader refused because they
+  would land on it, which never reach this host) and records the range as
+  the title's memory, so the next run places the loader elsewhere.
 - **`adpcm.rs`** (§4), **`wince.rs`** (§5), **`vm2.rs`** (§11).
 - **`diag.rs`**, **`ui.rs`** — counter panel and everything drawn on the
   terminal.

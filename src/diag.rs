@@ -149,6 +149,13 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             // already inside the loader.
             ("g_gd_sp_min", Fmt::Hex),
             ("g_gd_sp_in_image", Fmt::Num),
+            // Disc reads the loader refused because they would have landed on
+            // it, and the last one's range: the title was told FAILED and the
+            // host never saw the request. Fed to the learned memory map
+            // (`StackVerdict::observe_refused`). Absent before 2026-10-05.
+            ("g_gd_self_refused", Fmt::Num),
+            ("g_gd_self_refused_lo", Fmt::Hex),
+            ("g_gd_self_refused_hi", Fmt::Hex),
             ("g_gd_idx_counts", Fmt::GdIdx),
             ("g_gd_cmd_counts", Fmt::GdCmd),
             ("g_gd_park_longs", Fmt::Num),
@@ -260,6 +267,10 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("g_irq_evt_last", Fmt::Hex),
             // BBA RX interrupts the hook took (Katana titles).
             ("g_irq_rx", Fmt::Num),
+            // Entries on that level with nothing pending, swallowed: a
+            // line that fell before the CPU took it. Passed on, Shenmue II
+            // entered its debug monitor (black screen, 2026-10-05).
+            ("g_irq_rx_stray", Fmt::Num),
             // The level the BBA is routed to (0x3a0 IML2, 0x360 IML4, 0x320
             // IML6; 0 = none), and the title's masks the hook found:
             // IML2 NRM EXT ERR, IML4 ..., IML6 ...
@@ -1068,6 +1079,13 @@ impl Probe {
             };
             if let (Some(sp), Some(in_image)) = (word("g_gd_sp_min"), word("g_gd_sp_in_image")) {
                 stack.observe(sp, in_image);
+            }
+            if let (Some(n), Some(lo), Some(hi)) = (
+                word("g_gd_self_refused"),
+                word("g_gd_self_refused_lo"),
+                word("g_gd_self_refused_hi"),
+            ) {
+                stack.observe_refused(n, lo, hi);
             }
         }
         let now = Instant::now();

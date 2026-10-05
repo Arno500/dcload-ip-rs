@@ -157,6 +157,23 @@ impl VariantWord {
     pub fn is_core(&self) -> bool {
         self.layout == 2
     }
+
+    /// The file of the set this build came from; `None` for the universal
+    /// image (every kind of title, both drivers) and anything unrecognised.
+    pub fn variant(&self) -> Option<Variant> {
+        let driver = match (self.bba, self.lan) {
+            (true, false) => Driver::Bba,
+            (false, true) => Driver::Lan,
+            _ => return None,
+        };
+        let os = match self.os {
+            1 => Os::Katana,
+            2 => Os::Kos,
+            3 => Os::Wince,
+            _ => return None,
+        };
+        Some(Variant { driver, os, cdda: self.cdda, core: self.is_core() })
+    }
 }
 
 /// What the host knows about the title when it picks a loader.
@@ -285,6 +302,25 @@ pub fn is_core_image(bytes: &[u8]) -> bool {
 /// memory marks, the IP.BIN write, the hop planner.
 static ACTIVE: Mutex<Option<Footprint>> = Mutex::new(None);
 
+/// The image of the loader VERS last said is running, when it is a variant: the
+/// ELF every symbol the host reads by name must come from (counters, the GD
+/// entry, the staging buffers). `None`: the universal image, as before variants.
+static RUNNING_IMAGE: Mutex<Option<(u32, Vec<u8>, String)>> = Mutex::new(None);
+
+pub fn set_running_image(image: Option<(u32, Vec<u8>, String)>) {
+    *RUNNING_IMAGE.lock().unwrap() = image;
+}
+
+/// The running variant's image, if one runs at `base`.
+pub fn running_image(base: u32) -> Option<(Vec<u8>, String)> {
+    RUNNING_IMAGE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(b, _, _)| *b == base)
+        .map(|(_, bytes, label)| (bytes.clone(), label.clone()))
+}
+
 pub fn set_active(fp: Option<Footprint>) {
     *ACTIVE.lock().unwrap() = fp.filter(Footprint::is_core);
 }
@@ -344,6 +380,23 @@ pub fn patch_resident(bytes: &mut [u8], ip: [u8; 4], port: u16) -> Result<(), St
     put("our_ip", &u32::from_be_bytes(ip).to_le_bytes())?;
     put("dcload_syscall_port", &port.to_le_bytes())?;
     Ok(())
+}
+
+/// Tell a core where its SHADOW goes (`core_shadow`, AGENTS.md 4.19 of the
+/// loader): high RAM the title leaves alone until its first call to a BIOS
+/// vector. At EXEC the core copies itself there and points the vectors at the
+/// copy, which puts the core back on the first call -- for a title whose boot
+/// code runs over the system hole (Shenmue II's 1ST_READ copies 16 KB of itself
+/// to 0x8c004000). `Ok(false)`: a core built before the shadow, left as it is.
+pub fn patch_core_shadow(bytes: &mut [u8], shadow: u32) -> Result<bool, String> {
+    let syms = loaders::symbols(bytes)?;
+    let Some(&(addr, _)) = syms.get("core_shadow") else {
+        return Ok(false);
+    };
+    let off = file_offset(bytes, addr)
+        .ok_or_else(|| format!("`core_shadow` (0x{addr:08x}) is not in an uploaded section"))?;
+    bytes[off..off + 4].copy_from_slice(&shadow.to_le_bytes());
+    Ok(true)
 }
 
 /// Where a loaded (PROGBITS) address sits in the ELF file.
@@ -460,6 +513,19 @@ mod tests {
         assert!(!v.is_core());
         assert!(VariantWord::from_word(0xA500_0002).unwrap().is_core());
         assert_eq!(VariantWord::from_word(0x0000_0102), None);
+        // ... and names the file it came from
+        assert_eq!(
+            v.variant(),
+            Some(Variant { driver: Driver::Bba, os: Os::Katana, cdda: false, core: false })
+        );
+        let core = VariantWord::from_word(0xA500_0000 | 2 | 1 << 4 | 1 << 10).unwrap();
+        assert_eq!(
+            core.variant(),
+            Some(Variant { driver: Driver::Lan, os: Os::Katana, cdda: false, core: true })
+        );
+        // the universal image: every kind of title, both drivers
+        let all = VariantWord::from_word(0xA500_0000 | 1 | 1 << 8 | 1 << 9 | 1 << 10).unwrap();
+        assert_eq!(all.variant(), None);
     }
 
     #[test]
@@ -579,6 +645,13 @@ mod tests {
             // pinned: it does not move, and "moving" it to where it is changes nothing
             assert!(loaders::relocate(&bytes, 0x8ce0_0000).is_err());
             assert_eq!(loaders::relocate(&bytes, 0x8c00_4000).unwrap(), bytes);
+            // the shadow's address lands in the word the core reads at EXEC
+            let mut shadowed = bytes.clone();
+            assert!(patch_core_shadow(&mut shadowed, 0x8cf6_0000).unwrap());
+            let syms = loaders::symbols(&shadowed).unwrap();
+            let at = file_offset(&shadowed, syms["core_shadow"].0).unwrap();
+            assert_eq!(&shadowed[at..at + 4], &0x8cf6_0000u32.to_le_bytes());
+            assert!(shadowed.iter().zip(&bytes).filter(|(a, b)| a != b).count() <= 4);
         }
         let mut patched = std::fs::read(dir.join(
             Variant { driver: Driver::Bba, os: Os::Katana, cdda: false, core: false }.file_name(),

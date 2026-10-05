@@ -349,18 +349,26 @@ pub fn note_running_loader(
     loaders: &crate::loaders::LoaderSet,
     reply: &crate::loaders::VersionReply,
 ) {
-    let core = reply.variant.is_some_and(|v| v.is_core());
-    let driver = reply.adapter.and_then(crate::variants::Driver::from_installed);
-    let footprint = match (core, driver, reply.base) {
-        (true, Some(driver), Some(base)) => {
-            let v = crate::variants::pick_variant(driver, &Default::default(), true);
-            loaders
-                .variant_image(&v, base)
-                .ok()
-                .and_then(|(bytes, _)| crate::variants::footprint_from_elf(&bytes).ok())
-        }
+    // The variant VERS names, read from its own file (a core's or a HIGH
+    // variant's symbols are not the universal image's).
+    let image = match (reply.variant.and_then(|w| w.variant()), reply.base) {
+        (Some(v), Some(base)) => match loaders.variant_image(&v, base) {
+            Ok((bytes, label)) => Some((base, bytes, label)),
+            Err(e) => {
+                warn!(
+                    "the running loader is {} at 0x{base:08x}, but its file cannot be \
+                     read ({e}); symbols will come from the universal image",
+                    v.label()
+                );
+                None
+            }
+        },
         _ => None,
     };
+    let footprint = image
+        .as_ref()
+        .and_then(|(_, bytes, _)| crate::variants::footprint_from_elf(bytes).ok())
+        .filter(|fp| fp.is_core());
     if let Some(fp) = &footprint {
         info!(
             "a core loader is running: resident to 0x{:08x}, IP.BIN room {} bytes",
@@ -368,6 +376,7 @@ pub fn note_running_loader(
         );
     }
     crate::variants::set_active(footprint);
+    crate::variants::set_running_image(image);
 }
 
 fn ensure_loader_base_inner(
