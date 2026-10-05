@@ -1027,6 +1027,23 @@ impl Probe {
         })
     }
 
+    /// A counter's value in the last sample, `None` before the first one or
+    /// when this build does not have it.
+    pub fn word(&self, name: &str) -> Option<u64> {
+        let i = self.entries.iter().position(|e| e.name == name)?;
+        self.prev[i].as_ref()?.first().copied()
+    }
+
+    /// Write the last sample where it holds still, as `w` does, headed by
+    /// `why`. Nothing when no sample ever landed: an empty box says nothing.
+    pub fn dump(&self, why: &str) {
+        if self.samples == 0 {
+            info!("diag: no sample to write, none was ever answered");
+            return;
+        }
+        self.panel.dump(why);
+    }
+
     /// Repaint without re-reading. Cheap, and rate-limited by indicatif.
     pub fn repaint(&self) {
         self.panel.render();

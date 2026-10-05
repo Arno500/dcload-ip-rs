@@ -17,6 +17,7 @@ mod fs;
 mod disc_formats;
 mod dispatch;
 mod io;
+mod keepalive;
 mod loaders;
 mod marks;
 mod memmap;
@@ -344,6 +345,20 @@ struct Args {
     /// Adjustable live from the panel with `+` and `-`.
     #[arg(long, default_value_t = 2.0, value_name = "SECONDS")]
     diag_interval: f64,
+
+    /// End a running session after this many seconds without a word from the
+    /// console; 0 keeps it open forever.
+    ///
+    /// The title's reads and the other instruments' requests keep it quiet;
+    /// past a third of the limit without a word it asks the console itself
+    /// (4 bytes every 0.5 s). With the counter panel
+    /// sampling (`--diag`, `d`), its last sample is written to
+    /// `dcload-diag.txt` on the way out. Armed only once the console says the
+    /// loader's interrupt hook is in, which is what makes it listen while the
+    /// title does not read: never for a KOS title, a LOW loader, or a title
+    /// whose interrupt entry the loader refuses.
+    #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+    keepalive: u64,
 
     /// TCP port on 127.0.0.1 where a `u-exec` session serving a disc image
     /// listens for `swap-disc`; 0 turns it off.
@@ -1992,6 +2007,47 @@ fn start_stack_watch(
     }
 }
 
+/// The `--keepalive` settings for this title, `None` when it cannot be armed.
+///
+/// Silence means something only when the loader listens while the title runs
+/// (`keepalive.rs`): never for a KOS title, whose vector table the loader's
+/// interrupt hook does not recognise (loader AGENTS.md 4.18), nor under a
+/// loader built without the hook's idle listen (the LOW family). Whether the
+/// hook actually went in is asked of the console once the title runs.
+fn keepalive_config(args: &Args, kos: bool, running_base: Option<u32>) -> Option<keepalive::Config> {
+    if args.keepalive == 0 {
+        return None;
+    }
+    if kos {
+        info!("keepalive: off for a KOS title, which is silent whenever it does not read");
+        return None;
+    }
+    let syms = running_base
+        .ok_or_else(|| "the loader does not report its base".to_string())
+        .and_then(|base| running_loader_image(args, base))
+        .and_then(|(elf, _)| loaders::symbols(&elf));
+    let syms = match syms {
+        Ok(s) => s,
+        Err(e) => {
+            info!("keepalive: off, {e}");
+            return None;
+        }
+    };
+    match (syms.get("gd_idle_listen"), syms.get("g_irq_hooked")) {
+        (Some(_), Some(&(hooked_at, _))) => Some(keepalive::Config {
+            limit: std::time::Duration::from_secs(args.keepalive),
+            hooked_at,
+        }),
+        _ => {
+            info!(
+                "keepalive: off, this loader does not listen to the network while a title \
+                 runs (no interrupt hook idle listen), so silence would mean nothing"
+            );
+            None
+        }
+    }
+}
+
 /// Tell the loader the title is a KOS binary (`g_gd_kos`, cdfs_syscalls.c):
 /// its disc reads then start without the first yield, as isoldr does for
 /// BIN_TYPE_KOS. KOS polls a DMA read once and, on PROCESSING, sleeps until
@@ -3543,7 +3599,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             );
                         }
                         if has_disc || mount.is_some() || console {
-                            dispatch::receive_syscalls(
+                            let end = dispatch::receive_syscalls(
                                 &mut udpsender,
                                 disc_reader,
                                 mount.clone(),
@@ -3563,8 +3619,12 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 marks,
                                 running_base.map(|b| loader_stage(&args, b)).unwrap_or_default(),
                                 if has_disc { control::serve(args.control_port) } else { None },
+                                keepalive_config(&args, kos, running_base),
                             )?;
-                            return Ok(ExitCode::SUCCESS);
+                            return Ok(match end {
+                                dispatch::SessionEnd::Exit => ExitCode::SUCCESS,
+                                dispatch::SessionEnd::Silent(_) => ExitCode::FAILURE,
+                            });
                         }
                         Ok(ExitCode::SUCCESS)
                     }

@@ -45,6 +45,12 @@ pub trait ExternalDcIo {
     /// evict the first -- and an evicted sink does not fail, it just never
     /// claims anything again, which reads as a console that stopped answering.
     fn add_sink(&mut self, _sink: SharedSink) {}
+    /// When the last datagram from the console arrived, whoever it was for --
+    /// a sink's reply counts as much as a syscall. `None` until the first one,
+    /// and always for the fakes in the tests.
+    fn last_input(&self) -> Option<time::Instant> {
+        None
+    }
 }
 
 pub struct DcIoUDP {
@@ -53,6 +59,7 @@ pub struct DcIoUDP {
     poller: Poller,
     buf: [u8; 65527],
     sinks: Vec<SharedSink>,
+    last_input: Option<time::Instant>,
 }
 
 impl DcIoUDP {
@@ -79,6 +86,7 @@ impl DcIoUDP {
             key,
             buf,
             sinks: Vec::new(),
+            last_input: None,
         })
     }
 }
@@ -132,6 +140,7 @@ impl ExternalDcIo for DcIoUDP {
                 match self.socket.recv_from(&mut self.buf) {
                     Ok((n, addr)) => {
                         trace!("Received {} bytes from {}", n, addr);
+                        self.last_input = Some(time::Instant::now());
                         match DCReturnCmd::try_from(self.buf[..n].to_vec()) {
                             Ok(cmd) => {
                                 // First claimer wins, and the ranges are
@@ -182,5 +191,9 @@ impl ExternalDcIo for DcIoUDP {
 
     fn add_sink(&mut self, sink: SharedSink) {
         self.sinks.push(sink);
+    }
+
+    fn last_input(&self) -> Option<time::Instant> {
+        self.last_input
     }
 }

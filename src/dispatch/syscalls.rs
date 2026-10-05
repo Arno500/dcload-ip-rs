@@ -9,6 +9,15 @@ fn toc_word(toc: &[u8], i: usize) -> String {
         .unwrap_or_default()
 }
 
+/// How a syscall session ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The title called `exit`.
+    Exit,
+    /// Nothing came from the console for the `--keepalive` limit.
+    Silent(Duration),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn receive_syscalls(
     conn: &mut impl ExternalDcIo,
@@ -24,7 +33,8 @@ pub fn receive_syscalls(
     mut marks: Option<crate::marks::MarkWatch>,
     stage: Vec<(u32, u32)>,
     swap_requests: Option<std::sync::mpsc::Receiver<crate::control::SwapRequest>>,
-) -> DcResult<()> {
+    keepalive: Option<crate::keepalive::Config>,
+) -> DcResult<SessionEnd> {
     // A disc that failed to open (already reported) answers every read with
     // an error.
     let disc = cd_disc.unwrap_or_else(|| get_disc_format(StubDisc {}));
@@ -76,7 +86,44 @@ pub fn receive_syscalls(
     if let Some(s) = swap.as_ref() {
         s.install(conn);
     }
+    // Only where something asks the console a question while the title runs:
+    // without the panel, the stack watch or the witness words, nothing would
+    // answer.
+    let mut keepalive = match keepalive {
+        Some(cfg) if diag.is_some() || stack.is_some() || marks.is_some() => {
+            let k = crate::keepalive::Keepalive::new(&cfg);
+            k.install(conn);
+            Some(k)
+        }
+        Some(_) => {
+            debug!("keepalive: off, nothing asks this console anything while the title runs");
+            None
+        }
+        None => None,
+    };
     loop {
+        // The panel's own reading of the hook, while it has the wire.
+        let panel_hooked = diag
+            .as_ref()
+            .filter(|_| crate::ui::sampling_wanted())
+            .and_then(|d| d.word("g_irq_hooked"));
+        if let Some(k) = keepalive.as_mut()
+            && let Some(quiet) = k.tick(conn, panel_hooked)
+        {
+            error!(
+                "keepalive: nothing from the console for {}s -- it is off, reset or frozen. \
+                 Ending the session (--keepalive 0 keeps it open).",
+                quiet.as_secs()
+            );
+            // The last numbers the console gave, before they are gone.
+            if let Some(d) = diag.as_ref().filter(|_| crate::ui::sampling_wanted()) {
+                d.dump(&format!(
+                    "keepalive: nothing from the console for {}s; the last sample it answered",
+                    quiet.as_secs()
+                ));
+            }
+            return Ok(SessionEnd::Silent(quiet));
+        }
         // Instruments post their own requests here, at the top, where no
         // transfer owns the conversation; their replies are claimed in the IO
         // layer (`io::PacketSink`).
@@ -113,6 +160,7 @@ pub fn receive_syscalls(
             diag.as_ref().and_then(|d| d.poll_timeout()),
             stack.as_ref().and_then(|s| s.poll_timeout()),
             marks.as_ref().and_then(|m| m.poll_timeout()),
+            keepalive.as_ref().and_then(|k| k.poll_timeout()),
         ]
         .into_iter()
         .flatten()
@@ -164,7 +212,7 @@ pub fn receive_syscalls(
                             }
                             DCLoadClientCmds::Exit => {
                                 info!("Received Exit syscall, terminating syscall receiver");
-                                return Ok(());
+                                return Ok(SessionEnd::Exit);
                             }
                             DCLoadClientCmds::FSCommand(cmd) => {
                                 debug!("Received FSCommand syscall: {:?}", cmd);
@@ -191,3 +239,4 @@ pub fn receive_syscalls(
         }
     }
 }
+

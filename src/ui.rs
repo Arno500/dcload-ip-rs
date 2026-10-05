@@ -983,6 +983,14 @@ impl DiagPanel {
         }
     }
 
+    /// The `w` snapshot, written from code, headed by `why`.
+    pub fn dump(&self, why: &str) {
+        let Ok(text) = self.state.lock().map(|s| s.snapshot()) else {
+            return;
+        };
+        write_snapshot(&format!("--- {why}\n{text}"));
+    }
+
     pub fn render(&self) {
         if self.on_screen {
             paint(&self.bar, &self.state);

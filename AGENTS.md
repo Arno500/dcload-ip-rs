@@ -120,7 +120,8 @@ Global options: `-H/--host`, `-v`/`-vv`, `-p/--port`, `-i/--infinite`,
 `--no-ppf`, `--no-gaps-guard`, `--no-marks`, `--no-vm2`, `--no-wince`,
 `--vga auto|always|never`, `--no-cdda`, `--cdda-tone`, `--probe ADDR=ID[:PEEK]`
 (a stub that logs when ADDR executes), `--descramble auto|always|never`,
-`--boot-ipbin`, `--diag`, `--diag-interval`. `src/main.rs` (`Args`) is the
+`--boot-ipbin`, `--diag`, `--diag-interval`, `--keepalive SECONDS`.
+`src/main.rs` (`Args`) is the
 list of record.
 
 **Data files live at the project root** (outside `target/`, so `cargo clean`
@@ -395,6 +396,18 @@ No negotiation: check the mode first when a console does not answer.
   loader answers only inside `bb->loop()`, so a title that stopped reading its
   disc may leave the panel unanswered; the header shows the measured
   interval. The panel and stack watch overlap, so only one is active at a time.
+- **Keepalive** (`--keepalive`, default 10 s, 0 = off; `keepalive.rs`): the
+  syscall loop ends the session (exit code 1) when no datagram at all has
+  arrived for that long (`ExternalDcIo::last_input`, set in `handle_data`
+  before the sinks). Past a third of the limit without a word it asks for
+  itself (4-byte `SBIQ` of `g_irq_hooked` every 0.5 s), answered within 50 ms
+  by the hook's idle listen. It is **armed only where silence means
+  something**: the panel, the stack watch or the witness words up, not a KOS title, a loader with the hook's idle listen
+  (`gd_idle_listen` in its ELF; `main.rs` `keepalive_config`), and
+  `g_irq_hooked` read non-zero on the console (a 4-byte `SBIQ` every 10 s,
+  60 s after six unanswered, until it is; read off the panel's samples while
+  it has the wire). The panel does not suspend it: when it samples, its last
+  sample is appended to `dcload-diag.txt` as the session ends.
 
 ## 10. Gotchas
 
