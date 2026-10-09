@@ -26,6 +26,7 @@ pub fn receive_syscalls(
     running_base: Option<u32>,
     out_of_heap: bool,
     guards: &[GuardWord],
+    disc_patches: Vec<DiscPatch>,
     cdda: CddaSource,
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     mut diag: Option<crate::diag::Probe>,
@@ -78,6 +79,7 @@ pub fn receive_syscalls(
         running_base,
         out_of_heap,
         guards,
+        disc_patches,
         memory,
         stage,
     );
@@ -151,6 +153,8 @@ pub fn receive_syscalls(
                 "disc changed to {spec}: {} tracks, {audio_tracks} of them audio",
                 toc_all_tracks.len()
             );
+            // The achievements follow the game to its next disc.
+            crate::ra::session::disc_changed(&spec);
             reply.send(Ok(format!("disc changed to {spec}")));
         }
         // The soonest wake-up anyone wants; none at all blocks.

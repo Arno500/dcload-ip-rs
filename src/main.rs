@@ -13,6 +13,7 @@ mod control;
 mod adpcm;
 mod cd;
 mod diag;
+mod discord;
 mod fs;
 mod disc_formats;
 mod dispatch;
@@ -23,6 +24,7 @@ mod marks;
 mod memmap;
 mod patchdb;
 mod ppf;
+mod ra;
 mod presets;
 mod stackwatch;
 mod variants;
@@ -209,6 +211,16 @@ struct Args {
     #[arg(long)]
     no_wince: bool,
 
+    /// Take the loader out of the TOP of Windows CE's RAM, as this host did
+    /// until 2026-10-09.
+    ///
+    /// By default the loader goes at the bottom of CE's page pool
+    /// (`ulRAMFree`, raised above it). CE hands pages out from the top, so
+    /// taking them there moves everything it loads down by as much: Sega Rally
+    /// 2's program landed 80 KB under where its achievement set looks for it.
+    #[arg(long, conflicts_with = "no_wince")]
+    wince_loader_top: bool,
+
     /// Make the title believe a VGA box is plugged in.
     ///
     /// Two things, both found in the image and both applied before it runs:
@@ -364,6 +376,31 @@ struct Args {
     /// listens for `swap-disc`; 0 turns it off.
     #[arg(long, default_value_t = control::default_port(), value_name = "PORT")]
     control_port: u16,
+
+    /// Do not earn RetroAchievements.
+    ///
+    /// By default a `u-exec` of a disc image earns them once a login is saved
+    /// (`ra-login`): the loader samples the memory the set reads, once per
+    /// frame, and this host judges it with rcheevos and reports to
+    /// retroachievements.org. Without a login, or for what cannot be sampled (a
+    /// KOS title, a bare program, a loader built without `WITH_RCHEEVOS`; loader
+    /// AGENTS.md 4.20), it stays off and says why in one line. SOFTCORE only,
+    /// unless `--ra-hardcore`.
+    #[arg(long)]
+    no_ra: bool,
+
+    /// Ask for hardcore mode. RetroAchievements accepts it only from clients it
+    /// has registered, which this one is not yet: expect the server to refuse.
+    #[arg(long, conflicts_with = "no_ra")]
+    ra_hardcore: bool,
+
+    /// Show the game on your Discord profile while RetroAchievements runs: its
+    /// title and badge, its rich presence, the achievements earned and a link
+    /// to its page. Takes the APPLICATION ID of an application you create at
+    /// discord.com/developers/applications (its name is what Discord shows after
+    /// "Playing"). Discord must run on this PC; it is looked for every 30 s.
+    #[arg(long, conflicts_with = "no_ra", value_name = "APPLICATION_ID")]
+    discord: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -1031,10 +1068,71 @@ fn choose_loader_image(args: &Args, loaders: &mut loaders::LoaderSet, has_disc: 
     info!("loader image: resident (no screen, no DHCP) at 0x{base:08x}");
 }
 
+/// The base the rules below choose, then taken out of a syMalloc heap
+/// (`dispatch::heap`): a base inside one moves to its top, whose end the upload
+/// and the served sectors lower past the loader. Not for a base given with
+/// `--loader-base`, nor for one the HLib rule chose (Shenmue II's syMalloc heap
+/// is not the allocator it uses, and the HLib bottom is measured).
 fn wanted_loader_base(
     args: &Args,
     running: Option<u32>,
     disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
+    katana: &[dispatch::DiscHeap],
+) -> Option<u32> {
+    let mut by_hlib = false;
+    let want = wanted_loader_base_by_rules(args, running, disc, &mut by_hlib);
+    if by_hlib || katana.is_empty() || args.no_relocate || args.loader_base.is_some() {
+        return want;
+    }
+    let base = want.or(running)?;
+    let heaps: Vec<dispatch::KatanaHeap> = katana.iter().map(|d| d.heap).collect();
+    match dispatch::katana_loader_base(&heaps, base) {
+        // The rules below check a base against the constants of the program
+        // this host uploads; the programs the disc serves are checked here.
+        Some(top)
+            if top != base
+                && disc.is_some_and(|(d, _)| {
+                    katana.iter().all(|k| match k.literals_in_loader(d, top) {
+                        Ok(hits) if hits.is_empty() => true,
+                        Ok(hits) => {
+                            warn!(
+                                "{} loads {} constant(s) naming RAM a loader at its heap's top \
+                                 (0x{top:08x}) would occupy (0x{:08x} first); not moving it there",
+                                k.file,
+                                hits.len(),
+                                hits[0].0
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            warn!("{e}; not moving the loader to 0x{top:08x}");
+                            false
+                        }
+                    })
+                }) =>
+        {
+            let names: Vec<&str> = katana
+                .iter()
+                .filter(|d| d.heap.patch(top).is_ok_and(|p| p.is_some()))
+                .map(|d| d.file.as_str())
+                .collect();
+            info!(
+                "0x{base:08x} is inside the syMalloc heap {} sets up                  (0x{:08x}..0x{:08x}), which fills differently every time: putting the                  loader at 0x{top:08x}, its top, and lowering the heap's end to it",
+                names.join(" and "),
+                heaps.iter().filter(|h| h.loader_base() == Some(top)).map(|h| h.start).min().unwrap_or(0),
+                heaps.iter().filter(|h| h.loader_base() == Some(top)).map(|h| h.end).max().unwrap_or(0),
+            );
+            Some(top)
+        }
+        _ => want,
+    }
+}
+
+fn wanted_loader_base_by_rules(
+    args: &Args,
+    running: Option<u32>,
+    disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
+    by_hlib: &mut bool,
 ) -> Option<u32> {
     if args.no_relocate {
         return None;
@@ -1186,25 +1284,32 @@ fn wanted_loader_base(
     };
 
     // A WINDOWS CE TITLE SAYS WHERE ITS RAM IS, AND IT IS ALMOST ALL OF IT.
-    // Its kernel hands pages out of `ulRAMStart..ulRAMEnd` from the top down,
+    // Its kernel hands pages out of `ulRAMFree..ulRAMEnd` from the top down,
     // so a loader placed by the rules below -- which know Katana allocators --
     // lands in that pool and is overwritten once CE's allocations reach it.
-    // The loader goes at the top of the pool instead, and the upload tells CE
-    // its pool ends there (`wince::ram_end_patch`). Measured on Sega Rally 2
-    // PAL: pool 0x8c143000..0x8cef0000, loader at 0x8cee0000.
+    // The loader goes at the bottom of the pool instead, and the upload tells
+    // CE its pool starts above it (`wince::take`): taken from the top, it moved
+    // everything CE loads down by as much (Sega Rally 2's program, 2026-10-09).
+    // Measured on Sega Rally 2 PAL: pool 0x8c143000..0x8cef0000.
     if framed_wince {
         match wince::romhdr(&boot, args.address) {
-            Some(h) => match wince::loader_base(&h, loaders::LOADER_SPAN) {
+            Some(h) => match wince::loader_base(&h, loaders::LOADER_SPAN, wince_place(args)) {
                 Some(base) => {
                     info!(
-                        "Windows CE: its kernel manages RAM 0x{:08x}..0x{:08x} (ROMHDR at                          0x{:08x}); putting the loader at 0x{base:08x}, the top of that, and                          telling CE its RAM ends there",
-                        h.ram_start, h.ram_end, h.at
+                        "Windows CE: its kernel manages RAM 0x{:08x}..0x{:08x} (ROMHDR at \
+                         0x{:08x}); putting the loader at 0x{base:08x}, the {} of that, and \
+                         taking it out of CE's RAM",
+                        h.ram_start,
+                        h.ram_end,
+                        h.at,
+                        if args.wince_loader_top { "top" } else { "bottom" }
                     );
                     return Some(base);
                 }
                 None => warn!(
-                    "Windows CE: its RAM ends at 0x{:08x}, too low to take the loader's 64 KB                      out of; placing the loader by the usual rules, where CE may reuse it",
-                    h.ram_end
+                    "Windows CE: its RAM (0x{:08x}..0x{:08x}) is too small to take the loader's \
+                     64 KB out of; placing the loader by the usual rules, where CE may reuse it",
+                    h.ram_free, h.ram_end
                 ),
             },
             None => warn!(
@@ -1295,6 +1400,7 @@ fn wanted_loader_base(
                      loader at 0x{b:08x}, its bottom, and starting the heap above it",
                     heap.start, heap.end
                 );
+                *by_hlib = true;
                 return Some(b);
             }
             Some(b) => warn!(
@@ -1716,6 +1822,22 @@ enum Commands {
         #[arg(value_hint = clap::ValueHint::FilePath)]
         disc: String,
     },
+    /// Log in to retroachievements.org once; the token (never the password) is
+    /// kept in the user's config folder; RetroAchievements is then on for every
+    /// disc image (`--no-ra` turns it off). Touches no console.
+    RaLogin {
+        /// Your RetroAchievements user name
+        user: String,
+    },
+    /// Say how much memory a disc's RetroAchievements set makes the loader
+    /// sample: the number to compare with `RA_WORDS` (loader AGENTS.md 4.20).
+    /// Needs `ra-login`; touches no console.
+    RaCount {
+        /// Disc image (.gdi / .cdi / .iso / .zip), or the 32-digit RetroAchievements
+        /// hash of one when the disc is not at hand
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        disc: String,
+    },
     /// Write known patterns to free RAM and read them straight back, across
     /// several sizes and misalignments. Uploads no title and starts nothing --
     /// it only answers "can a read-back off this console be believed at all".
@@ -2007,6 +2129,87 @@ fn start_stack_watch(
     }
 }
 
+/// Start the RetroAchievements thread (on unless `--no-ra`), `None` when it
+/// cannot run. Being on by default, it is quiet about what it cannot do: one
+/// `info` line, never a warning, unless something it should have done failed.
+///
+/// It needs what the loader's sampler needs: a resident loader built with
+/// `WITH_RCHEEVOS` (the symbol `g_ra_gen` is how that is told), and a title
+/// whose interrupt entry the hook recognises -- never KOS. The disc is only
+/// opened a second time to hash it.
+fn start_ra(
+    args: &Args,
+    conn: &mut DcIoUDP,
+    kos: bool,
+    wince: bool,
+    running_base: Option<u32>,
+    disc: Option<&str>,
+) -> Option<ra::session::Handle> {
+    if args.no_ra {
+        return None;
+    }
+    let Some(disc) = disc else {
+        debug!("RetroAchievements: off (no disc image: a bare program has no set)");
+        return None;
+    };
+    if kos {
+        info!("RetroAchievements: off (a KOS title has no interrupt hook, nothing can be sampled)");
+        return None;
+    }
+    if ra::store::load().is_none() {
+        info!("RetroAchievements: off (not logged in; `ra-login <user>` once turns it on)");
+        return None;
+    }
+    if wince {
+        info!(
+            "RetroAchievements: Windows CE -- the loader reads the title's RAM past its write-back \
+             cache and has room for fewer words (loader AGENTS.md 4.20; not yet seen on a \
+             console)"
+        );
+    }
+    let has_sampler = running_base
+        .ok_or_else(|| "the loader does not report its base".to_string())
+        .and_then(|base| running_loader_image(args, base))
+        .and_then(|(elf, _)| loaders::symbols(&elf))
+        .map(|syms| syms.contains_key("g_ra_gen"));
+    match has_sampler {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(
+                "RetroAchievements: off (the loader on the console has no sampler; rebuild \
+                 the loader set with `make loaders`, WITH_RCHEEVOS, and redeploy loaders/)"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("RetroAchievements: off (cannot tell whether the loader can sample: {e})");
+            return None;
+        }
+    }
+    use crate::io::ExternalDcIo as _;
+    let socket = conn.try_clone_socket()?;
+    if args.ra_hardcore {
+        warn!("--ra-hardcore: the server will most likely refuse it (client not registered)");
+    }
+    let mut cfg = ra::session::Config::new(args.ra_hardcore, wince);
+    cfg.discord = args.discord.clone();
+    match ra::session::start(
+        cfg,
+        Some(disc.to_string()),
+        socket,
+    ) {
+        Ok(handle) => {
+            conn.add_sink(handle.sink());
+            info!("RetroAchievements: starting");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!("RetroAchievements: {e}");
+            None
+        }
+    }
+}
+
 /// The `--keepalive` settings for this title, `None` when it cannot be armed.
 ///
 /// Silence means something only when the loader listens while the title runs
@@ -2046,6 +2249,19 @@ fn keepalive_config(args: &Args, kos: bool, running_base: Option<u32>) -> Option
             None
         }
     }
+}
+
+/// Where the running loader keeps the RetroAchievements room it is lent under
+/// Windows CE (`g_ra_ce_room`, `g_ra_ce_room_words`, cdfs_syscalls.c); `None`
+/// for a loader without the sampler.
+/// Which end of Windows CE's page pool the loader is taken from.
+fn wince_place(args: &Args) -> wince::Place {
+    if args.wince_loader_top { wince::Place::Top } else { wince::Place::Bottom }
+}
+
+fn ra_ce_room_symbols(args: &Args, base: u32) -> Option<(u32, u32)> {
+    let syms = running_loader_image(args, base).and_then(|(elf, _)| loaders::symbols(&elf)).ok()?;
+    Some((syms.get("g_ra_ce_room")?.0, syms.get("g_ra_ce_room_words")?.0))
 }
 
 /// Tell the loader the title is a KOS binary (`g_gd_kos`, cdfs_syscalls.c):
@@ -2196,23 +2412,23 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("title    : {}", identity.title);
-    println!("product  : {} {}", identity.product, identity.version);
-    println!("region   : {}", identity.region);
-    println!("boot md5 : {}", identity.md5);
+    info!("title    : {}", identity.title);
+    info!("product  : {} {}", identity.product, identity.version);
+    info!("region   : {}", identity.region);
+    info!("boot md5 : {}", identity.md5);
     // WHAT THE DISC CAN PLAY, which is not derivable from anything else printed
     // here. A title only ever learns it has music from the table of contents,
     // so "how many audio tracks does this image have" is the first thing worth
     // knowing about a title that is supposed to have a soundtrack and does not.
     let tracks = reader.toc_tracks();
     if tracks.is_empty() {
-        println!("tracks   : this image does not enumerate its tracks -- no CDDA possible");
+        info!("tracks   : this image does not enumerate its tracks -- no CDDA possible");
     } else {
         let audio: Vec<u8> = tracks.iter().filter(|t| t.audio).map(|t| t.number).collect();
         if audio.is_empty() {
-            println!("tracks   : {} tracks, none of them audio", tracks.len());
+            info!("tracks   : {} tracks, none of them audio", tracks.len());
         } else {
-            println!(
+            info!(
                 "tracks   : {} tracks, {} audio ({})",
                 tracks.len(),
                 audio.len(),
@@ -2232,7 +2448,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     ) {
         Ok(b) => {
             framed_wince = b.wince && b.skipped > 0;
-            println!(
+            info!(
                 "boot bin : {} ({} bytes at LBA {}){}",
                 b.name,
                 b.bytes.len(),
@@ -2243,9 +2459,9 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     _ => "",
                 }
             );
-            println!("bin md5  : {:x}", md5::compute(&b.bytes));
+            info!("bin md5  : {:x}", md5::compute(&b.bytes));
             if b.wince {
-                println!(
+                info!(
                     "wince    : Windows CE -- {}",
                     if args.no_wince {
                         "uploaded whole and entered directly (--no-wince)".to_string()
@@ -2261,20 +2477,20 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             Some(b.bytes)
         }
         Err(e) => {
-            println!("boot bin : NOT FOUND -- {e}");
+            info!("boot bin : NOT FOUND -- {e}");
             None
         }
     };
     if let Some(b) = boot_bytes.as_ref() {
         let n = dispatch::gd_body_patches(b, args.address, 0).len();
         if n > 0 {
-            println!(
+            info!(
                 "gd body  : {n} direct call site(s) to the BIOS GD driver (0x8c0010f0), \
                  pointed at the loader's emulation at upload"
             );
         }
         if !framed_wince && let Some(h) = dispatch::hlib_heap(b, args.address) {
-            println!(
+            info!(
                 "heap     : HLib 0x{:08x}..0x{:08x}; loader {}",
                 h.start,
                 h.end,
@@ -2290,26 +2506,27 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         }
         if framed_wince {
             match wince::romhdr(b, args.address) {
-                Some(h) => println!(
-                    "ce ram   : ROMHDR at 0x{:08x}: RAM 0x{:08x}..0x{:08x}, driver globals \
-                     0x{:08x}..0x{:08x}; loader {}",
+                Some(h) => info!(
+                    "ce ram   : ROMHDR at 0x{:08x}: RAM 0x{:08x}..0x{:08x} (free from \
+                     0x{:08x}), driver globals 0x{:08x}..0x{:08x}; loader {}",
                     h.at,
                     h.ram_start,
                     h.ram_end,
+                    h.ram_free,
                     h.drivglob_start,
                     h.drivglob_start.wrapping_add(h.drivglob_len),
-                    match wince::loader_base(&h, loaders::LOADER_SPAN) {
-                        Some(base) => format!("at 0x{base:08x}, RAM end moved there"),
+                    match wince::loader_base(&h, loaders::LOADER_SPAN, wince_place(args)) {
+                        Some(base) => format!("at 0x{base:08x}, taken out of CE's RAM"),
                         None => "placed by the usual rules".to_string(),
                     }
                 ),
-                None => println!("ce ram   : no ROM header found"),
+                None => info!("ce ram   : no ROM header found"),
             }
             match wince::pio_patches(b, args.address).first() {
-                Some((at, w)) => println!(
+                Some((at, w)) => info!(
                     "ce gd    : aligned reads sent to PIO at 0x{at:08x} (word 0x{w:08x})"
                 ),
-                None => println!("ce gd    : DMA/PIO choice NOT found -- DMA streams would stall"),
+                None => info!("ce gd    : DMA/PIO choice NOT found -- DMA streams would stall"),
             }
         }
     }
@@ -2325,7 +2542,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         .as_deref()
         .map(|b| dispatch::vga_cable_patches(b, args.address))
         .unwrap_or_default();
-    println!(
+    info!(
         "vga      : IP.BIN {}; {}",
         match declared {
             Some(true) => "declares VGA box support",
@@ -2355,25 +2572,25 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             };
             let mut said = false;
             for c in &plan.apply {
-                println!("patch    : {}", line(c, "WOULD APPLY"));
+                info!("patch    : {}", line(c, "WOULD APPLY"));
                 said = true;
             }
             for c in &plan.offer {
-                println!("patch    : {}", line(c, "available (--ppf)"));
+                info!("patch    : {}", line(c, "available (--ppf)"));
                 said = true;
             }
             for p in &plan.problems {
-                println!("patch    : {p}");
+                info!("patch    : {p}");
                 said = true;
             }
             if !said {
-                println!(
+                info!(
                     "patch    : no PPF patch listed or found for this dump ({})",
                     plan.summary
                 );
             }
         }
-        None => println!("patch    : no boot binary, so no PPF patch could be checked"),
+        None => info!("patch    : no boot binary, so no PPF patch could be checked"),
     }
 
     let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
@@ -2389,13 +2606,13 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     let seen = seen_db.get(&identity.md5).map(|r| r.map);
     let sp_min = seen_db.get(&identity.md5).and_then(|r| r.sp_min);
     match seen.as_ref() {
-        Some(m) => println!(
+        Some(m) => info!(
             "seen     : {} of 256 blocks of 64 KB used in earlier sessions \
              (of {} games recorded)",
             m.blocks_marked(),
             seen_db.len()
         ),
-        None => println!(
+        None => info!(
             "seen     : nothing recorded for this game yet (of {} games recorded)",
             seen_db.len()
         ),
@@ -2406,7 +2623,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     match sp_min {
         Some(sp) => {
             let end = loaders.image_end_for(loaders::DEFAULT_BASE);
-            println!(
+            info!(
                 "stack    : enters GD syscalls as low as 0x{sp:08x}; a loader at \
                  0x{:08x} ends at 0x{} -- {} (needs {})",
                 loaders::DEFAULT_BASE,
@@ -2418,7 +2635,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 loaders::LOW_BASE_MIN_MARGIN,
             )
         }
-        None => println!(
+        None => info!(
             "stack    : never measured -- no session has read this title's GD stack \
              pointer back off the console"
         ),
@@ -2433,11 +2650,11 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
     if let Some(bytes) = boot_bytes.as_deref() {
         let fills = dispatch::constant_range_fills(bytes, args.address);
         match (painted_at(loaders::DEFAULT_BASE), fills.first()) {
-            (Some(p), _) => println!(
+            (Some(p), _) => info!(
                 "startup  : {} -- NO LOW BASE",
                 painted_reason(loaders::DEFAULT_BASE, p)
             ),
-            (None, Some(&(lo, hi, site))) => println!(
+            (None, Some(&(lo, hi, site))) => info!(
                 "startup  : fills 0x{lo:08x}..0x{hi:08x} (the loop at 0x{site:08x}){}; clear \
                  of a loader at 0x{:08x}",
                 if fills.len() > 1 {
@@ -2447,7 +2664,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 },
                 loaders::DEFAULT_BASE
             ),
-            (None, None) => println!("startup  : no fill of a constant range found"),
+            (None, None) => info!("startup  : no fill of a constant range found"),
         }
     }
     // `is_preset`: `base` is the title's own preset, whose window is tried
@@ -2463,17 +2680,17 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             .collect::<Vec<_>>()
             .join(" and ");
         if hits.is_empty() {
-            println!("overlap  : none -- nothing the title loads points into {where_}");
+            info!("overlap  : none -- nothing the title loads points into {where_}");
             return;
         }
-        println!(
+        info!(
             "overlap  : {} CONSTANT(S) POINT INTO THE LOADER at {where_}",
             hits.len()
         );
         for (at, site) in hits.iter().take(8) {
-            println!("           0x{at:08x} loaded at 0x{site:08x}");
+            info!("           0x{at:08x} loaded at 0x{site:08x}");
         }
-        println!(
+        info!(
             "           If the title writes there the loader is overwritten -- and a \
              Maple DMA does it with no syscall, no packet and no exception."
         );
@@ -2485,7 +2702,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             && let Some((alt, ceiling)) =
                 preset_window_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min)
         {
-            println!(
+            info!(
                 "           uexec would use 0x{alt:08x} instead: the top of the preset's \
                  window, under 0x{ceiling:08x}, the lowest address the title names above it \
                  (relocating {} there -- no rebuild).",
@@ -2494,7 +2711,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             return;
         }
         match pick_clear_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min) {
-            Some(alt) => println!(
+            Some(alt) => info!(
                 "           uexec would use 0x{alt:08x} instead ({}).",
                 if loaders.has(alt) {
                     "a loader built for that address".to_string()
@@ -2502,7 +2719,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     format!("relocating {} there -- no rebuild", loaders::RELOCATABLE_NAME)
                 }
             ),
-            None => println!(
+            None => info!(
                 "           Nowhere clear of it, so uexec would go ahead here. Note this \
                  only sees constants: a heap that grows into the loader has none."
             ),
@@ -2515,18 +2732,19 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         .as_deref()
         .filter(|_| framed_wince)
         .and_then(|b| wince::romhdr(b, args.address))
-        .and_then(|h| wince::loader_base(&h, loaders::LOADER_SPAN))
+        .and_then(|h| wince::loader_base(&h, loaders::LOADER_SPAN, wince_place(args)))
     {
-        println!(
-            "would use: 0x{base:08x} -- the top of Windows CE's RAM, taken out of it at \
-             upload; the preset is not consulted"
+        info!(
+            "would use: 0x{base:08x} -- {} of Windows CE's RAM, taken out of it at \
+             upload; the preset is not consulted",
+            if args.wince_loader_top { "the top" } else { "the bottom" }
         );
         report_collisions(base, false);
         return ExitCode::SUCCESS;
     }
     let (db_path, db_searched) = game_db_path(args, &loaders);
     match presets::PresetDb::load(&db_path) {
-        Err(e) => println!(
+        Err(e) => info!(
             "preset   : no database at {} ({e})\n           looked in: {}",
             db_path.display(),
             db_searched
@@ -2548,7 +2766,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     )
                 }) {
                     Some(alt) => {
-                        println!(
+                        info!(
                             "preset   : not in the database ({} rows); would leave 0x{:08x} \
                              for 0x{alt:08x}, off the low family",
                             db.len(),
@@ -2557,7 +2775,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         report_collisions(alt, false);
                     }
                     None => {
-                        println!(
+                        info!(
                             "preset   : not in the database ({} rows); nothing clear of the \
                              low family, so it would stay at 0x{:08x} and be overwritten",
                             db.len(),
@@ -2568,7 +2786,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                 }
             }
             None => {
-                println!(
+                info!(
                     "preset   : not in the database ({} rows); would stay at 0x{:08x}",
                     db.len(),
                     loaders::DEFAULT_BASE
@@ -2587,9 +2805,9 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         }
                     }
                 };
-                println!("preset   : '{}' -- {}", p.title, how);
-                println!("memory   : 0x{:08x}", p.memory);
-                println!(
+                info!("preset   : '{}' -- {}", p.title, how);
+                info!("memory   : 0x{:08x}", p.memory);
+                info!(
                     "loader   : {}",
                     if let Some(reason) = loaders::known_unsupported(p.memory) {
                         format!("UNSUPPORTED base -- {reason}")
@@ -2611,7 +2829,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     }
                 );
                 for note in p.unsupported() {
-                    println!("not done : {note}");
+                    info!("not done : {note}");
                 }
                 // The same two functions `uexec` calls, so this report cannot
                 // drift from what a run would do -- including for a preset this
@@ -2627,7 +2845,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         base_for_low_preset(&loaders, b, args.address, seen.as_ref(), sp_min)
                     }) {
                         Some(alt) => {
-                            println!(
+                            info!(
                                 "would use: 0x{alt:08x} -- 0x{:08x} and 0x{:08x} are ruled out \
                                  by a preset this low",
                                 loaders::ISOLDR_DEFAULT_ADDR,
@@ -2635,7 +2853,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             );
                             report_collisions(alt, false);
                         }
-                        None => println!(
+                        None => info!(
                             "would use: nothing clear of this title could be produced; the \
                              loader would stay where it is"
                         ),
@@ -2644,14 +2862,14 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     // THE SAME PREDICATES `uexec` APPLIES, so the offline
                     // report cannot come to a different answer than a run.
                     if unprovidable {
-                        println!(
+                        info!(
                             "too big  : the loader set cannot be placed at 0x{:08x} -- its \
                              image no longer fits under the BIOS VBR",
                             p.memory
                         );
                     }
                     if let Some(votes) = contested.as_ref() {
-                        println!(
+                        info!(
                             "contested: presets under this title disagree ({}) and one is \
                              below 0x{:08x} -- DreamShell only goes there once its default \
                              and its high option have failed",
@@ -2664,7 +2882,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         );
                     }
                     if no_headroom {
-                        println!(
+                        info!(
                             "no room  : this title's measured stack leaves less than {} bytes \
                              under a loader at 0x{:08x}",
                             loaders::LOW_BASE_MIN_MARGIN,
@@ -2682,7 +2900,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                         )
                     }) {
                         Some(alt) => {
-                            println!(
+                            info!(
                                 "would use: 0x{alt:08x} -- off the low family, seeded from \
                                  0x{:08x}, DreamShell's own answer when low RAM is not \
                                  workable",
@@ -2691,7 +2909,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             report_collisions(alt, false);
                         }
                         None => {
-                            println!(
+                            info!(
                                 "would use: nothing clear of the low family could be produced; \
                                  the preset's 0x{:08x} would be used anyway",
                                 p.memory
@@ -2927,6 +3145,31 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Commands::SwapDisc { ref disc } = args.command {
         return Ok(control::swap_disc_client(args.control_port, disc));
     }
+    if let Commands::RaLogin { ref user } = args.command {
+        let password = match console::Term::stderr().read_secure_line() {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                error!("no password given");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        return Ok(match ra::session::login(user, &password) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("RetroAchievements login failed: {e}");
+                ExitCode::FAILURE
+            }
+        });
+    }
+    if let Commands::RaCount { ref disc } = args.command {
+        return Ok(match ra::session::count(disc) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("{e}");
+                ExitCode::FAILURE
+            }
+        });
+    }
     if let Commands::Relocate {
         ref elf,
         to,
@@ -2943,7 +3186,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(match loaders::relocate(&bytes, to) {
             Ok(moved) => match std::fs::write(output, &moved) {
                 Ok(()) => {
-                    println!("{elf} -> {output}, based at 0x{to:08x} ({} bytes)", moved.len());
+                    info!("{elf} -> {output}, based at 0x{to:08x} ({} bytes)", moved.len());
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -3083,6 +3326,24 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     }
 
+    // SYMALLOC HEAPS (dispatch::heap): every program on the disc that hands
+    // Katana's allocator the RAM up to a fixed end. Found once, before EXEC,
+    // because the placement below and the patches before EXEC both need them,
+    // and the sectors served afterwards carry the patch.
+    let katana_heaps: Vec<dispatch::DiscHeap> = match disc_reader.as_deref() {
+        Some(d) if matches!(args.command, Commands::UExec { .. }) && !args.no_heap_guard => {
+            dispatch::disc_katana_heaps(d)
+        }
+        _ => vec![],
+    };
+    for h in &katana_heaps {
+        debug!(
+            "heap     : {} sets up a syMalloc heap 0x{:08x}..0x{:08x} (its end is the word \
+             at 0x{:08x})",
+            h.file, h.heap.start, h.heap.end, h.heap.end_at
+        );
+    }
+
     // Relocate BEFORE uploading the title. Any chainload replaces the whole
     // loader, so a title uploaded first would be uploaded into an image that is
     // about to be overwritten -- and the game's own RAM is zero-filled by the
@@ -3106,6 +3367,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             &args,
             running_base,
             disc_reader.as_deref().zip(redirect_disc.as_deref()),
+            &katana_heaps,
         )
         .or(running_base)
     {
@@ -3318,6 +3580,57 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         ),
                     }
                 }
+                // A SYMALLOC HEAP (dispatch::heap) whose top the loader sits at
+                // has its end lowered to the loader: in the program uploaded
+                // now, guarded like the HLib words, and in every program the
+                // disc serves that sets up the same heap, in the sectors as they
+                // are sent (Jet Set Radio runs a JET_PAL.BIN its 1ST_READ.BIN
+                // reads off the disc). Not for an HLib title: that allocator is
+                // the one it uses.
+                let mut disc_patches: Vec<dispatch::DiscPatch> = vec![];
+                if heap.is_none() && !args.no_heap_guard && !wince
+                    && let Some(base) = running_base
+                {
+                    if let Some(h) = dispatch::katana_heap(&payload, args.address) {
+                        match h.patch(base) {
+                            Ok(Some(p)) => {
+                                info!(
+                                    "syMalloc heap 0x{:08x}..0x{:08x} of the uploaded program: \
+                                     its end lowered to 0x{:08x}, the loader's base (0x{:08x}=0x{:08x})",
+                                    h.start, h.end, p.1, p.0, p.1
+                                );
+                                heap_guard.push(p);
+                            }
+                            Ok(None) => {}
+                            Err(why) => warn!(
+                                "syMalloc heap 0x{:08x}..0x{:08x} of the uploaded program: the \
+                                 loader at 0x{base:08x} cannot be taken out of it: {why}. Expect \
+                                 the heap to overwrite it.",
+                                h.start, h.end
+                            ),
+                        }
+                    }
+                    for d in &katana_heaps {
+                        match d.patch(base) {
+                            Ok(Some(p)) => {
+                                info!(
+                                    "syMalloc heap 0x{:08x}..0x{:08x} of {} on the disc: its end \
+                                     lowered to 0x{:08x} in the sectors served (LBA 0x{:08x} \
+                                     +0x{:03x})",
+                                    d.heap.start, d.heap.end, d.file, p.value, p.lba, p.off
+                                );
+                                disc_patches.push(p);
+                            }
+                            Ok(None) => {}
+                            Err(why) => warn!(
+                                "syMalloc heap 0x{:08x}..0x{:08x} of {} on the disc: the loader \
+                                 at 0x{base:08x} cannot be taken out of it: {why}. Expect the \
+                                 heap to overwrite it.",
+                                d.heap.start, d.heap.end, d.file
+                            ),
+                        }
+                    }
+                }
                 if let Some(base) = running_base {
                     let mut hits =
                         dispatch::literals_in_loader_footprint(&payload, args.address, base);
@@ -3416,22 +3729,59 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // image CE reads in place, guarded like the others.
                 let mut wince_guard: Vec<(u32, u32)> = vec![];
                 if wince && !args.no_wince {
+                    // RetroAchievements: CE leaves the sampler little room in the
+                    // loader, so a block next to it is taken out of CE's RAM too and
+                    // its place told to the loader (g_ra_ce_room, loader AGENTS.md
+                    // 4.20). Not when RetroAchievements is off.
+                    let ra_room = (!args.no_ra)
+                        .then(|| running_base.and_then(|b| ra_ce_room_symbols(&args, b)))
+                        .flatten();
+                    let room = if ra_room.is_some() { wince::RA_ROOM } else { 0 };
+                    let place = wince_place(&args);
                     match wince::romhdr(&payload, args.address) {
-                        Some(h) => match running_base.and_then(|b| wince::ram_end_patch(&h, b)) {
-                            Some(p) => {
-                                info!(
-                                    "Windows CE: its RAM now ends at 0x{:08x} instead of                                      0x{:08x}, so its kernel never hands out the loader's pages",
-                                    p.1, h.ram_end
-                                );
-                                wince_guard.push(p);
+                        Some(h) => match running_base.and_then(|b| {
+                            wince::take(&h, b, loaders::LOADER_SPAN, room, place)
+                        }) {
+                            Some(t) => {
+                                match place {
+                                    wince::Place::Bottom => info!(
+                                        "Windows CE: its RAM now starts at 0x{:08x} instead of \
+                                         0x{:08x} (its end, 0x{:08x}, untouched), so its kernel \
+                                         never hands out the loader's pages and loads the title \
+                                         where it would without a loader",
+                                        t.patch.1, h.ram_free, h.ram_end
+                                    ),
+                                    wince::Place::Top => info!(
+                                        "Windows CE: its RAM now ends at 0x{:08x} instead of \
+                                         0x{:08x}, so its kernel never hands out the loader's \
+                                         pages (everything it loads moves down by as much)",
+                                        t.patch.1, h.ram_end
+                                    ),
+                                }
+                                wince_guard.push(t.patch);
+                                if let (Some((sym, words)), Some((at, size))) = (ra_room, t.room) {
+                                    info!(
+                                        "RetroAchievements: lending its sampler the {} KB at \
+                                         0x{at:08x}, next to the loader",
+                                        size / 1024
+                                    );
+                                    if let Err(e) = dispatch::apply_patches(
+                                        &mut udpsender,
+                                        &[(sym, at), (words, size / 4)],
+                                    ) {
+                                        warn!("could not tell the loader its RetroAchievements room: {e}");
+                                    }
+                                }
                             }
                             None => info!(
-                                "Windows CE: the loader is outside CE's RAM (0x{:08x}..0x{:08x});                                  nothing to take out of it",
-                                h.ram_start, h.ram_end
+                                "Windows CE: the loader is outside CE's RAM (0x{:08x}..0x{:08x}); \
+                                 nothing to take out of it",
+                                h.ram_free, h.ram_end
                             ),
                         },
                         None => warn!(
-                            "Windows CE: no ROM header found, so the loader's RAM could not be                              taken out of CE's -- expect it to be overwritten"
+                            "Windows CE: no ROM header found, so the loader's RAM could not be \
+                             taken out of CE's -- expect it to be overwritten"
                         ),
                     }
                     let pio = wince::pio_patches(&payload, args.address);
@@ -3455,7 +3805,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // poke made once before EXEC came back as the disc has it.
                 // The heap now starts right above the loader: reads landing
                 // there are the title's allocator at work, not a near miss.
-                let loader_out_of_heap = !heap_guard.is_empty();
+                let loader_out_of_heap = !heap_guard.is_empty() || !disc_patches.is_empty();
                 let guards = dispatch::guard_words(
                     &[
                         gaps_guard,
@@ -3583,6 +3933,15 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     image_end,
                     memory_recorder.clone(),
                 );
+                // Held until the session ends: dropping it stops the thread.
+                let _ra = start_ra(
+                    &args,
+                    &mut udpsender,
+                    kos,
+                    wince && !args.no_wince,
+                    running_base,
+                    redirect_disc.as_deref(),
+                );
                 info!("Upload complete, executing at 0x{:08x}", entry);
                 // The title is on the console now; the host's copy is only
                 // holding up to 16 MiB for the length of the session.
@@ -3606,6 +3965,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                                 running_base,
                                 loader_out_of_heap,
                                 &guards,
+                                disc_patches,
                                 if args.no_cdda {
                                     dispatch::CddaSource::Off
                                 } else if args.cdda_tone {
@@ -3659,6 +4019,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         // out rather than caught by a wildcard so adding a subcommand keeps
         // failing to compile until it is wired up.
         Commands::Identify { .. }
+        | Commands::RaLogin { .. }
+        | Commands::RaCount { .. }
         | Commands::Extract { .. }
         | Commands::AuditAudio { .. }
         | Commands::Relocate { .. } => {

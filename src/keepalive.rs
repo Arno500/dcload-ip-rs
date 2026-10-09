@@ -18,6 +18,16 @@
 //! entry the loader refuses (KOS, homebrew) never arms it. KOS titles are not
 //! even asked: the hook never recognises KOS's table.
 //!
+//! AND IT IS DISARMED WHEN THE HOOK GOES. A title can replace the entry the
+//! loader hooked with one it refuses (Jet Set Radio, 2026-10-09: hooked during
+//! its first loads, two interrupts through it, then refused at the same VBR
+//! before its SEGA logo); the loader is then deaf between reads again, and a
+//! count armed on the first answer ended a live session 10 s into the logo
+//! while the panel's own sample already read `g_irq_hooked` 0. So, armed, this
+//! asks again every `ARMED_CHECK_EVERY` while the console talks (each answer
+//! comes from inside a read's wait), takes the panel's reading too, and goes
+//! back to checking on a 0.
+//!
 //! THE COUNTER PANEL DOES NOT SUSPEND IT: a console that answers nothing has
 //! nothing more to show the panel either (Sonic Adventure 2, 2026-10-05: an
 //! hour of "sample timed out"). While the panel samples, the hook check gives
@@ -44,6 +54,10 @@ pub struct Config {
 const CHECK_EVERY: Duration = Duration::from_secs(10);
 const QUIET_CHECK_EVERY: Duration = Duration::from_secs(60);
 const QUIET_AFTER: u32 = 6;
+/// Armed: how often the hook is asked about while the console still talks,
+/// so that a title which replaced its interrupt entry is noticed before its
+/// loads end.
+const ARMED_CHECK_EVERY: Duration = Duration::from_secs(2);
 /// One question's life, and how often it is asked again inside it -- the
 /// stack watch's figures, for the same link.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -161,20 +175,35 @@ impl Keepalive {
         let paused = crate::ui::sampling_wanted();
         let answer = {
             let mut sink = self.sink.lock().expect("sink poisoned");
-            // Armed, the value is not wanted, only the reply claimed: the
-            // panel's sink comes first in the list and takes it when it has a
-            // sample open over the same word.
+            // Armed, the reply is claimed even while the panel samples (its
+            // sink comes first in the list and takes it when it has a sample
+            // open over the same word; then its reading stands in).
             sink.active = !paused || matches!(self.state, State::Armed(..));
             sink.value.take()
         };
         let answer = answer.or(panel_hooked.map(|v| v as u32));
         let State::Checking { next_at, asked, last_sent, misses } = &mut self.state else {
             let State::Armed(silence, last_ping) = &mut self.state else { unreachable!() };
+            if answer == Some(0) {
+                info!(
+                    "keepalive: the loader's hook is out (the title replaced its interrupt \
+                     entry), so the console is deaf between disc reads; silence is not counted \
+                     until the hook is back"
+                );
+                self.state = State::Checking {
+                    next_at: now + CHECK_EVERY,
+                    asked: None,
+                    last_sent: now,
+                    misses: 0,
+                };
+                return None;
+            }
             if let Some(quiet) = silence.check(now, conn.last_input()) {
                 return Some(quiet);
             }
-            if now.duration_since(silence.since) >= silence.limit / 3
-                && now.duration_since(*last_ping) >= RETRY
+            let silent = now.duration_since(silence.since) >= silence.limit / 3;
+            if (silent && now.duration_since(*last_ping) >= RETRY)
+                || (!silent && !paused && now.duration_since(*last_ping) >= ARMED_CHECK_EVERY)
             {
                 *last_ping = now;
                 let addr = self.sink.lock().expect("sink poisoned").addr;
@@ -237,7 +266,10 @@ impl Keepalive {
         let paused = crate::ui::sampling_wanted();
         match &self.state {
             State::Armed(s, last_ping) => {
-                let ping = (s.since + s.limit / 3).max(*last_ping + RETRY);
+                let mut ping = (s.since + s.limit / 3).max(*last_ping + RETRY);
+                if !paused {
+                    ping = ping.min(*last_ping + ARMED_CHECK_EVERY);
+                }
                 Some(s.poll_timeout(now).min(ping.saturating_duration_since(now)))
             }
             State::Checking { .. } if paused => None,
@@ -301,6 +333,66 @@ mod tests {
             request: None,
             error_code: None,
         }
+    }
+
+    /// A console that talks (`last_input` is now) and counts what it is asked.
+    struct Talking {
+        sent: std::cell::Cell<u32>,
+        heard: Instant,
+    }
+
+    impl ExternalDcIo for Talking {
+        fn poll(&self, _t: Option<Duration>) -> Result<polling::Events, std::io::Error> {
+            unreachable!()
+        }
+        fn handle_data(&mut self, _e: &polling::Events) -> Result<Vec<DCReturnCmd>, std::io::Error> {
+            unreachable!()
+        }
+        fn send_command(&self, _c: DCLoadCmd) -> Result<usize, Box<dyn std::error::Error>> {
+            self.sent.set(self.sent.get() + 1);
+            Ok(0)
+        }
+        fn last_input(&self) -> Option<Instant> {
+            Some(self.heard)
+        }
+    }
+
+    fn keepalive() -> Keepalive {
+        Keepalive::new(&Config { limit: Duration::from_secs(10), hooked_at: 0x8ce0_9fcc })
+    }
+
+    /// Jet Set Radio, 2026-10-09: hooked during its first loads, refused once
+    /// its second program had copied its entry again; the panel read 0 and the
+    /// count, armed, ended the session in the SEGA logo.
+    #[test]
+    fn the_panel_reading_the_hook_out_disarms_the_count() {
+        let mut c = Talking { sent: Default::default(), heard: Instant::now() };
+        let mut k = keepalive();
+        assert_eq!(k.tick(&mut c, Some(1)), None);
+        assert!(matches!(k.state, State::Armed(..)));
+        assert_eq!(k.tick(&mut c, Some(0)), None);
+        assert!(matches!(k.state, State::Checking { .. }));
+        // Back in, armed again.
+        assert_eq!(k.tick(&mut c, Some(1)), None);
+        assert!(matches!(k.state, State::Armed(..)));
+    }
+
+    #[test]
+    fn armed_it_asks_while_the_console_talks_and_disarms_on_a_zero() {
+        let mut c = Talking { sent: Default::default(), heard: Instant::now() };
+        let mut k = keepalive();
+        let now = Instant::now();
+        k.state = State::Armed(Silence::new(k.limit, now), now - ARMED_CHECK_EVERY);
+        assert_eq!(k.tick(&mut c, None), None);
+        assert_eq!(c.sent.get(), 1, "the hook is asked although the console is not silent");
+        assert_eq!(k.tick(&mut c, None), None);
+        assert_eq!(c.sent.get(), 1, "not again before ARMED_CHECK_EVERY");
+        k.sink.lock().unwrap().value = Some(1);
+        assert_eq!(k.tick(&mut c, None), None);
+        assert!(matches!(k.state, State::Armed(..)));
+        k.sink.lock().unwrap().value = Some(0);
+        assert_eq!(k.tick(&mut c, None), None);
+        assert!(matches!(k.state, State::Checking { .. }));
     }
 
     #[test]

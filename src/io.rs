@@ -51,6 +51,11 @@ pub trait ExternalDcIo {
     fn last_input(&self) -> Option<time::Instant> {
         None
     }
+    /// A second handle on the connection, for a thread that only SENDS (the
+    /// RetroAchievements table). Replies still come through this object.
+    fn try_clone_socket(&self) -> Option<UdpSocket> {
+        None
+    }
 }
 
 pub struct DcIoUDP {
@@ -195,5 +200,9 @@ impl ExternalDcIo for DcIoUDP {
 
     fn last_input(&self) -> Option<time::Instant> {
         self.last_input
+    }
+
+    fn try_clone_socket(&self) -> Option<UdpSocket> {
+        self.socket.try_clone().ok()
     }
 }

@@ -323,6 +323,24 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
         ],
     ),
     (
+        // WITH_RCHEEVOS loaders only (loader AGENTS.md 4.20). g_ra_gen is the
+        // generation of the last table the loader took: 0 with RetroAchievements on means no
+        // RACT ever reached it.
+        "RetroAchievements",
+        &[
+            ("g_ra_gen", Fmt::Num),
+            ("g_ra_frames", Fmt::Num),
+            ("g_ra_sent", Fmt::Num),
+            ("g_ra_dropped", Fmt::Num),
+            ("g_ra_keys", Fmt::Num),
+            ("g_ra_tick_max", Fmt::Tmu2Ms),
+            // a table Windows CE's room cannot hold
+            ("g_ra_nofit", Fmt::Num),
+            ("g_ra_oc_words", Fmt::Num),
+            ("g_ra_oc_skip", Fmt::Num),
+        ],
+    ),
+    (
         "Warm start / DHCP",
         &[
             ("g_warm_start", Fmt::Num),
@@ -339,6 +357,10 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
             ("our_ip", Fmt::Ip),
             ("tool_ip", Fmt::Ip),
             ("g_pmcr_backwards", Fmt::Num),
+            // 0 while the loader's clock is performance counter 1; else the
+            // PMCR1 a title wrote over it (bit 31 set), and the clock is TMU2.
+            // Windows CE does (0x8000c004); a Katana or KOS title must not.
+            ("g_clk_tmu2", Fmt::Hex),
             ("g_idle_polls_max", Fmt::Num),
             // The millisecond deadline, which is a DIFFERENT exit from the
             // adapter loop than `g_idle_polls_max` records -- reading that one
@@ -457,6 +479,8 @@ pub struct SampleSink {
     /// OVERLAP -- the panel's span contains `g_gd_sp_min` -- so whichever came
     /// first in the list would eat the other's replies. Exactly one is on.
     active: bool,
+    /// The loader answered `DRST` (`r`: its max/min counters started over).
+    reset_acked: bool,
 }
 
 impl SampleSink {
@@ -472,6 +496,7 @@ impl SampleSink {
             last_sent: Instant::now(),
             need_send: false,
             control: false,
+            reset_acked: false,
             // A SINK MADE BY HAND IS USABLE. `Probe::new` overrides this with
             // the switch's real state; defaulting to off here would make the
             // constructor's product silently deaf, which is a trap for the next
@@ -582,6 +607,11 @@ impl PacketSink for SampleSink {
         let Some(inner) = cmd.cmd.as_ref() else {
             return false;
         };
+        // Nobody else sends DRST: every answer is ours, even a late one.
+        if matches!(inner.cmd, DCLoadCmds::Drst()) {
+            self.reset_acked = true;
+            return true;
+        }
         let (lo, span) = (self.lo, self.span);
         let off = match inner.address.checked_sub(lo) {
             Some(d) if (d as usize) < span => d as usize,
@@ -659,6 +689,11 @@ const SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an unanswered piece waits before it is asked for again.
 const PIECE_RETRY: Duration = Duration::from_millis(300);
 
+/// `DRST` (`r`) is asked again this often, and given up after `RESET_GIVE_UP`:
+/// the loader hears it only in its own network windows, like a sample.
+const RESET_RETRY: Duration = Duration::from_millis(300);
+const RESET_GIVE_UP: Duration = Duration::from_secs(5);
+
 /// How much of the image is compared against the ELF before anything is
 /// decoded. 256 bytes of the first loadable segment, which is what
 /// `scripts/dc-counters.py` settled on.
@@ -698,6 +733,9 @@ pub struct Probe {
     /// watch cannot run alongside it without the two sinks claiming each
     /// other's replies. See `stackwatch::StackVerdict`.
     stack: Option<crate::stackwatch::StackVerdict>,
+    /// `r` pressed and not yet answered: when it was pressed, when `DRST` last
+    /// went out.
+    reset: Option<(Instant, Instant)>,
 }
 
 impl Probe {
@@ -760,6 +798,7 @@ impl Probe {
             real: (lo, span),
             label,
             stack: None,
+            reset: None,
         })
     }
 
@@ -806,6 +845,7 @@ impl Probe {
         if !self.sync_switch() {
             return;
         }
+        self.tick_reset(conn);
         // 1. Anything complete? Decoding is done here, off the packet path.
         let done = {
             let mut sink = self.sink.lock().expect("sink poisoned");
@@ -959,6 +999,47 @@ impl Probe {
             sink.last_sent = Instant::now();
         }
         self.repaint_status();
+    }
+
+    /// Follow `r`: ask the loader to start its max/min counters over (`DRST`,
+    /// `cmd_drst` in commands.c), until it answers. Only while sampling: the
+    /// answer is claimed by the sink, and an inactive sink claims nothing.
+    fn tick_reset(&mut self, conn: &mut impl ExternalDcIo) {
+        if crate::ui::take_reset_extremes() && self.reset.is_none() {
+            let now = Instant::now();
+            self.sink.lock().expect("sink poisoned").reset_acked = false;
+            self.reset = Some((now, now - RESET_RETRY));
+        }
+        let Some((asked, last_sent)) = self.reset else {
+            return;
+        };
+        if std::mem::take(&mut self.sink.lock().expect("sink poisoned").reset_acked) {
+            self.reset = None;
+            info!("diag: the loader's max/min counters start over");
+            // The next sample shows them, now rather than in an interval.
+            if self.sink.lock().expect("sink poisoned").pending.is_none() {
+                self.next_at = Instant::now();
+            }
+            return;
+        }
+        if asked.elapsed() > RESET_GIVE_UP {
+            self.reset = None;
+            warn!(
+                "diag: no answer to DRST -- the max/min counters were not reset (a loader \
+                 older than 2026-10-09 does not know it)"
+            );
+            return;
+        }
+        if last_sent.elapsed() >= RESET_RETRY {
+            let cmd = DCLoadCmd { cmd: DCLoadCmds::Drst(), address: 0, size: 0 };
+            match conn.send_command(cmd) {
+                Ok(_) => self.reset = Some((asked, Instant::now())),
+                Err(e) => {
+                    self.reset = None;
+                    debug!("diag: could not send DRST: {e}");
+                }
+            }
+        }
     }
 
     /// Bring the sampling into line with the panel's switch. Returns whether
@@ -1470,6 +1551,24 @@ mod tests {
         sink.active = true;
         assert!(sink.claim(&ours), "data, once switched on");
         assert!(sink.claim(&dbin(0x8c00_a000, 8)), "terminator, once switched on");
+    }
+
+    /// The loader's answer to `r` (`DRST`) is taken by an active sink only, and
+    /// it is what tells the probe the counters started over.
+    #[test]
+    fn the_answer_to_a_reset_is_ours_while_sampling() {
+        let mut v = b"DRST".to_vec();
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes());
+        let drst = DCReturnCmd::try_from(v).expect("DRST parses");
+
+        let mut sink = SampleSink::new(0x8c00_a000, 8);
+        sink.active = false;
+        assert!(!sink.claim(&drst), "an inactive sink claims nothing");
+        assert!(!sink.reset_acked);
+        sink.active = true;
+        assert!(sink.claim(&drst), "claimed, whatever its address");
+        assert!(sink.reset_acked);
     }
 
     /// A `DoneBinary` is claimed on its ADDRESS, and on nothing else.

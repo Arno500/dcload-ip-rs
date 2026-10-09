@@ -24,6 +24,16 @@ pub enum DCLoadCmds {
     /// `address` is the generation, and in the reply `size` is 0 accepted,
     /// 1 busy (a GD command is in flight), `0xffffffff` refused.
     Disc(),
+    /// The `--diag` panel's `r`: the loader starts its max/min counters over
+    /// (`cmd_drst` in commands.c). Answered with the same command, `size` 0.
+    Drst(),
+    /// RetroAchievements table (`cmd_ract` in ra.c, `ra/`): `address` is the
+    /// generation, the payload the ranges to sample. The reply's `size` is 0
+    /// accepted, `0xffffffff` refused.
+    Ract(Option<Vec<u8>>),
+    /// DC to host, never answered: frames of the sampled ranges. `address` is
+    /// the sequence, the payload what `ra::frames` parses.
+    Rafr(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +66,9 @@ impl DCLoadCmds {
             DCLoadCmds::PerformanceCounter() => "PMCR",
             DCLoadCmds::Mark(_) => "MARK",
             DCLoadCmds::Disc() => "DISC",
+            DCLoadCmds::Drst() => "DRST",
+            DCLoadCmds::Ract(_) => "RACT",
+            DCLoadCmds::Rafr(_) => "RAFR",
         }
     }
 }
@@ -106,6 +119,16 @@ impl From<DCLoadCmd> for Vec<u8> {
             }
             DCLoadCmds::PerformanceCounter() => b"PMCR".to_vec(),
             DCLoadCmds::Disc() => b"DISC".to_vec(),
+            DCLoadCmds::Drst() => b"DRST".to_vec(),
+            DCLoadCmds::Ract(None) => b"RACT".to_vec(),
+            DCLoadCmds::Ract(Some(table)) => {
+                data = table;
+                b"RACT".to_vec()
+            }
+            DCLoadCmds::Rafr(frames) => {
+                data = frames;
+                b"RAFR".to_vec()
+            }
             DCLoadCmds::Mark(None) => b"MARK".to_vec(),
             DCLoadCmds::Mark(Some(bits)) => {
                 data = bits;
@@ -224,6 +247,12 @@ impl TryFrom<Vec<u8>> for DCReturnCmd {
             }
             b"PMCR" => DCLoadCmds::PerformanceCounter(),
             b"DISC" => DCLoadCmds::Disc(),
+            b"DRST" => DCLoadCmds::Drst(),
+            b"RACT" => {
+                let payload = &input[12..];
+                DCLoadCmds::Ract((!payload.is_empty()).then(|| payload.to_vec()))
+            }
+            b"RAFR" => DCLoadCmds::Rafr(input[12..].to_vec()),
             b"MARK" => {
                 let payload = &input[12..];
                 DCLoadCmds::Mark((!payload.is_empty()).then(|| payload.to_vec()))

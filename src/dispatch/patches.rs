@@ -24,7 +24,7 @@ pub(super) fn payload_spans(buf: &[u8], address: u32) -> Vec<(u32, &[u8])> {
     spans
 }
 
-fn le16(data: &[u8], i: usize) -> u16 {
+pub(super) fn le16(data: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([data[i], data[i + 1]])
 }
 
@@ -44,7 +44,7 @@ pub(super) fn names_ram(w: u32) -> bool {
 
 /// If `op` at offset `at` is `mov.l @(disp,PC),Rn`: `Rn` and the offset it
 /// loads from (PC + 4, rounded down to 4, plus disp * 4).
-fn pc_load(op: u16, at: usize) -> Option<(u16, usize)> {
+pub(super) fn pc_load(op: u16, at: usize) -> Option<(u16, usize)> {
     (op & 0xf000 == 0xd000).then(|| ((op >> 8) & 0xf, ((at + 4) & !3) + (op & 0xff) as usize * 4))
 }
 
@@ -662,8 +662,7 @@ mod tests {
         let boot = std::fs::read(p).expect("read");
         assert!(is_kos_binary(&boot));
         let got = kos_mem_top_patches(&boot, 0x8c01_0000, 0x8cfe_8000).expect("found");
-        println!("{got:x?}");
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 2, "{got:x?}");
     }
 
     /// A raw image of `len` zero bytes with the given words set.

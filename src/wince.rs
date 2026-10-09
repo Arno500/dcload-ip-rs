@@ -11,9 +11,16 @@
 //!    It hands pages out from the top: the first ones it used were 352 KB under
 //!    `ulRAMEnd`. A loader anywhere in the pool is overwritten once CE's
 //!    allocations reach it, with nothing logged. isoldr lives under
-//!    `0x8c008000` (13 KB); ours is 32 KB and cannot. So the loader goes at the
-//!    top of the pool and the image is told its pool ends there -- the header
-//!    is data the kernel reads once at boot, and the one place that number is.
+//!    `0x8c008000` (13 KB); ours is 32 KB and cannot. So the loader is taken
+//!    out of the pool through the header -- data the kernel reads once at
+//!    boot, and the one place those numbers are -- at the BOTTOM: it goes at
+//!    `ulRAMFree` and the pool is told it starts above it ([`Place`]). Taken
+//!    from the top (`ulRAMEnd` lowered, until 2026-10-09), it moved everything
+//!    CE hands out by as much: Sega Rally 2's `RALLY2.EXE` loaded at RAM
+//!    `0xA85000` instead of `0xA99000`, 0x14000 lower for a 64 KB loader and
+//!    16 KB of RetroAchievements room, and its achievement set, which looks for
+//!    the program at the seven pages `0xA95000..0xA9B000` an unmodified CE
+//!    gives it, matched nothing.
 //!
 //! 2. **CE chains DMA stream pieces from the G1 DMA-end interrupt**, which a
 //!    network transport never raises. Its driver (`wsegacd.dll`, XIP in the
@@ -104,21 +111,83 @@ pub fn romhdr(payload: &[u8], load: u32) -> Option<RomHdr> {
     found
 }
 
-/// Where the loader goes for a CE title: the top `span` bytes of CE's page
-/// pool, which [`ram_end_patch`] then takes out of the pool. `None` when that
-/// would leave CE less than 8 MB above `ulRAMFree`.
-pub fn loader_base(h: &RomHdr, span: u32) -> Option<u32> {
-    let base = h.ram_end.checked_sub(span)? & !0xffff;
-    (base >= h.ram_free.saturating_add(0x80_0000)).then_some(base)
+/// Which end of CE's page pool the loader is taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// At `ulRAMFree`, the pool told it starts above the loader and the
+    /// RetroAchievements room: what CE hands out from the top is where an
+    /// unmodified CE puts it. The default.
+    Bottom,
+    /// At the top, the pool told it ends under the room: everything CE hands
+    /// out moves down by as much (`--wince-loader-top`, the placement until
+    /// 2026-10-09).
+    Top,
 }
 
-/// The word that tells CE its page pool ends at `base`, when a loader at
-/// `base` sits inside the pool. `None` when it does not (nothing to take).
-pub fn ram_end_patch(h: &RomHdr, base: u32) -> Option<(u32, u32)> {
-    let base = p1(base);
-    (base > h.ram_free && base < h.ram_end)
-        .then(|| (h.at + (RAMEND * 4) as u32, base & !0xfff))
+/// CE's pool must keep this much.
+const POOL_MIN: u32 = 0x80_0000;
+
+/// Where the loader goes for a CE title: `span` bytes at one end of CE's page
+/// pool, which [`take`] then takes out of the pool with up to `RA_ROOM` more.
+/// `None` when that would leave CE less than 8 MB.
+pub fn loader_base(h: &RomHdr, span: u32, place: Place) -> Option<u32> {
+    match place {
+        Place::Top => {
+            let base = h.ram_end.checked_sub(span)? & !0xffff;
+            (base >= h.ram_free.saturating_add(POOL_MIN)).then_some(base)
+        }
+        Place::Bottom => {
+            let base = p1(h.ram_free).checked_add(0xffff)? & !0xffff;
+            let top = base.checked_add(span)?.checked_add(RA_ROOM)?;
+            (top.saturating_add(POOL_MIN) <= h.ram_end).then_some(base)
+        }
+    }
 }
+
+/// What [`take`] takes out of CE's pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    /// The ROMHDR word to write and its value (`ulRAMFree` or `ulRAMEnd`).
+    pub patch: (u32, u32),
+    /// The RetroAchievements room: P1 address and bytes; `None` for no room.
+    pub room: Option<(u32, u32)>,
+}
+
+/// Take the loader at `base` (`span` bytes) and `room` more bytes for the
+/// RetroAchievements sampler out of CE's page pool, at the end `place` says.
+/// `None` when the loader is not inside the pool (nothing to take), or when
+/// what is left would reach `ulRAMFree` / `ulRAMEnd`.
+pub fn take(h: &RomHdr, base: u32, span: u32, room: u32, place: Place) -> Option<Taken> {
+    let base = p1(base);
+    if base < h.ram_free || base >= h.ram_end {
+        return None;
+    }
+    let room_at = |a: u32| (room != 0).then_some((a, room));
+    match place {
+        Place::Top => {
+            let end = base.checked_sub(room)? & !0xfff;
+            (base > h.ram_free && end > h.ram_free).then(|| Taken {
+                patch: (h.at + (RAMEND * 4) as u32, end),
+                room: room_at(end),
+            })
+        }
+        Place::Bottom => {
+            let above = base.checked_add(span)?;
+            let free = above.checked_add(room)?.checked_add(0xfff)? & !0xfff;
+            (free < h.ram_end).then(|| Taken {
+                patch: (h.at + (RAMFREE * 4) as u32, free),
+                room: room_at(above),
+            })
+        }
+    }
+}
+
+/// What the RetroAchievements sampler is lent under CE, next to the loader
+/// (`g_ra_ce_room`, loader AGENTS.md 4.20): the loader's dead stack holds ~136
+/// words of table, Sega Rally 2's achievements need ~430 and more as its
+/// pointers move (967 words seen, 2026-10-08). 16 KB holds the loader's largest
+/// table (1024 words: previous frame, window, a keyframe); 8 KB held 992.
+pub const RA_ROOM: u32 = 0x4000;
 
 /// The branch in CE's GD driver that sends an aligned scatter-gather read to
 /// DMA, as it reads in Sega Rally 2's `wsegacd.dll` (`0x8c099f70`):
@@ -196,15 +265,60 @@ mod tests {
         assert_eq!(romhdr(&p, LOAD), None);
     }
 
+    /// Sega Rally 2 PAL's pool, with `ulRAMFree` where it is not 64 KB aligned.
+    fn sr2() -> RomHdr {
+        RomHdr {
+            at: LOAD + 0x1000,
+            phys_first: LOAD,
+            phys_last: 0x8c14_0000,
+            ram_start: 0x8c14_3000,
+            ram_free: 0x8c14_8000,
+            ram_end: 0x8cef_0000,
+            drivglob_start: 0x8cef_0000,
+            drivglob_len: 0x0011_0000,
+        }
+    }
+
+    #[test]
+    fn places_the_loader_at_the_bottom_of_the_pool_and_leaves_the_top_alone() {
+        let h = sr2();
+        let base = loader_base(&h, 0x10000, Place::Bottom).unwrap();
+        assert_eq!(base, 0x8c15_0000, "ulRAMFree rounded up to 64 KB");
+        // the pool starts above the loader and the room; its end is not touched,
+        // so what CE hands out from the top is where an unmodified CE puts it
+        assert_eq!(
+            take(&h, base, 0x10000, RA_ROOM, Place::Bottom),
+            Some(Taken { patch: (h.at + 24, 0x8c16_4000), room: Some((0x8c16_0000, RA_ROOM)) })
+        );
+        assert_eq!(
+            take(&h, base, 0x10000, 0, Place::Bottom),
+            Some(Taken { patch: (h.at + 24, 0x8c16_0000), room: None })
+        );
+        // a pool that would be left under 8 MB: no place
+        let small = RomHdr { ram_end: 0x8c95_0000, ..h };
+        assert_eq!(loader_base(&small, 0x10000, Place::Bottom), None);
+        // a loader outside the pool takes nothing from it
+        assert_eq!(take(&h, 0x8c00_4000, 0x10000, RA_ROOM, Place::Bottom), None);
+        assert_eq!(take(&h, 0x8cef_0000, 0x10000, 0, Place::Bottom), None);
+    }
+
     #[test]
     fn places_the_loader_at_the_top_of_the_pool_and_takes_it_out() {
         let h = romhdr(&image(0x1000), LOAD).unwrap();
-        let base = loader_base(&h, 0x10000).unwrap();
+        let base = loader_base(&h, 0x10000, Place::Top).unwrap();
         assert_eq!(base, 0x8cee_0000);
-        assert_eq!(ram_end_patch(&h, base), Some((LOAD + 0x1000 + 28, 0x8cee_0000)));
+        assert_eq!(
+            take(&h, base, 0x10000, 0, Place::Top),
+            Some(Taken { patch: (LOAD + 0x1000 + 28, 0x8cee_0000), room: None })
+        );
+        // RetroAchievements' block is taken out with it, under the loader.
+        assert_eq!(
+            take(&h, base, 0x10000, RA_ROOM, Place::Top),
+            Some(Taken { patch: (LOAD + 0x1000 + 28, 0x8ced_c000), room: Some((0x8ced_c000, RA_ROOM)) })
+        );
         // A loader outside the pool takes nothing from it.
-        assert_eq!(ram_end_patch(&h, 0x8c00_4000), None);
-        assert_eq!(ram_end_patch(&h, 0x8cef_0000), None);
+        assert_eq!(take(&h, 0x8c00_4000, 0x10000, RA_ROOM, Place::Top), None);
+        assert_eq!(take(&h, 0x8cef_0000, 0x10000, 0, Place::Top), None);
     }
 
     #[test]

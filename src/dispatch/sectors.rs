@@ -40,6 +40,8 @@ pub(super) struct SectorServer<'a> {
     stage: Vec<(u32, u32)>,
     /// Patched words to put back when a read reloads them.
     guards: &'a [GuardWord],
+    /// Words changed in the sectors served, wherever they land (`DiscPatch`).
+    disc_patches: Vec<DiscPatch>,
     memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
     logged_lbas: HashSet<u32>,
     /// Destinations already reported as landing on the loader (said once each).
@@ -55,12 +57,14 @@ pub(super) struct SectorServer<'a> {
 }
 
 impl<'a> SectorServer<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         toc_start: u32,
         toc_sectors: u32,
         running_base: Option<u32>,
         out_of_heap: bool,
         guards: &'a [GuardWord],
+        disc_patches: Vec<DiscPatch>,
         memory: Option<std::sync::Arc<std::sync::Mutex<crate::memmap::MemoryRecorder>>>,
         stage: Vec<(u32, u32)>,
     ) -> Self {
@@ -71,6 +75,7 @@ impl<'a> SectorServer<'a> {
             loader_base: running_base.unwrap_or(crate::loaders::DEFAULT_BASE),
             stage,
             guards,
+            disc_patches,
             memory,
             logged_lbas: HashSet::new(),
             warned_overlap: HashSet::new(),
@@ -185,6 +190,12 @@ impl<'a> SectorServer<'a> {
         }
         let mut buf = buf;
         self.guard_in_flight(start, dc_address, &mut buf);
+        if patch_disc_read(&self.disc_patches, start, &mut buf) > 0 {
+            info!(
+                "LBA 0x{start:08x} -> 0x{dc_address:08x} carries a syMalloc heap's end: \
+                 lowered to the loader's base in the data sent"
+            );
+        }
         let buf = buf;
         self.watch_destination(start, dc_address, buf.len() as u32);
         // `send_sectors` fails only if the socket does. No ReturnValue then:

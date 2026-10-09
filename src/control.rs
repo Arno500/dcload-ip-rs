@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use log::{info, warn};
+use log::{error, info, warn};
 
 const DEFAULT_PORT: u16 = 53536;
 
@@ -120,13 +120,13 @@ fn absolute_spec(spec: &str) -> String {
 /// `swap-disc`: ask the session on this machine to change disc.
 pub fn swap_disc_client(port: u16, spec: &str) -> ExitCode {
     if port == 0 {
-        eprintln!("the control port is off (--control-port 0)");
+        error!("the control port is off (--control-port 0)");
         return ExitCode::FAILURE;
     }
     let mut stream = match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            error!(
                 "no session is listening on 127.0.0.1:{port} ({e}); `swap-disc` needs a \
                  running `u-exec <image>` (same --control-port)"
             );
@@ -135,22 +135,22 @@ pub fn swap_disc_client(port: u16, spec: &str) -> ExitCode {
     };
     let _ = stream.set_read_timeout(Some(CLIENT_WAIT + Duration::from_secs(5)));
     if writeln!(stream, "SWAP {}", absolute_spec(spec)).is_err() {
-        eprintln!("could not talk to the session");
+        error!("could not talk to the session");
         return ExitCode::FAILURE;
     }
     let mut answer = String::new();
     if BufReader::new(stream).read_line(&mut answer).is_err() || answer.is_empty() {
-        eprintln!("the session closed the connection without answering");
+        error!("the session closed the connection without answering");
         return ExitCode::FAILURE;
     }
     let answer = answer.trim_end();
     match answer.strip_prefix("OK ") {
         Some(m) => {
-            println!("{m}");
+            info!("{m}");
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("{}", answer.strip_prefix("ERR ").unwrap_or(answer));
+            error!("{}", answer.strip_prefix("ERR ").unwrap_or(answer));
             ExitCode::FAILURE
         }
     }

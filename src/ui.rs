@@ -814,6 +814,17 @@ pub fn sampling_wanted() -> bool {
     SAMPLING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `r` was pressed: the loader's max/min counters are to start over. Set on the
+/// key thread, taken by `diag::Probe::tick` on the syscall loop, which sends
+/// `DRST` -- the extremes live on the console, and the host cannot lower a
+/// maximum it only reads.
+static RESET_EXTREMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Was `r` pressed since the last call?
+pub fn take_reset_extremes() -> bool {
+    RESET_EXTREMES.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Register a bar with the display, keeping the panel last.
 ///
 /// `MultiProgress::add` appends, so with a panel present every transfer bar
@@ -1068,6 +1079,10 @@ impl DiagPanel {
                     console::Key::Char('w') | console::Key::Char('W') => {
                         dump = Some(s.snapshot());
                     }
+                    // `r`: the max/min counters start over (see RESET_EXTREMES).
+                    console::Key::Char('r') | console::Key::Char('R') => {
+                        RESET_EXTREMES.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     console::Key::Char('+') | console::Key::Char('=') => {
                         s.interval = (s.interval / 2).max(INTERVAL_MIN);
                     }
@@ -1148,14 +1163,11 @@ fn write_snapshot(text: &str) {
             f.write_all(text.as_bytes())
         })
         .is_ok();
-    multi().suspend(|| {
-        eprintln!("{text}");
-        if saved {
-            eprintln!("  (also appended to {PATH})\n");
-        } else {
-            eprintln!("  (could not write {PATH})\n");
-        }
-    });
+    if saved {
+        log::info!("{text}\n  (also appended to {PATH})");
+    } else {
+        log::info!("{text}\n  (could not write {PATH})");
+    }
 }
 
 /// Draw the whole block into the bar's message, in one string.
@@ -1324,11 +1336,11 @@ fn compose(s: &mut PanelState, term_rows: usize, term_cols: usize) -> String {
     let hint = fits(
         &[
             format!(
-                " ↑↓ PgUp/PgDn: page · a: {} · ± rate · w: save · d ",
+                " ↑↓ PgUp/PgDn: page · a: {} · ± rate · w: save · r: reset max/min · d ",
                 if s.show_all { "used only" } else { "all" }
             ),
-            " ↑↓ · a · ± · w · d ".to_string(),
-            " ↑↓ a ± w d ".to_string(),
+            " ↑↓ · a · ± · w · r · d ".to_string(),
+            " ↑↓ a ± w r d ".to_string(),
         ],
         total_inner,
     );

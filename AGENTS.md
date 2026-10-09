@@ -46,7 +46,8 @@ ADPCM decoding).
      (`preset_window_base`). Off the low family the search starts at
      `ISOLDR_HIGH_ADDR` for a known title, `SCRATCH_BASE` otherwise.
    - Windows CE (§5) and KOS (§5) titles have their own rules, and so does a
-     title with an HLib heap (§5): the loader goes at its bottom.
+     title with an HLib heap (§5): the loader goes at its bottom. A base the
+     rules put inside a Katana syMalloc heap (§5) moves to that heap's top.
    - **The resident image** (`variants.rs`, loader AGENTS.md 4.18). After the
      base is chosen, `choose_loader_image` serves `dcload-resident.elf` (no
      screen, no DHCP; `variants::patch_resident` writes the console's `-H`
@@ -257,8 +258,17 @@ upload, verified, re-applied on reload, and listed by `identify`
 - **Windows CE** (`boot::WinCe`, `wince.rs`). Recognised by name
   (`0WINCEOS.BIN`, whose first 2048-byte sector is dropped, as DreamShell's
   isoldr does) or by `"ECEC"` at +64; entered through the disc's second
-  bootstrap. The loader goes at `ulRAMEnd - LOADER_SPAN` from CE's `ROMHDR`,
-  and `ulRAMEnd` is lowered under it (`ram_end_patch`). `pio_patches` sends
+  bootstrap. **The loader goes at the bottom of CE's page pool**: `ulRAMFree`
+  from CE's `ROMHDR` rounded up to 64 KB (Sega Rally 2 PAL: `0x8c14d000` →
+  `0x8c150000`), and `ulRAMFree` is raised above it and the RetroAchievements
+  room (`wince::take`, `Place::Bottom`). CE hands pages out from the top, so the
+  top must stay as an unmodified CE has it: until 2026-10-09 the loader took
+  `ulRAMEnd - LOADER_SPAN` and lowered `ulRAMEnd`, which moved everything CE
+  loads down by as much -- Sega Rally 2's `RALLY2.EXE` at RAM `0xA85000`, not
+  `0xA99000`, and its RetroAchievements set (game 8443), which finds the program
+  by a signature at `base + 0x2e2da4` on the seven pages `0xA95000..0xA9B000`,
+  matched nothing (its rich presence said "RALLY2.EXE=0xA85000 -- Add to
+  RAScript!!"). `--wince-loader-top` restores the old placement. `pio_patches` sends
   CE's GD driver down its PIO path, because its DMA path waits for a G1
   interrupt this transport never raises. Reads into the loader's `_gd_stage*`
   buffers are not collisions (`loader_stage`). `--no-wince` uploads it whole.
@@ -279,6 +289,28 @@ upload, verified, re-applied on reload, and listed by `identify`
   Its fixed regions rule out the alternatives: above `0x8cec0000` cutscenes and
   stack, and a disc-4 loading buffer ending at `0x8cf046c0` runs over the
   heap's top.
+- **syMalloc heap** (`dispatch/heap.rs`, same `--no-heap-guard`). Katana's
+  `sbInitSystem` hands `syMallocInit` everything from the program's `_end` to a
+  fixed end literal, recognised by its code (`mov.l @r0,r4 ; mov.l @(d,pc),r5 ;
+  mov #-32,r0 ; or r2,r4 ; and r0,r4 ; add #32,r4 ; sub r4,r5`, with `&_end`
+  loaded into r0 just before and no other load of the end literal). Every
+  `.BIN` of the boot area's root is searched (its first 64 KB, plus the sector
+  holding `_end`; ~15 ms once the image is indexed), read as run from
+  0x8c010000, because the program that sets the heap need not be the one
+  uploaded: Jet Set Radio's `1ST_READ.BIN` reads `JET_PAL.BIN` into a buffer
+  and runs it. A base the rules choose inside such a heap (and not given with
+  `--loader-base`, nor chosen by the HLib rule) moves to the heap's top, the
+  highest 64 KB boundary leaving the loader's span inside it, provided no
+  program on the disc loads a constant naming that span; the end literal is
+  then lowered to the loader's base, in the uploaded program (guarded like the
+  HLib words) and in the sectors served (`DiscPatch`, applied in
+  `SectorServer::serve` wherever the read lands, only over the disc's own
+  word). Not for an HLib title. Jet Set Radio PAL: heaps
+  `0x8c0a9120..0x8c800000` (1ST_READ) and `0x8c35d740..0x8c800000`
+  (JET_PAL/JET), fixed buffers from `0x8c800000` up; the learned map's holes
+  were inside the heap, and loaders at `0x8c650000`/`0x8c580000` were
+  overwritten while a level loaded (2026-10-09). Loader `0x8c7f0000`, end
+  lowered to it: measured on the console (2026-10-10), levels load and play.
 - **KOS** (`is_kos_binary`). The loader is told via `g_gd_kos`; KOS's top of
   RAM is lowered under the loader (`kos_mem_top_patches`); the dcload magic at
   `0x8c004004` is pointed at the live loader (`update_dcload_magic`) so KOS's
@@ -391,7 +423,9 @@ No negotiation: check the mode first when a console does not answer.
   stderr is not a terminal. The in-game loading bar (`LoadMonitor`) groups
   disc reads into bursts and updates only after the ReturnValue.
 - **Counter panel** (`--diag`, `diag.rs`): `d` toggles sampling, `w` writes a
-  snapshot to `dcload-diag.txt`, `+`/`-` change the interval. The loader image
+  snapshot to `dcload-diag.txt`, `+`/`-` change the interval, `r` sends `DRST`
+  (retried every 300 ms for 5 s) and the loader starts its max/min counters
+  over (`g_gd_sp_min` excepted: the stack watch's guard). The loader image
   is verified against the uploaded ELF before any counter is decoded. The
   loader answers only inside `bb->loop()`, so a title that stopped reading its
   disc may leave the panel unanswered; the header shows the measured
@@ -407,7 +441,11 @@ No negotiation: check the mode first when a console does not answer.
   `g_irq_hooked` read non-zero on the console (a 4-byte `SBIQ` every 10 s,
   60 s after six unanswered, until it is; read off the panel's samples while
   it has the wire). The panel does not suspend it: when it samples, its last
-  sample is appended to `dcload-diag.txt` as the session ends.
+  sample is appended to `dcload-diag.txt` as the session ends. **Armed, it
+  asks again every 2 s while the console talks, and a 0 (its own answer or
+  the panel's) disarms it** until the hook is back: a title can replace the
+  entry the loader hooked (Jet Set Radio, 2026-10-09, loader AGENTS.md 4.15),
+  and a count armed once ended a live session in its SEGA logo.
 
 ## 10. Gotchas
 
@@ -426,6 +464,12 @@ No negotiation: check the mode first when a console does not answer.
 - **A disc read landing on the loader** is an error; within 256 KB of a high
   loader, a warning.
 - `cdi2iso.c` at the root is untracked third-party GPLv2 reference, not built.
+- **Everything the program says goes through the `log` macros** (`error!` …
+  `trace!`), never `println!`/`eprintln!`: the logger is the one writer that
+  suspends the progress bars (`ui::BarAwareLogger`) and that `-v`/`RUST_LOG`
+  filter. Command reports (`identify`, `ra-count`, `relocate`, `swap-disc`) are
+  `info!`. Exceptions: `build.rs`'s `cargo:` directives, and tests, where no
+  logger is installed (a skip notice logged there would be lost).
 
 ## 12. Disc swap
 
@@ -473,3 +517,205 @@ them in step).
   non-frame data and port A's slots then answer empty, while port B works.
   The next control is physical: move the VMUPro to port B and see whether the
   fault follows the device.
+
+## 13. RetroAchievements
+
+`src/ra/`, `build.rs`, `vendor/rcheevos` (MIT, plain copy of upstream
+`683197d`, see `REVISION`), `src/ra/shim.c`. The loader samples RAM
+(loader AGENTS.md §4.20); this host judges with rcheevos and talks to
+retroachievements.org. **On by default** for a `u-exec` of a disc image once
+`ra-login <user>` has been run once (password asked, only the token kept, in
+`%APPDATA%` / `~/.config/dcload-ip-rs/`); without a login, for a KOS title, a
+bare program or a loader without the sampler it stays off with one `info` line
+(`start_ra`); `--no-ra` turns it off;
+`ra-count <image>` for the size of a set.
+
+- **One thread, one owner.** Everything that touches rcheevos runs on the
+  `retroachievements` thread (`session.rs`). The packet sink (`RaSink`) only
+  forwards `RAFR` frames and `RACT` replies through a channel, so the syscall
+  loop never waits on the network or the achievement logic. HTTP is one short
+  thread per request (`env.rs`), answered back through the same channel.
+- **`shim.c` keeps rc_client's structs on the C side**; Rust sees integers,
+  strings and function pointers (`ffi.rs`). Any rcheevos upgrade is a
+  recompile of the shim plus its callers' check.
+- **Pointers the loader follows itself** (`chains.rs`, loader AGENTS.md §4.20). The
+  set is walked once with rcheevos' **public structures only** (`ra_probe_walk` in
+  `shim.c`: `rc_runtime_get_achievement` / `_lboard`, a trigger's condition sets,
+  a condition's operands, `rc_operand_is_memref`; the rich presence's display
+  conditions and named values) -- never `rc_internal.h`. Position decides what is
+  indirect: after an `AddAddress` a memref operand's `address` is an OFFSET from
+  the accumulated pointer, which is documented rcheevos behaviour and is covered by
+  tests that fail if an update changes it (`ra::tests::the_walk_*`). Each indirect
+  read becomes a chain word; a pointer that is a 24-bit read at an address that is
+  0 or 1 mod 4 and an offset within ±4 MB qualifies, anything else is left to
+  discovery. The table is built from this structure first, so the pass on zeros
+  finds only what it did not name (3 words in SA2: its rich presence parts).
+  `Env::read` resolves a read through the table's words, then through the chains'
+  addresses worked out from the frame's values; an address **past RAM reads
+  nothing** and is no miss (it used to skip every frame for good).
+- **Disc swaps** (`swap-disc`, §12). After the loader accepts and the new image is
+  served, `dispatch/syscalls.rs` calls `ra::session::disc_changed(spec)`, which
+  reaches the RA thread through a global mailbox (so one RA session at a time).
+  The thread opens the new image, hashes it and calls `rc_client_begin_change_media`:
+  **rc_client keeps the loaded game and only notes the new hash -- it never loads
+  another game.** A multi-disc game's discs are one RetroAchievements game (Resident
+  Evil 2: both discs are game 3859, one set of 179 achievements, 122 words, no
+  pointers; measured 2026-10-07), so the set, the table and the generation stay and
+  nothing is sent to the console. If the lookup of the new hash (`r=gameid`,
+  reported by the shim as `Event::HashGame`) names ANOTHER game, `reload()` unloads,
+  loads that game's set and builds a new table; frames are ignored meanwhile. A disc
+  RetroAchievements does not know leaves the set as it was (hardcore, if asked for,
+  is turned off by rc_client). The wiring line in the syscall loop is not covered by
+  the tests, which call `disc_changed` themselves (`ra::e2e`, both paths, proven
+  by mutation).
+- **Merging**: the ranges merge the finest gap that fits the range budget
+  (`GAPS`, `MAX_RANGES`), so a set with few ranges carries no filler words. **The
+  budget is the loader's 384 ranges**; merging over gaps adds words the set does not
+  read, so too small a budget makes a table too many words (Sega Rally 2,
+  2026-10-08: 967 words in 155 ranges under the old 160, refused; the error now
+  gives the distinct words read beside the table's). **A table goes in parts**
+  (`Table::parts`, loader AGENTS.md 4.20), each at most 1460 bytes of command data
+  (`MAX_PAYLOAD`), because the loader takes no IP fragment: SA2's first table, one
+  1476-byte `RACT`, was fragmented by Windows and never seen (`g_ra_gen` 0, the
+  "not answered 20 times" warning, 2026-10-07). Only the last part is answered; a
+  lost part leaves the table unanswered and `resend_table()` sends all of it again.
+  The words a table may have are the loader's room from that answer (744 under a
+  Katana title, 1024 under Windows CE with the lent block); `MAX_WORDS` (1024) only
+  caps it. A first table larger than the room that applies, accepted or refused,
+  goes to `step_down`. Test helper: `table::Assembler` (the loader's rules, for the
+  fake consoles).
+- **A pointer that holds no address** (2026-10-07, SA2 on the console: the table
+  grew every few frames and nothing was ever awarded). The loader reads a chain's
+  word at its address rounded down to 4 (`ra.c`, `& 0x00fffffc`); `Env::word_at`
+  matches it the same way, so the bytes of that word are right. But a pointer
+  whose value is not a multiple of 4 -- a pointer field holding something else,
+  between levels -- makes rcheevos read across two words, and a pointer it reads
+  there is not the one the loader followed: its children land anywhere, differently
+  each frame. Growing the table after them never ends, and a frame that grows the
+  table is not judged. So a frame's misses grow the table only when no chain
+  address is misaligned (`Env::skewed`). When one is and the walk left nothing to
+  discovery (`unsupported` 0: every read an aligned pointer can lead to is a
+  chain), the frame is judged anyway; otherwise it is skipped without growing.
+  Checked against SA2's real set with a simulated console (consistent memory,
+  random pointers): aligned pointers miss nothing in 3000 frames; with misaligned
+  ones every miss frame is skewed. `ra::e2e::a_pointer_that_holds_no_address_*`
+  fails without the rule (15 tables, nothing awarded).
+- **What the log says about the user's state.** At load: how many achievements
+  are already earned in this mode (rc_client never watches those again, so they
+  cannot unlock a second time), each one at `debug`, the watched ones at
+  `trace`. The rich presence is evaluated locally every frame and logged at
+  `debug` when it changes; **the site only gets it at rc_client's ping, every
+  2 minutes** (`rc_client.c`, `120 * 1000`), as in every emulator. A faster ping
+  is not ours to choose: it is the server's load.
+- **A table is acknowledged by its own frames only** (2026-10-08, Sega Rally 2
+  on the console: host at generation 2, loader still at 1, `last 10 s: 0 frames`
+  while `g_ra_frames` ran at 60 a second). `RACT` is one datagram and can be
+  lost. Two faults kept it lost: `on_frame` took any `RAFR` as proof the loader
+  held the table, and the old table's frames kept coming; and `resend_table()`
+  ran only when nothing arrived for 250 ms, which ten `RAFR` a second never
+  allow. Now only a frame of the current generation acknowledges, and the
+  resend is looked at on every turn (its own 1 s timer).
+  `a_lost_table_is_sent_again_while_the_old_one_is_sampled` fails with either
+  fault (both checked).
+- **A set too big for the loader** (`Keep`, `trim_sets`, `step_down`,
+  2026-10-08). When the table does not fit (`TableError::TooBig`, at the first
+  table or later as pointers move, or the `RACT` reply's room is smaller), the
+  game is loaded again with the game-sets answer trimmed before rcheevos sees it,
+  one step at a time (each step reloads rc_client: hit counts restart):
+  1. **`SlowRichPresence`**: the PROBE's copy has no rich presence, so neither
+     has the table; the REAL client keeps it, and whatever it reads that the
+     table lacks comes from the **slow path** (`slow.rs`): `SBIQ` reads of
+     those words, pieces of neighbouring words (gap ≤ 256 B, ≤ 5760 B), 8 in
+     flight, a cycle at most every 5 s, through P1 under Katana and P2 under
+     Windows CE (its MMU: a P0 address would be translated in the loader; its
+     virtually indexed cache: P2 reads RAM and leaves no stale line, at the
+     price of missing what sits in a dirty line). `Env::read`, in the real
+     client with `slow_mode`, serves the last values read and notes the words
+     it has not got (`slow_new`) -- never a miss, never a reason to grow. The
+     rich presence may lag a cycle; the site gets it every 2 minutes anyway.
+     `RaSink` claims `SBIN` inside a read in flight and the `DBIN` naming exactly
+     one (a disc read's DoneBinary names a title buffer, never this range and
+     size, and disc reads no longer ask for one).
+  2. **`NoLeaderboards`**: the leaderboards leave both copies (a leaderboard
+     left in the client with its words out of the table would submit scores
+     read on zeros); the rich presence stays slow. Achievements are never
+     dropped.
+  Sega Rally 2: 1775 words in 337 ranges in all (seven copies of every
+  condition, one per place the game may keep its data); the rich presence alone
+  ~900 words, ~300 pieces; without it 427 at load. Tests:
+  `trimming_takes_the_rich_presence_out_of_the_table_then_the_leaderboards_out_of_the_game`,
+  `the_slow_path_serves_the_real_client_and_not_the_probe`, `slow::tests`, and
+  `a_set_too_big_for_the_loader_reads_its_rich_presence_slowly` (a fake console
+  answers `SBIQ`; fails without the step and without the reads, both checked).
+  **Not yet seen on a console**: whether the loader's listen windows keep up
+  (`debug!` "rich presence read slowly: … the cycle took … ms").
+- **Windows CE lends the sampler 16 KB** (`wince::RA_ROOM`, 8 KB until 2026-10-09): with RetroAchievements
+  on and a loader that has `g_ra_ce_room`, the block right above the loader is
+  taken out of CE's RAM with it (under it with `--wince-loader-top`), and the
+  block's P1 address and size are written to
+  `g_ra_ce_room` / `g_ra_ce_room_words` before EXEC (`ra_ce_room_symbols`). The
+  loader's own dead stack holds no table any more; the block holds its largest
+  table, 1024 words (8 KB held 992) (loader AGENTS.md 4.20). Not yet seen on the console.
+- **Discord** (`--discord <application id>`, `src/discord.rs`): the game's
+  title, badge (a URL: Discord fetches it), rich presence, achievements earned
+  and a button to its page go to the user's profile, from the Load event, each
+  rich presence change and each unlock. The application id is the user's own,
+  from discord.com/developers (its name follows "Playing"); none is built in.
+  Discord's IPC is written by hand (frames: op and length u32 LE, then JSON)
+  rather than through the usual crate (serde, uuid 0.8, thiserror). It runs on
+  its own thread: Discord may be absent (looked for every 30 s) or quit, and a
+  write to its pipe must not hold the RA thread. Discord takes about one update
+  per 15 s, so updates are coalesced (the last wins). The profile is cleared
+  when the session ends; a killed host closes the pipe, which clears it too.
+  Test: `discord::tests` (a fake Discord over a socket pair, Unix only;
+  checked by mutation). **Not yet seen against a real Discord.**
+- **Why an achievement does not fire.** Every 10 s, at `debug`: frames that
+  arrived, judged, skipped while the table grew, skipped on a pointer that is not
+  an address (an achievement true only on a skipped frame cannot fire).
+- **Each frame runs twice**: the *probe* (a private `rc_runtime` holding the
+  whole set, `ra_probe_*`) first; whatever it reads that the table lacks
+  grows the table (new generation, new `RACT`) and the frame is NOT given to
+  the real client, because a frame judged on zeros could award an achievement
+  for good. Pointer chains (`AddAddress`) are followed this way: the target is
+  unknown until the pointer's value is. The probe puts back what fires, or it
+  would stop following that chain.
+- **`grow(first)`**: the first table comes from one probe pass over zeros (which
+  also reads where a NULL pointer would aim, address 0x10: one wasted word);
+  later growth uses the misses of the frame that failed, never a re-probe.
+- **Hash**: `rc_hash_generate` with a custom cd reader over `DiscFormat`
+  (`cb_sector`, `cb_track_first`): filesystem numbering is
+  `fs_lba(...)`-relative, track 3 is `boot_sector()` on a GD-ROM image and the
+  first data track otherwise. **Measured only against a synthetic ISO** (the
+  e2e test); check a real GDI against retroachievements.org before trusting it.
+- **Lost frames**: `frames::Mirror` numbers datagrams; a gap makes it distrust
+  deltas until the next keyframe, and nothing is judged meanwhile. A frame is
+  one or more records of at most 128 words (`WIN`), complete at the one flagged
+  `last`: a keyframe of the whole table (512 words) is cut across datagrams, and
+  is a base only once every window of it has arrived. A frame the LOADER drops
+  (its batch full, the network busy) is not a gap in the sequence: the loader
+  makes the next frame a keyframe instead, so no delta ever follows a hole.
+- **Limits**: 512 words (ranges' and chains') in 160 ranges and 64 chains
+  (`table.rs`, mirroring `RA_WORDS` / `RA_RANGES` / `RA_CHAINS`). Measured with
+  `ra-count` on 2026-10-07: Sonic Adventure 2 270 words (213 from RAM in 155
+  ranges + 57 chains), Shenmue II 157 (155 in 71 ranges + 2 chains).
+- **Windows CE is served**, with less room: the loader answers each table with
+  the most words it can take under Katana and under CE (`Msg::Ract.limits`), the
+  session keeps the one that applies (`max_words`) and refuses a set that does
+  not fit with the figures. Under CE the loader reads through P2 and overlays the
+  operand cache's dirty lines (loader AGENTS.md §4.20): **never seen on a console**.
+- **Softcore only in practice.** Hardcore needs RetroAchievements to have
+  registered this client; `--ra-hardcore` asks anyway and warns.
+- **Tests**: `ra::loader_c` compiles the loader's own `ra.c` for the PC
+  (loader repo `scripts/ra-sampler-harness`, stubs for the hardware headers) and
+  feeds its datagrams to `Mirror`: the one place the C encoder and the Rust
+  decoder meet; skipped without gcc or `DCLOAD_LOADER_REPO`. Proven able to fail
+  (a mutated bitmap in the encoder breaks it). `ra::tests` (probe against the real rcheevos), `ra::e2e` (fake
+  server over TCP and fake console over UDP: login, hash, set, table, frames,
+  a pointer growing the table, two awards). `DCLOAD_RA_HOST` points the client
+  at another server (test hook). The e2e test needs `genisoimage` and is
+  skipped without it.
+- **Sizing the loader's table**: `ra-count` prints the direct words; the
+  session logs `the table peaked at N of 256 words` when it ends. That figure
+  decides `RA_WORDS` in the loader (128 or 256).
+- **Not measured**: anything on a console or flycast, the real server, the
+  Windows build (MSVC compiles `shim.c` and rcheevos through `cc`).
