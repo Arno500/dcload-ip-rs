@@ -314,7 +314,8 @@
       "u-exec",
       // "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Grand Theft Auto 2 v1.003 (2000)(Take 2)(PAL)(M5)[!].zip",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Jet Set Radio v1.002 (2000)(Sega)(PAL)(M4)[!].zip",
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Jet Set Radio v1.002 (2000)(Sega)(PAL)(M4)[!].zip",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.004 (2001)(Infogrames)(PAL)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {

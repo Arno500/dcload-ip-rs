@@ -1,5 +1,6 @@
 //! The shipped patch library: which PPF belongs to which dump, and what this
-//! host does with it.
+//! host does with it. A row naming a `.dcp` patches the disc's files instead,
+//! and is left to `crate::dcp`.
 //!
 //! Some titles need a patch that no amount of looking at their code will
 //! produce. `--vga` can force a Katana cable check and set a flag in IP.BIN,
@@ -73,6 +74,12 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// A `.dcp`: the disc's files, served through `crate::dcp`, not bytes of
+    /// the boot binary. Keyed on `disc_md5` only.
+    pub fn is_disc_patch(&self) -> bool {
+        crate::dcp::is_dcp(&self.file)
+    }
+
     fn matches(&self, disc_md5: Option<&str>, bin_md5: &str) -> bool {
         let by_disc = matches!((self.disc_md5.as_deref(), disc_md5), (Some(a), Some(b)) if a == b);
         let by_bin = self.bin_md5.as_deref() == Some(bin_md5);
@@ -131,6 +138,19 @@ impl PatchDb {
 
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
+    }
+
+    /// The disc patches (`.dcp` rows) for the dump whose boot sector hashes
+    /// to `disc_md5`.
+    pub fn disc_rows<'a>(&'a self, disc_md5: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.entries
+            .iter()
+            .filter(move |e| e.is_disc_patch() && e.disc_md5.as_deref() == Some(disc_md5))
+    }
+
+    /// Where a row's file is.
+    pub fn path_of(&self, file: &str) -> Option<PathBuf> {
+        self.dir.as_deref().map(|d| d.join(file))
     }
 
     /// How many rows the manifest holds, so "no patch for this dump" can say
@@ -313,7 +333,8 @@ pub fn plan(
     // not offer a patch that is being applied two lines above.
     let mut spoken_for: Vec<String> = Vec::new();
 
-    for path in explicit {
+    // A `.dcp` named with --ppf patches the disc, not this binary (`crate::dcp`).
+    for path in explicit.iter().filter(|p| !crate::dcp::is_dcp(p)) {
         match read_ppf(Path::new(path)) {
             Ok(p) => {
                 let fit = p.fit(image);
@@ -353,6 +374,9 @@ pub fn plan(
             // Claimed by a row whether or not the row is acted on, so the
             // loose-file scan below does not re-offer it as "not listed".
             spoken_for.push(e.file.clone());
+            if e.is_disc_patch() {
+                continue;
+            }
             let (path, p) = match db.read(&e.file) {
                 Ok(p) => p,
                 Err(err) => {

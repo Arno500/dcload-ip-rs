@@ -9,3 +9,8 @@ scripts/*.jpg
 
 # save() writes beside the target and renames; a killed run leaves this behind
 /game-memory.tsv.tmp
+
+# Disc patches (.dcp) are other people's work and tens of MB each: the manifest
+# row and the .nfo crediting the author are in git, the patch is fetched from
+# where the .nfo says.
+/patches/*.dcp

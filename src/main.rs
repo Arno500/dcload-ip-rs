@@ -12,6 +12,7 @@ mod cmds;
 mod control;
 mod adpcm;
 mod cd;
+mod dcp;
 mod diag;
 mod discord;
 mod fs;
@@ -32,6 +33,7 @@ mod types;
 mod ui;
 mod vm2;
 mod wince;
+mod xdelta;
 
 const PROTOCOL_VERSION_LEGACY: [u8; 3] = [0, 0, 0];
 const PROTOCOL_VERSION_MODERN: [u8; 3] = [2, 0, 3];
@@ -137,6 +139,10 @@ struct Args {
     /// A patch that carries a blockcheck and does not match this image is
     /// REFUSED: its offsets mean something else here, and applying it would
     /// write correct bytes into the wrong instructions.
+    ///
+    /// A `.dcp` (Universal Dreamcast Patcher) patches the disc's FILES instead,
+    /// laid over the image this host serves -- the boot binary included when
+    /// the patch carries one.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     ppf: Vec<String>,
 
@@ -1086,41 +1092,46 @@ fn wanted_loader_base(
     }
     let base = want.or(running)?;
     let heaps: Vec<dispatch::KatanaHeap> = katana.iter().map(|d| d.heap).collect();
-    match dispatch::katana_loader_base(&heaps, base) {
-        // The rules below check a base against the constants of the program
-        // this host uploads; the programs the disc serves are checked here.
-        Some(top)
-            if top != base
-                && disc.is_some_and(|(d, _)| {
-                    katana.iter().all(|k| match k.literals_in_loader(d, top) {
-                        Ok(hits) if hits.is_empty() => true,
-                        Ok(hits) => {
-                            warn!(
-                                "{} loads {} constant(s) naming RAM a loader at its heap's top \
-                                 (0x{top:08x}) would occupy (0x{:08x} first); not moving it there",
-                                k.file,
-                                hits.len(),
-                                hits[0].0
-                            );
-                            false
-                        }
-                        Err(e) => {
-                            warn!("{e}; not moving the loader to 0x{top:08x}");
-                            false
-                        }
-                    })
-                }) =>
-        {
+    // The rules below check a base against the constants of the program this
+    // host uploads; the programs the disc serves are checked here, base by base
+    // down from the heap's top (Skies of Arcadia's Maple DMA list is in its
+    // heap's last 64 KB).
+    let free = |top: u32| {
+        disc.is_some_and(|(d, _)| {
+            katana.iter().all(|k| match k.literals_in_loader(d, top) {
+                Ok(hits) if hits.is_empty() => true,
+                Ok(hits) => {
+                    debug!(
+                        "{} loads {} constant(s) naming RAM a loader at 0x{top:08x}, near its \
+                         heap's top, would occupy (0x{:08x} first); not putting it there",
+                        k.file,
+                        hits.len(),
+                        hits[0].0
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!("{e}; not moving the loader to 0x{top:08x}");
+                    false
+                }
+            })
+        })
+    };
+    match dispatch::katana_loader_base(&heaps, base, &free) {
+        Some(top) if top != base => {
             let names: Vec<&str> = katana
                 .iter()
                 .filter(|d| d.heap.patch(top).is_ok_and(|p| p.is_some()))
                 .map(|d| d.file.as_str())
                 .collect();
+            let at = |h: &&dispatch::KatanaHeap| h.loader_bases().any(|b| b == top);
             info!(
-                "0x{base:08x} is inside the syMalloc heap {} sets up                  (0x{:08x}..0x{:08x}), which fills differently every time: putting the                  loader at 0x{top:08x}, its top, and lowering the heap's end to it",
+                "0x{base:08x} is inside the heap {} sets up (0x{:08x}..0x{:08x}), which fills \
+                 differently every time: putting the loader at 0x{top:08x}, at its top, and \
+                 lowering its end to it",
                 names.join(" and "),
-                heaps.iter().filter(|h| h.loader_base() == Some(top)).map(|h| h.start).min().unwrap_or(0),
-                heaps.iter().filter(|h| h.loader_base() == Some(top)).map(|h| h.end).max().unwrap_or(0),
+                heaps.iter().filter(at).map(|h| h.start).min().unwrap_or(0),
+                heaps.iter().filter(at).map(|h| h.end).max().unwrap_or(0),
             );
             Some(top)
         }
@@ -2398,7 +2409,8 @@ fn start_marks(
 
 /// `identify`: everything the loader-placement pass would work out, printed.
 fn identify_only(args: &Args, disc: &str) -> ExitCode {
-    let reader = match dispatch::open_disc(disc) {
+    configure_disc_patches(args);
+    let reader = match dcp::open_served(disc) {
         Ok(d) => d,
         Err(reason) => {
             error!("{reason}");
@@ -3027,6 +3039,15 @@ fn patch_plan(args: &Args, payload: &[u8], disc_md5: Option<&str>) -> patchdb::P
     patchdb::plan(&db, disc_md5, payload, &args.ppf, !args.no_ppf)
 }
 
+/// The patch library's disc patches (`.dcp` rows, and `.dcp` files named with
+/// `--ppf`), for every image opened to be served from here on: the session's
+/// and a `swap-disc`'s (`dcp::open_served`).
+fn configure_disc_patches(args: &Args) {
+    let loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
+    let db = patchdb::PatchDb::discover(args.patch_dir.clone(), loaders.dir());
+    dcp::configure(db, !args.no_ppf, &args.ppf);
+}
+
 /// Patch the payload in place, and hand back the words a reload has to undo.
 ///
 /// BEFORE THE UPLOAD, on purpose. The alternative -- poking the words in
@@ -3316,8 +3337,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // A failure here is reported and is not fatal: the title is still uploaded
     // and started, exactly as before, and every disc read it makes then fails.
     let mut disc_reader: Option<Box<dyn disc_formats::types::DiscFormat>> = None;
+    configure_disc_patches(&args);
     if let Some(path) = redirect_disc.as_deref() {
-        match dispatch::open_disc(path) {
+        match dcp::open_served(path) {
             Ok(disc) => disc_reader = Some(disc),
             Err(e) => {
                 error!("CDFS redirection DISABLED: {e}");
@@ -3326,8 +3348,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     }
 
-    // SYMALLOC HEAPS (dispatch::heap): every program on the disc that hands
-    // Katana's allocator the RAM up to a fixed end. Found once, before EXEC,
+    // HEAP ENDS (dispatch::heap): every program on the disc that sizes a heap
+    // from a literal end (syMalloc's sbInitSystem in any schedule, or any
+    // allocator set up the same way). Found once, before EXEC,
     // because the placement below and the patches before EXEC both need them,
     // and the sectors served afterwards carry the patch.
     let katana_heaps: Vec<dispatch::DiscHeap> = match disc_reader.as_deref() {
@@ -3338,9 +3361,11 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
     for h in &katana_heaps {
         debug!(
-            "heap     : {} sets up a syMalloc heap 0x{:08x}..0x{:08x} (its end is the word \
-             at 0x{:08x})",
-            h.file, h.heap.start, h.heap.end, h.heap.end_at
+            "heap     : {} sets up a heap 0x{:08x}..0x{:08x} (its end is the word at 0x{:08x})",
+            h.file,
+            h.heap.start,
+            h.heap.end,
+            h.heap.end_at
         );
     }
 
@@ -3580,8 +3605,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         ),
                     }
                 }
-                // A SYMALLOC HEAP (dispatch::heap) whose top the loader sits at
-                // has its end lowered to the loader: in the program uploaded
+                // A HEAP END (dispatch::heap) whose top the loader sits at is
+                // lowered to the loader: in the program uploaded
                 // now, guarded like the HLib words, and in every program the
                 // disc serves that sets up the same heap, in the sectors as they
                 // are sent (Jet Set Radio runs a JET_PAL.BIN its 1ST_READ.BIN
@@ -3591,22 +3616,28 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 if heap.is_none() && !args.no_heap_guard && !wince
                     && let Some(base) = running_base
                 {
-                    if let Some(h) = dispatch::katana_heap(&payload, args.address) {
+                    let kos = dispatch::is_kos_binary(&payload);
+                    for h in dispatch::program_heaps(&payload, args.address).into_iter().filter(|_| !kos) {
                         match h.patch(base) {
                             Ok(Some(p)) => {
                                 info!(
-                                    "syMalloc heap 0x{:08x}..0x{:08x} of the uploaded program: \
-                                     its end lowered to 0x{:08x}, the loader's base (0x{:08x}=0x{:08x})",
-                                    h.start, h.end, p.1, p.0, p.1
+                                    "heap 0x{:08x}..0x{:08x} of the uploaded program: its end \
+                                     lowered to 0x{:08x}, the loader's base (0x{:08x}=0x{:08x})",
+                                    h.start,
+                                    h.end,
+                                    p.1,
+                                    p.0,
+                                    p.1
                                 );
                                 heap_guard.push(p);
                             }
                             Ok(None) => {}
                             Err(why) => warn!(
-                                "syMalloc heap 0x{:08x}..0x{:08x} of the uploaded program: the \
-                                 loader at 0x{base:08x} cannot be taken out of it: {why}. Expect \
-                                 the heap to overwrite it.",
-                                h.start, h.end
+                                "heap 0x{:08x}..0x{:08x} of the uploaded program: the loader at \
+                                 0x{base:08x} cannot be taken out of it: {why}. Expect the heap \
+                                 to overwrite it.",
+                                h.start,
+                                h.end
                             ),
                         }
                     }
@@ -3614,19 +3645,25 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                         match d.patch(base) {
                             Ok(Some(p)) => {
                                 info!(
-                                    "syMalloc heap 0x{:08x}..0x{:08x} of {} on the disc: its end \
-                                     lowered to 0x{:08x} in the sectors served (LBA 0x{:08x} \
-                                     +0x{:03x})",
-                                    d.heap.start, d.heap.end, d.file, p.value, p.lba, p.off
+                                    "heap 0x{:08x}..0x{:08x} of {} on the disc: its end lowered \
+                                     to 0x{:08x} in the sectors served (LBA 0x{:08x} +0x{:03x})",
+                                    d.heap.start,
+                                    d.heap.end,
+                                    d.file,
+                                    p.value,
+                                    p.lba,
+                                    p.off
                                 );
                                 disc_patches.push(p);
                             }
                             Ok(None) => {}
                             Err(why) => warn!(
-                                "syMalloc heap 0x{:08x}..0x{:08x} of {} on the disc: the loader \
-                                 at 0x{base:08x} cannot be taken out of it: {why}. Expect the \
-                                 heap to overwrite it.",
-                                d.heap.start, d.heap.end, d.file
+                                "heap 0x{:08x}..0x{:08x} of {} on the disc: the loader at \
+                                 0x{base:08x} cannot be taken out of it: {why}. Expect the heap \
+                                 to overwrite it.",
+                                d.heap.start,
+                                d.heap.end,
+                                d.file
                             ),
                         }
                     }

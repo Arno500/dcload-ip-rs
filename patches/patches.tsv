@@ -17,7 +17,11 @@
 #              `boot md5`. Names a dump, not a game.
 #   bin_md5    MD5 of the UNPATCHED boot binary, printed as `bin md5`. Narrower,
 #              and the one that matters when the patch has no blockcheck.
-#   file       the .ppf, in this directory.
+#   file       the .ppf, in this directory -- or a .dcp (Universal Dreamcast
+#              Patcher): the disc's FILES, laid over the image this host serves
+#              (src/dcp.rs). A .dcp row keys on disc_md5 only (bin_md5: -), and
+#              a .dcp also patches the boot binary when it carries one. All or
+#              nothing: a member that does not apply leaves the disc as it is.
 #   apply      auto   = applied by itself; --no-ppf turns it off.
 #              manual = shipped and reported, applied only with --ppf.
 #              Use manual when the patch changes what the title DOES rather
@@ -29,3 +33,5 @@
 #
 # disc_md5	bin_md5	file	apply	title	note
 1aae36b0c58051ed3f9c3190a2927dbd	ca89367a7c231402e015aa9b3844973b	jc-snows-60hz-vga.ppf	auto	SNOW SURFERS (PAL) -- Snow Surfers v1.001 (1999)(Sega)(PAL)[!]	Adds the VGA video path the PAL release was built without, and forces 60 Hz. By japanese_cake, 2015 (jc-snows-60hz-vga.nfo). Pair it with --vga so the cable check and IP.BIN agree; --no-ppf leaves the title as shipped.
+2753e38e18d34cb1f8a732f770400e19	-	riggles-soa-60hz-v2-disc1.dcp	auto	SKIES OF ARCADIA DISC1 (PAL) -- Skies of Arcadia v1.000 (2001)(Sega)(PAL)(M4)(Disc 1 of 2)[!]	PAL 60 Hz on RGB, VGA and composite with the US cutscene timings, sound effects and walking speed, region-free. By Riggles, 2025 (https://x.com/Riggles_yep; https://www.dreamcast-talk.com/forum/viewtopic.php?t=18173; riggles-soa-60hz-v2.nfo). 60 Hz only; --no-ppf serves the disc as shipped.
+b0026e0b0d145d3763d809d7e507edbc	-	riggles-soa-60hz-v2-disc2.dcp	auto	SKIES OF ARCADIA DISC2 (PAL) -- Skies of Arcadia v1.000 (2001)(Sega)(PAL)(M4)(Disc 2 of 2)[!]	PAL 60 Hz on RGB, VGA and composite with the US cutscene timings, sound effects and walking speed, region-free. By Riggles, 2025 (https://x.com/Riggles_yep; https://www.dreamcast-talk.com/forum/viewtopic.php?t=18173; riggles-soa-60hz-v2.nfo). 60 Hz only; --no-ppf serves the disc as shipped.

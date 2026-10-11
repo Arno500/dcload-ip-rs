@@ -103,7 +103,8 @@ impl DiscSwap {
                 req.reply.send(Err("a disc swap is already in progress".into()));
                 continue;
             }
-            match open_disc(&req.spec) {
+            // Through the disc patches, like the session's own image.
+            match crate::dcp::open_served(&req.spec) {
                 Err(e) => req.reply.send(Err(e)),
                 Ok(disc) => {
                     self.generation = self.generation.wrapping_add(1).max(1);

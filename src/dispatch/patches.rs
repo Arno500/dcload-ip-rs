@@ -93,6 +93,63 @@ pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
             out.push((at, 0xffff_ffff));
         }
     }
+    out.extend(gaps_control_patches(buf, address));
+    out
+}
+
+/// The GAPS bridge's control register, without its segment.
+const GAPS_CTRL: u32 = 0x0100_1418;
+/// What a driver writes there, bit 0 aside: 1 brings the bridge up (KOS's
+/// `gaps_init`), 0 switches it off (Sonic Adventure 2, loader AGENTS.md 4.12).
+const GAPS_KEY: u32 = 0x5a14_a500;
+
+/// Stop a title's own Broadband Adapter driver from taking the adapter
+/// (2026-10-11).
+///
+/// WHY. Unreal Tournament PAL carries a complete RTL8139 driver (online play)
+/// that never looks for `"GAPS"`: its probe (0x8c1c5a10) writes the key
+/// `0x5a14a501` to the control register `0xa1001418`, waits, and takes a
+/// read-back of 1 for an adapter. Then its init clears the adapter's 32 KB of
+/// SRAM through `0xa1840000` (the loader's RX ring) and resets the chip, and
+/// its shutdown writes `0x5a14a500` there. The loader went deaf right after
+/// the title's first directory reads, wherever it was placed.
+///
+/// Every driver brings the bridge up with that key, whoever wrote it, so the
+/// key is what is recognised: each literal naming the control register that an
+/// instruction loads, with a key literal within `GAPS_CORROBORATION_SPAN`, is
+/// pointed at that key word itself (through P2). The driver's writes then land
+/// on a word of its own image, the read-back is the key and not 1, and the
+/// title takes its no-adapter path, which every title that supports a modem
+/// has. Nothing else in the image changes.
+fn gaps_control_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
+    let mut out = vec![];
+    for (base, data) in payload_spans(buf, address) {
+        let loaded: HashSet<usize> = (0..data.len().saturating_sub(1))
+            .step_by(2)
+            .filter_map(|i| pc_load(le16(data, i), i).map(|(_, t)| t))
+            .collect();
+        let named = |pick: &dyn Fn(u32) -> bool| -> Vec<usize> {
+            words(data).filter(|&(i, w)| pick(w) && loaded.contains(&i)).map(|(i, _)| i).collect()
+        };
+        let keys = named(&|w| w & !1 == GAPS_KEY);
+        let ctrls = named(&|w| w & 0x1fff_ffff == GAPS_CTRL && matches!(w >> 29, 0 | 4 | 5));
+        for c in ctrls {
+            let Some(&k) = keys.iter().filter(|&&k| k.abs_diff(c) <= GAPS_CORROBORATION_SPAN).min_by_key(|&&k| k.abs_diff(c))
+            else {
+                continue;
+            };
+            let (at, key) = (p1(base) + c as u32, p1(base) + k as u32);
+            out.push((at, (key & 0x1fff_ffff) | 0xa000_0000));
+        }
+    }
+    if let Some(&(at, to)) = out.first() {
+        info!(
+            "this title drives the Broadband Adapter itself (GAPS control register named at \
+             0x{at:08x}, with its key); pointing {} such word(s) at the key's own word (0x{to:08x}) \
+             so it finds no adapter and cannot reset it",
+            out.len()
+        );
+    }
     out
 }
 
@@ -595,6 +652,48 @@ fn read_word(conn: &mut impl ExternalDcIo, addr: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unreal Tournament PAL's BBA driver (1ST_READ.BIN at 0x8c010000): its
+    /// shutdown (0x8c1c4b54, key 0x5a14a500), its probe's write (0x8c1c5a12,
+    /// key 0x5a14a501) and read-back (0x8c1c5e88), with the opcodes and
+    /// literal offsets of the real program.
+    fn ut_bba_like() -> Vec<u8> {
+        let mut img = vec![0u8; 0x1b_6000];
+        for (at, op) in [(0x1b_4b54usize, 0xd460u16), (0x1b_4b56, 0xd55f), (0x1b_5a12, 0xd42c), (0x1b_5a14, 0xd52a), (0x1b_5e88, 0xd435)] {
+            img[at..at + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        for (at, w) in [
+            (0x1b_4cd4usize, 0x5a14_a500u32),
+            (0x1b_4cd8, 0xa100_1418),
+            (0x1b_5ac0, 0x5a14_a501),
+            (0x1b_5ac4, 0xa100_1418),
+            (0x1b_5f60, 0xa100_1418),
+        ] {
+            img[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn a_titles_own_bba_driver_is_pointed_at_its_key_words() {
+        assert_eq!(
+            gaps_probe_patches(&ut_bba_like(), 0x0c01_0000),
+            vec![
+                (0x8c1c_4cd8, 0xac1c_4cd4),
+                (0x8c1c_5ac4, 0xac1c_5ac0),
+                (0x8c1c_5f60, 0xac1c_5ac0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_control_register_with_no_key_near_it_is_left_alone() {
+        let mut img = ut_bba_like();
+        for at in [0x1b_4cd4, 0x1b_5ac0] {
+            img[at..at + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        }
+        assert_eq!(gaps_probe_patches(&img, 0x0c01_0000), vec![]);
+    }
 
     /// Shenmue II after the swap to disc 4: its main program comes back off
     /// the disc, and the patched word in it must come back patched -- but

@@ -45,6 +45,8 @@ log = "0.4.29"
 # DreamShell names its per-game presets after the MD5 of a disc's boot sector,
 # so recognising a disc means computing the same hash. Not a security use.
 md5 = "0.8.0"
+# xdelta3 patches inside a `.dcp` compress their sections with LZMA2 (src/xdelta.rs).
+lzma-rs = "0.3.0"
 # Inflate with RESTART POINTS. The `block-boundary` feature is what makes
 # random access into a zipped disc image possible without unpacking it: it
 # exposes the decoder state at a deflate block boundary, which is all a

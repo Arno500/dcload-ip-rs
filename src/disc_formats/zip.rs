@@ -468,6 +468,31 @@ impl ZipArchive {
         }
     }
 
+    /// One member, whole, in memory -- quietly: a `.dcp` holds hundreds of
+    /// small members, and `open_entry`'s line apiece would bury the session's
+    /// log under them.
+    pub fn read_whole(&self, entry: &ZipEntry) -> io::Result<Vec<u8>> {
+        let label = format!("{}!{}", self.path.display(), entry.name);
+        if entry.is_encrypted() {
+            return Err(io::Error::other(format!("{label}: encrypted")));
+        }
+        let raw = Box::new(FileSource::open(&self.path)?);
+        let data_at = self.data_offset(entry, raw.as_ref())?;
+        let comp = SubSource::new(raw, data_at, entry.compressed_size, label.clone());
+        match entry.method {
+            METHOD_STORED if entry.compressed_size == entry.uncompressed_size => {
+                let mut bytes = vec![0u8; entry.uncompressed_size as usize];
+                comp.read_at(0, &mut bytes)?;
+                Ok(bytes)
+            }
+            METHOD_DEFLATE => inflate_all(&comp, entry.uncompressed_size, entry.crc32, &label),
+            other => Err(io::Error::other(format!(
+                "{label}: compression method {other} ({}) cannot be read whole",
+                method_name(other)
+            ))),
+        }
+    }
+
     pub fn open_named(&self, name: &str) -> io::Result<Box<dyn ImageSource>> {
         self.open_found(name, self.find(name))
     }

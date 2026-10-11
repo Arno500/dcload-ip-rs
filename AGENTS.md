@@ -47,7 +47,8 @@ ADPCM decoding).
      `ISOLDR_HIGH_ADDR` for a known title, `SCRATCH_BASE` otherwise.
    - Windows CE (§5) and KOS (§5) titles have their own rules, and so does a
      title with an HLib heap (§5): the loader goes at its bottom. A base the
-     rules put inside a Katana syMalloc heap (§5) moves to that heap's top.
+     rules put inside a heap a program sizes from a literal end (§5) moves to
+     that heap's top.
    - **The resident image** (`variants.rs`, loader AGENTS.md 4.18). After the
      base is chosen, `choose_loader_image` serves `dcload-resident.elf` (no
      screen, no DHCP; `variants::patch_resident` writes the console's `-H`
@@ -289,28 +290,52 @@ upload, verified, re-applied on reload, and listed by `identify`
   Its fixed regions rule out the alternatives: above `0x8cec0000` cutscenes and
   stack, and a disc-4 loading buffer ending at `0x8cf046c0` runs over the
   heap's top.
-- **syMalloc heap** (`dispatch/heap.rs`, same `--no-heap-guard`). Katana's
-  `sbInitSystem` hands `syMallocInit` everything from the program's `_end` to a
-  fixed end literal, recognised by its code (`mov.l @r0,r4 ; mov.l @(d,pc),r5 ;
-  mov #-32,r0 ; or r2,r4 ; and r0,r4 ; add #32,r4 ; sub r4,r5`, with `&_end`
-  loaded into r0 just before and no other load of the end literal). Every
-  `.BIN` of the boot area's root is searched (its first 64 KB, plus the sector
-  holding `_end`; ~15 ms once the image is indexed), read as run from
-  0x8c010000, because the program that sets the heap need not be the one
+- **Heap ends** (`dispatch/heap.rs`, same `--no-heap-guard`). Katana's
+  `sbInitSystem` hands `syMallocInit` everything from the program's `_end` to an
+  end literal, and every title compiles it in its own order: four byte
+  patterns were written for three titles and the fourth matched none. So the
+  rule is read off what the code DOES with the end, not its bytes
+  (`Code::sizes`): **a heap's size is its end minus its start**, a `sub` whose
+  minuend comes from a literal naming high RAM (P0/P1/P2, up to `0x0d000000`)
+  and whose subtrahend is a known RAM address at or above the program (`_end`
+  rounded). A small evaluator reads each program straight through: literals,
+  immediates, words read through a known pointer (`&_end`), the ALU operations
+  sbInitSystem uses, and which literal a value still names (the same RAM give
+  or take `SAME_RAM`, 0x40: `& ~31`, `+ 32`, the segment); rts/bra/jmp end what
+  it knows, a call clobbers r0..r7, conditional branches are read through. A
+  literal is taken only if **every** instruction loading it sizes a heap or is
+  in a function that does (no rts/bra/jmp between): a word also used as a
+  buffer address would move the buffer onto the loader. At least `MIN_LEFT`
+  (1 MB) of heap; nothing for a Windows CE disc (`0WINCEOS.BIN`) or a KOS
+  program. Not seen: an end passed as an end (`init(start, end)`), an end that
+  is not a literal, a constant-size heap (HLib, above), a stack moved to the
+  top of RAM (a rule for that found "stacks" in Crazy Taxi, Sonic Adventure and
+  data files read as code: dropped). Checked on ten images (2026-10-11):
+  Crazy Taxi, Sonic Adventure, Sonic Adventure 2, Shenmue II, Sega Rally 2
+  PAL and US give nothing; the ones below are found.
+
+  Every `.BIN` of the boot area's root is searched (its first 64 KB, the whole
+  of the program IP.BIN boots, plus the sector holding `_end`), read as run
+  from 0x8c010000, because the program that sets the heap need not be the one
   uploaded: Jet Set Radio's `1ST_READ.BIN` reads `JET_PAL.BIN` into a buffer
   and runs it. A base the rules choose inside such a heap (and not given with
   `--loader-base`, nor chosen by the HLib rule) moves to the heap's top, the
   highest 64 KB boundary leaving the loader's span inside it, provided no
-  program on the disc loads a constant naming that span; the end literal is
-  then lowered to the loader's base, in the uploaded program (guarded like the
-  HLib words) and in the sectors served (`DiscPatch`, applied in
-  `SectorServer::serve` wherever the read lands, only over the disc's own
-  word). Not for an HLib title. Jet Set Radio PAL: heaps
-  `0x8c0a9120..0x8c800000` (1ST_READ) and `0x8c35d740..0x8c800000`
-  (JET_PAL/JET), fixed buffers from `0x8c800000` up; the learned map's holes
-  were inside the heap, and loaders at `0x8c650000`/`0x8c580000` were
-  overwritten while a level loaded (2026-10-09). Loader `0x8c7f0000`, end
-  lowered to it: measured on the console (2026-10-10), levels load and play.
+  program on the disc loads a constant naming that span -- else one 64 KB lower,
+  down to `TOP_SLACK` (256 KB) under the top, the heap above given up; every
+  end literal of a heap the loader is then in is lowered to the loader's base,
+  in the uploaded program (guarded like the HLib words) and in the sectors
+  served (`DiscPatch`, applied in `SectorServer::serve` wherever the read
+  lands, only over the disc's own word). Not for an HLib title.
+
+  | Title (PAL) | Heap | End literal(s) | Loader |
+  | --- | --- | --- | --- |
+  | Jet Set Radio | `0x8c0a9120..` (1ST_READ), `0x8c35d740..0x8c800000` (JET_PAL/JET) | `0x8c013e60`, `0x8c013fe8` | `0x8c7f0000`, **measured** (2026-10-10): levels load and play; at `0x8c650000`/`0x8c580000` (the learned map's holes, inside the heap) it was overwritten while a level loaded |
+  | Skies of Arcadia | `0x8c5534c0..0x8d000000` | `0x8c015eb4` (loaded twice in sbInitSystem) | `0x8cfe0000` (`0x8cff0000` is its Maple DMA list); at `0x8cfd0000` unpatched the console reset at EXEC. Not measured |
+  | Tony Hawk's Pro Skater 2 | `0x8c349580..0x8d000000` | `0x8c062f0c` (sbInitSystem 0x52de0 into 1ST_READ) | `0x8cfd0000` (it names `0x8cfe0000`, `0x8cff0000`); at `0x8ce00000` reset before the menu after a 1.5 MB read to the heap's top. Not measured |
+  | Unreal Tournament | `0x8c313740..0x8cfdd000` | `0x8c05b1f8` (sbInitSystem, and a function sizing it again from the same pool), `0x8c05b2a0` (a second set-up) | `0x8cfc0000`; at `0x8c940000` (middle of unread RAM) silent after seven sector reads (2026-10-11). Its stack is moved to `0x8d000000`, above the heap. Not measured |
+  | Snow Surfers | `0x8c1eaec0..0x8d000000` | `0x8c081c70`, `0x8c081d7c` (two sbInitSystems) | moves off `0x8ce00000`, where every CD-DA session ran inside the heap, to the top under what it names. Not measured |
+
 - **KOS** (`is_kos_binary`). The loader is told via `g_gd_kos`; KOS's top of
   RAM is lowered under the loader (`kos_mem_top_patches`); the dcload magic at
   `0x8c004004` is pointed at the live loader (`update_dcload_magic`) so KOS's
@@ -327,6 +352,27 @@ files (`patchdb.rs`, `ppf.rs`: PPF 1.0/2.0/3.0).
 - `apply` is `auto` or `manual` (offered, not applied). A `.ppf` without a row
   is offered only if its blockcheck matches. `--no-ppf` disables the list but
   still reports what it held back.
+- **Disc patches (`.dcp`, `dcp.rs` + `xdelta.rs`).** A row naming a `.dcp` (the
+  Universal Dreamcast Patcher's zip of `<path>.xdelta` deltas and whole files)
+  patches the disc's FILES, keyed on `disc_md5`; `--ppf x.dcp` names one by
+  hand. The image is opened through `dcp::open_served` (the session's and a
+  `swap-disc`'s, and `identify`), which lays the patched files over it: a file
+  that still fits its sectors stays there with a new size in its record, one
+  that grows or is new goes into a hole of the data track (below the highest
+  sector used), a new record is inserted in ISO 9660 order and a directory
+  that would need to move refuses the patch. **All or nothing**: a file the
+  disc lacks, or an xdelta window whose Adler-32 fails (another dump), serves
+  the image as it lies. xdelta3's LZMA sections are xz streams flushed without
+  an end (`unlzma`): decoded with `lzma-rs` once the end byte is added. The
+  boot binary is read through the overlay, so it is uploaded patched; the
+  RetroAchievements hash is taken from the image as it lies. The `.dcp` files
+  are gitignored (others' work, tens of MB); the row and an `.nfo` crediting
+  the author are committed. Skies of Arcadia PAL (Riggles' 60 Hz desync fix
+  v2): disc 1 495 files patched and `SOUND/M02S.P16` (16 MB) added in the hole
+  at LBA 45261, 3.6 s at open; disc 2 388 patched, 2 moved. Every file read
+  back through the overlay matched the patcher's output (2026-10-11); not yet
+  run on the console. A swap to a patched disc builds its overlay inside the
+  syscall loop (~3.5 s, on top of opening the image).
 
 ## 7. Architecture
 

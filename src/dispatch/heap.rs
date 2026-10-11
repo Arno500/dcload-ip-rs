@@ -175,24 +175,122 @@ impl HlibHeap {
 // into a buffer, copies it to 0x8c010000 and runs it. So the programs on the
 // disc are scanned too, and the word is patched in the sectors served
 // (`DiscPatch`), wherever the read lands.
+//
+// A SECOND FORM: THE HEAP TO THE TOP OF RAM (Skies of Arcadia, 2026-10-11).
+// Its sbInitSystem (1ST_READ.BIN, 0x8c015e02) has no fixed end: the end is
+// `_end`'s segment with the literal 0x0d000000, so the heap is everything from
+// the BSS to 0x8d000000 and no base above the program is outside it. With the
+// loader at 0x8cfd0000 the console reset at EXEC, before answering anything:
+//
+//     mov.l   @(disp,pc),r3   ; 0xe0000000
+//     mov.l   @(disp,pc),r1   ; &_end
+//     mov.l   @r1,r5
+//     and     r3,r5
+//     mov.l   @(disp,pc),r2   ; the heap's end, 0x0d000000
+//     or      r2,r5           ; end = (_end & 0xe0000000) | 0x0d000000
+//     mov.l   @(disp,pc),r1   ; 0x80000000
+//     mov.l   @(disp,pc),r3   ; &_end
+//     mov.l   @r3,r0
+//     or      r1,r0
+//     mov     #-32,r2
+//     and     r2,r0
+//     sub     r0,r5
+//     add     #-32,r5         ; size = end - (((_end | P1) & ~31) + 32)
+//
+// The same function loads the literal a second time to keep the size in a
+// global; lowering the one word lowers both. The literal is the same kind of
+// word as the first form's, so the same patch applies.
+//
+// Tony Hawk's Pro Skater 2 PAL (2026-10-11) has the same arithmetic scheduled
+// differently (1ST_READ.BIN, 0x8c062e10, heap 0x8c3495a0..0x8d000000): the
+// loader at 0x8ce00000 was in it and the console reset at the menu, right
+// after a 1.5 MB read to 0x8ce82380..0x8cfffb80, the heap's top.
+//
+//     mov.l   @(disp,pc),r1   ; &_end
+//     mov.l   @r1,r5
+//     mov.l   @(disp,pc),r4   ; 0x80000000
+//     mov.l   @(disp,pc),r1   ; 0xe0000000
+//     or      r5,r4
+//     and     r1,r5
+//     mov.l   @(disp,pc),r1   ; the heap's end, 0x0d000000
+//     mov     #-32,r8
+//     or      r1,r5
+//     and     r8,r4
+//     mov.l   @(disp,pc),r1   ; syMallocInit
+//     add     r8,r5
+//     sub     r4,r5
+//     add     #32,r4
+//
+// Its sbInitSystem is 0x52de0 into the program, linked after the game's own
+// code: the boot program is scanned whole (`disc_katana_heaps`).
+//
+// Its TOP is not free either: the title points the Maple DMA at 0x0cff0000,
+// inside the heap's last 64 KB. So the loader may sit up to `TOP_SLACK` under
+// the top, the heap above it given up with it (`katana_loader_base` takes the
+// highest base its caller accepts).
 // ---------------------------------------------------------------------------
 
-/// `mov.l @r0,r4`, `mov.l @(disp,pc),r5` (low byte any), then the rest.
-const SBINIT: [u16; 7] = [0x6402, 0xd500, 0xe0e0, 0x242b, 0x2409, 0x7420, 0x3548];
+// ---------------------------------------------------------------------------
+// ANY SCHEDULE, READ FROM WHAT THE CODE DOES WITH THE END (2026-10-11).
+//
+// Three byte patterns above, one per title, and the fourth title matched none
+// of them. Unreal Tournament PAL's sbInitSystem (1ST_READ.BIN, 0x8c05b0e8)
+// is the same arithmetic in yet another order, with its own end, 0x0cfdd000:
+// a heap 0x8c313740..0x8cfdd000. With the loader at 0x8c940000, the middle of
+// RAM no read had landed in, the console went silent after seven sector reads.
+// Two more functions size the same heap again (0x8c05b1a6 keeps the size in a
+// global, 0x8c05b26a sets it up afresh), one of them sharing the first's
+// literal pool: two words to lower, not one. And Snow Surfers, run for weeks
+// with its loader at 0x8ce00000, has two sbInitSystems of a fourth schedule
+// (0x8c081bda, 0x8c081d10) handing syMalloc everything to 0x8d000000: that
+// loader was inside a heap that happened not to fill so far.
+//
+// A byte pattern is one compiler's schedule of one library's code. What all of
+// them share is what the code does with the end: A HEAP'S SIZE IS ITS END
+// MINUS ITS START -- a `sub` whose minuend comes from a literal naming high
+// RAM and whose subtrahend is a known RAM address at or above the program
+// (`_end`, rounded). So each program is read straight through once by a small
+// evaluator: it knows literals, immediates, words read through a known pointer
+// (`&_end`) and a few ALU operations, and which literal a value still names
+// (the same RAM, give or take an alignment: `& ~31`, `+ 32`, the segment). An
+// unconditional transfer (rts, bra, jmp) ends what it knows, a call clobbers
+// r0..r7, a conditional branch is read through. Each end it finds names the
+// literal; lowering that word lowers the end, whatever the allocator, the
+// library version or the schedule (`KatanaHeap::patch`).
+//
+// A literal is taken only if every instruction that loads it sizes a heap, or
+// sits in a function that does (Skies of Arcadia's loads it again to keep the
+// size): a word also used as a buffer's address would move the buffer onto the
+// loader. Nothing under `MIN_LEFT`, nothing in Windows CE or KOS programs
+// (their RAM has rules of their own: `wince::take`, `kos_mem_top_patches`).
+//
+// Not seen: an end passed as an end (`init(start, end)`, no subtraction), an
+// end that is not a literal (from a table, from the hardware), a heap whose
+// size is a constant (HLib, above, has its own rule), a stack moved to the top
+// of RAM (Unreal Tournament's is, above its heap: a rule for that found
+// "stacks" in Crazy Taxi, Sonic Adventure and data files read as code, and was
+// dropped).
+// ---------------------------------------------------------------------------
+
 /// Where a Katana program runs, wherever it was read to.
 const KATANA_LOAD: u32 = 0x8c01_0000;
-/// How far back from the sequence the load of `&_end` into r0 may be.
-const SBINIT_LOOKBACK: usize = 32;
 /// The reach of `mov.l @(disp,pc)`: a literal is named from at most this far.
 const PC_REACH: usize = 1024;
-/// How much of a disc file is searched for the sequence: sbinit is linked
-/// right after crt0 (0x3dbc and 0x3f50 into Jet Set Radio's two programs).
+/// How much of a disc file is searched: sbinit is linked right after crt0
+/// (0x3dbc and 0x3f50 into Jet Set Radio's two programs). The program IP.BIN
+/// boots is searched whole: Tony Hawk's Pro Skater 2's sbinit is 0x52de0 into
+/// it, Unreal Tournament's `main` 0x48e80.
 const SCAN_BYTES: u32 = 0x1_0000;
+/// How far an ALU result may stray from its literal and still name it: an
+/// alignment (`& ~31`, `+ 32`), not another buffer.
+const SAME_RAM: u32 = 0x40;
+/// How much heap may be given up above the loader, when the top is not free.
+const TOP_SLACK: u32 = 0x4_0000;
 
-/// One syMalloc heap, as sbInitSystem sets it up.
+/// One heap a program sets up, and the literal that ends it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KatanaHeap {
-    /// The area handed to syMallocInit (P1).
+    /// Its start (P1): what its size is computed from.
     pub start: u32,
     /// Its end (P1), from the literal.
     pub end: u32,
@@ -201,62 +299,266 @@ pub struct KatanaHeap {
     end_raw: u32,
 }
 
-/// The sequence at `i` of `data` (run from `base`), its heap if `_end` can be
-/// read: from `data` itself, or through `read_word` for a program read only
-/// in part.
-fn sbinit_at(data: &[u8], base: u32, i: usize, read_word: &dyn Fn(u32) -> Option<u32>) -> Option<KatanaHeap> {
-    let op = |k: usize| (k + 2 <= data.len()).then(|| le16(data, k));
-    for (k, want) in SBINIT.iter().enumerate() {
-        let got = op(i + 2 * k)?;
-        if (k == 1 && got & 0xff00 != *want) || (k != 1 && got != *want) {
-            return None;
-        }
-    }
-    let (_, lit) = pc_load(op(i + 2)?, i + 2)?;
-    let end_raw = (lit + 4 <= data.len()).then(|| le32(data, lit))?;
-    // Nothing else may load that literal: the word is the heap's end only.
-    let namers = (lit.saturating_sub(PC_REACH)..lit)
-        .step_by(2)
-        .filter(|&j| op(j).and_then(|o| pc_load(o, j)).is_some_and(|(_, at)| at == lit))
-        .count();
-    if namers != 1 {
-        return None;
-    }
-    // r0 = &_end, loaded shortly before.
-    let end_ptr = (2..=SBINIT_LOOKBACK).step_by(2).find_map(|b| {
-        let j = i.checked_sub(b)?;
-        let o = op(j)?;
-        match pc_load(o, j) {
-            Some((0, at)) if at + 4 <= data.len() => Some(le32(data, at)),
-            _ => None,
-        }
-    })?;
-    let bss_end = read_word(end_ptr)?;
-    let start = p1(((bss_end | 0x8000_0000) & !31).wrapping_add(32));
-    let end = p1(end_raw);
-    (names_ram(end_raw) && names_ram(bss_end) && start < end && end - start >= MIN_LEFT).then_some(KatanaHeap {
-        start,
-        end,
-        end_at: p1(base).wrapping_add(lit as u32),
-        end_raw,
-    })
+/// Whether `w` can be the end of RAM a heap or stack runs to: an address in
+/// main RAM or one past it, in P0, P1 or P2.
+fn ends_ram(w: u32) -> bool {
+    matches!(w & 0xe000_0000, 0 | 0x8000_0000 | 0xa000_0000)
+        && (0x0c00_0001..=0x0d00_0000).contains(&(w & 0x1fff_ffff))
 }
 
-/// The syMalloc heap a program sets up, if exactly one sbInitSystem is in it.
-pub fn katana_heap(buf: &[u8], address: u32) -> Option<KatanaHeap> {
+/// A literal: its offset in the program, the word, and where it was loaded.
+type Lit = (usize, u32, usize);
+
+/// What a register holds, as far as one straight read can tell.
+#[derive(Clone, Copy, Debug, Default)]
+struct Val {
+    /// Its value, when every input was known.
+    v: Option<u32>,
+    /// The literal it still names.
+    lit: Option<Lit>,
+}
+
+impl Val {
+    fn known(v: u32) -> Self {
+        Val { v: Some(v), lit: None }
+    }
+}
+
+/// `lit`, if `v` still names its RAM.
+fn carry(lit: Option<Lit>, v: Option<u32>) -> Option<Lit> {
+    let (l, v) = (lit?, v?);
+    ((v & 0x1fff_ffff).abs_diff(l.1 & 0x1fff_ffff) <= SAME_RAM).then_some(l)
+}
+
+/// A heap size the evaluator saw: `end - start`, `end` from a literal.
+struct Size {
+    lit: Lit,
+    start: u32,
+}
+
+/// What an instruction does to control flow, after its delay slot if it has one.
+enum Flow {
+    Next,
+    Call,
+    Stop,
+}
+
+/// One program as it will run: its bytes from `base`, and how to read a word
+/// of RAM it names (`&_end`) that the bytes may not hold.
+struct Code<'a> {
+    data: &'a [u8],
+    base: u32,
+    read_word: &'a dyn Fn(u32) -> Option<u32>,
+}
+
+impl Code<'_> {
+    fn op(&self, i: usize) -> Option<u16> {
+        (i + 2 <= self.data.len()).then(|| le16(self.data, i))
+    }
+
+    /// Ends control flow for good: rts, rte, bra, braf, jmp.
+    fn stops(op: u16) -> bool {
+        op == 0x000b || op == 0x002b || op >> 12 == 0xa || op & 0xf0ff == 0x0023 || op & 0xf0ff == 0x402b
+    }
+
+    /// One instruction at `i` on `r`.
+    fn step(&self, op: u16, i: usize, r: &mut [Val; 16], seen: &mut Vec<Size>) -> Flow {
+        let n = ((op >> 8) & 0xf) as usize;
+        let m = ((op >> 4) & 0xf) as usize;
+        let simm = op as u8 as i8 as i32 as u32;
+        let uimm = (op & 0xff) as u32;
+        let none = Val::default();
+        // An address register moved by `by`: known if it was, naming nothing.
+        let moved = |x: Val, by: i32| Val { v: x.v.map(|v| v.wrapping_add(by as u32)), lit: None };
+        let alu = |a: Val, b: Val, v: Option<u32>| Val { v, lit: carry(a.lit, v).or_else(|| carry(b.lit, v)) };
+        match op >> 12 {
+            0x0 => match op & 0xf {
+                0xb if op == 0x000b || op == 0x002b => return Flow::Stop,
+                0x3 => match op & 0xf0 {
+                    0x00 => return Flow::Call,
+                    0x20 => return Flow::Stop,
+                    _ => {}
+                },
+                0x9 if op & 0xff == 0x29 => r[n] = none,
+                0x2 | 0xa | 0xc | 0xd | 0xe => r[n] = none,
+                0xf => (r[n], r[m]) = (none, none),
+                _ => {}
+            },
+            0x2 => match op & 0xf {
+                0x4 => r[n] = moved(r[n], -1),
+                0x5 => r[n] = moved(r[n], -2),
+                0x6 => r[n] = moved(r[n], -4),
+                0x9 => r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a & b)),
+                0xa => r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a ^ b)),
+                0xb => r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a | b)),
+                0xd => r[n] = none,
+                _ => {}
+            },
+            0x3 => match op & 0xf {
+                0x8 => {
+                    if let (Some(lit), Some(_), Some(start)) = (r[n].lit, r[n].v, r[m].v) {
+                        seen.push(Size { lit, start });
+                    }
+                    r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a.wrapping_sub(b)));
+                }
+                0xc => {
+                    r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a.wrapping_add(b)));
+                }
+                0x4 | 0xa | 0xb | 0xe | 0xf => r[n] = none,
+                _ => {}
+            },
+            0x4 => match op & 0xff {
+                0x0b => return Flow::Call,
+                0x2b => return Flow::Stop,
+                0x00 | 0x20 => r[n] = Val { v: r[n].v.map(|v| v << 1), lit: None },
+                0x01 => r[n] = Val { v: r[n].v.map(|v| v >> 1), lit: None },
+                0x21 => r[n] = Val { v: r[n].v.map(|v| ((v as i32) >> 1) as u32), lit: None },
+                0x08 => r[n] = Val { v: r[n].v.map(|v| v << 2), lit: None },
+                0x09 => r[n] = Val { v: r[n].v.map(|v| v >> 2), lit: None },
+                0x18 => r[n] = Val { v: r[n].v.map(|v| v << 8), lit: None },
+                0x19 => r[n] = Val { v: r[n].v.map(|v| v >> 8), lit: None },
+                0x28 => r[n] = Val { v: r[n].v.map(|v| v << 16), lit: None },
+                0x29 => r[n] = Val { v: r[n].v.map(|v| v >> 16), lit: None },
+                0x10 => r[n] = moved(r[n], -1),
+                0x04 | 0x05 | 0x24 | 0x25 => r[n] = none,
+                x if x & 0xf == 0x6 || x & 0xf == 0x7 => r[n] = moved(r[n], 4),
+                x if x & 0xf == 0x2 || x & 0xf == 0x3 => r[n] = moved(r[n], -4),
+                x if x & 0xf == 0xc || x & 0xf == 0xd => r[n] = none,
+                x if x & 0xf == 0xf => (r[n], r[m]) = (none, none),
+                _ => {}
+            },
+            0x5 => {
+                let at = r[m].v.map(|v| v.wrapping_add((op & 0xf) as u32 * 4));
+                r[n] = Val { v: at.and_then(|a| (self.read_word)(a)), lit: None };
+            }
+            0x6 => match op & 0xf {
+                0x3 => r[n] = r[m],
+                0x2 | 0x6 => {
+                    let v = r[m].v.and_then(|a| (self.read_word)(a));
+                    if op & 0xf == 0x6 && m != n {
+                        r[m] = moved(r[m], 4);
+                    }
+                    r[n] = Val { v, lit: None };
+                }
+                0x4 | 0x5 => {
+                    if m != n {
+                        r[m] = moved(r[m], if op & 0xf == 0x4 { 1 } else { 2 });
+                    }
+                    r[n] = none;
+                }
+                _ => r[n] = none,
+            },
+            0x7 => {
+                let v = r[n].v.map(|v| v.wrapping_add(simm));
+                r[n] = alu(r[n], Val::known(simm), v);
+            }
+            0x8 => match op >> 8 {
+                0x84 | 0x85 => r[0] = none,
+                _ => {}
+            },
+            0x9 => {
+                let at = i + 4 + uimm as usize * 2;
+                r[n] = self.op(at).map_or(none, |w| Val::known(w as i16 as i32 as u32));
+            }
+            0xa => return Flow::Stop,
+            0xb => return Flow::Call,
+            0xc => match op >> 8 {
+                0xc4..=0xc6 => r[0] = none,
+                0xc7 => r[0] = Val::known(p1(self.base).wrapping_add((((i + 4) & !3) + uimm as usize * 4) as u32)),
+                0xc9 => r[0] = alu(r[0], Val::known(uimm), r[0].v.map(|v| v & uimm)),
+                0xca => r[0] = alu(r[0], Val::known(uimm), r[0].v.map(|v| v ^ uimm)),
+                0xcb => r[0] = alu(r[0], Val::known(uimm), r[0].v.map(|v| v | uimm)),
+                _ => {}
+            },
+            0xd => {
+                let (_, at) = pc_load(op, i).unwrap_or((0, usize::MAX));
+                r[n] = match (at.checked_add(4)).is_some_and(|e| e <= self.data.len()) {
+                    true => {
+                        let w = le32(self.data, at);
+                        Val { v: Some(w), lit: ends_ram(w).then_some((at, w, i)) }
+                    }
+                    false => none,
+                };
+            }
+            0xe => r[n] = Val::known(simm),
+            0xf => match op & 0xf {
+                0x9 => r[m] = none,
+                0xb => r[n] = none,
+                _ => {}
+            },
+            _ => {}
+        }
+        Flow::Next
+    }
+
+    /// Read the program straight through, and every heap size seen.
+    fn sizes(&self) -> Vec<Size> {
+        let mut seen = vec![];
+        let mut r = [Val::default(); 16];
+        let mut pending: Option<Flow> = None;
+        let mut i = 0;
+        while let Some(op) = self.op(i) {
+            let flow = self.step(op, i, &mut r, &mut seen);
+            // The delay slot ran: now the branch.
+            match pending.take() {
+                Some(Flow::Call) => r[..8].fill(Val::default()),
+                Some(Flow::Stop) => r = [Val::default(); 16],
+                _ if !matches!(flow, Flow::Next) => pending = Some(flow),
+                _ => {}
+            }
+            i += 2;
+        }
+        seen
+    }
+
+    /// Whether nothing between `a` and `b` ends control flow: the same function.
+    fn same_stretch(&self, a: usize, b: usize) -> bool {
+        !(a.min(b)..a.max(b)).step_by(2).any(|k| self.op(k).is_some_and(Self::stops))
+    }
+
+    /// Every heap end this program sets up from a literal.
+    fn ends(&self, image_end: u32) -> Vec<KatanaHeap> {
+        let sizes = self.sizes();
+        let floor = p1(self.base);
+        let mut out: Vec<KatanaHeap> = vec![];
+        for s in &sizes {
+            let (at, raw, _) = s.lit;
+            let (start, end) = (p1(s.start), p1(raw));
+            let end_at = floor.wrapping_add(at as u32);
+            if !names_ram(s.start)
+                || start < floor
+                || end <= image_end
+                || end < start.saturating_add(MIN_LEFT)
+                || out.iter().any(|h| h.end_at == end_at)
+            {
+                continue;
+            }
+            // Every load of the word sizes a heap, or is in a function that does.
+            let sizing: Vec<usize> = sizes.iter().filter(|t| t.lit.0 == at).map(|t| t.lit.2).collect();
+            let loaders = (at.saturating_sub(PC_REACH)..at)
+                .step_by(2)
+                .filter(|&j| self.op(j).and_then(|o| pc_load(o, j)).is_some_and(|(_, t)| t == at));
+            if loaders.into_iter().all(|j| sizing.iter().any(|&k| k == j || self.same_stretch(j, k))) {
+                out.push(KatanaHeap { start, end, end_at, end_raw: raw });
+            }
+        }
+        out
+    }
+}
+
+/// Every heap end a program sets up from a literal (above), read as it runs
+/// from `address`.
+pub fn program_heaps(buf: &[u8], address: u32) -> Vec<KatanaHeap> {
     let mut found = vec![];
     for (base, data) in payload_spans(buf, address) {
         let word = |a: u32| {
             let off = p1(a).checked_sub(p1(base))? as usize;
             (a & 3 == 0 && off + 4 <= data.len()).then(|| le32(data, off))
         };
-        found.extend((0..data.len()).step_by(2).filter_map(|i| sbinit_at(data, base, i, &word)));
+        let image_end = p1(base).wrapping_add(data.len() as u32);
+        found.extend(Code { data, base, read_word: &word }.ends(image_end));
     }
-    found.dedup();
-    match found.as_slice() {
-        [one] => Some(*one),
-        _ => None,
-    }
+    found
 }
 
 impl KatanaHeap {
@@ -267,18 +569,27 @@ impl KatanaHeap {
         (crate::loaders::is_high(base) && base >= self.start + MIN_LEFT).then_some(base)
     }
 
+    /// The 64 KB boundaries the loader may take, highest first: the top, then
+    /// down to `TOP_SLACK` under it, the heap above the loader given up.
+    pub fn loader_bases(&self) -> impl Iterator<Item = u32> + '_ {
+        let top = self.loader_base();
+        (0..=TOP_SLACK / 0x1_0000)
+            .filter_map(move |k| top?.checked_sub(k * 0x1_0000))
+            .filter(|&b| crate::loaders::is_high(b) && b >= self.start + MIN_LEFT)
+    }
+
     /// The heap's end lowered to a loader at `base`, as (RAM address, word).
     /// Nothing when the loader is outside the heap; an error when it is not
-    /// at its top, where lowering the end would throw away the heap above it.
+    /// near its top, where lowering the end would throw away the heap above it.
     pub fn patch(&self, base: u32) -> Result<Option<(u32, u32)>, String> {
         let (lo, hi) = (p1(base), p1(base) + crate::loaders::LOADER_SPAN);
         if hi <= self.start || lo >= self.end {
             return Ok(None);
         }
-        if self.loader_base() != Some(lo) {
+        if !self.loader_bases().any(|b| b == lo) {
             return Err(format!(
-                "it is not at the top of the heap (0x{:08x}..0x{:08x}), the only part of it \
-                 the end can be lowered past",
+                "it is not at the top of the heap (0x{:08x}..0x{:08x}) or within 0x{TOP_SLACK:x} \
+                 under it, the only part of it the end can be lowered past",
                 self.start, self.end
             ));
         }
@@ -307,11 +618,18 @@ pub struct DiscPatch {
     pub value: u32,
 }
 
-/// Every program in the boot area's root that sets up a syMalloc heap, read as
-/// Katana runs it: from 0x8c010000. Reads the first `SCAN_BYTES` of each
-/// `.BIN` and one sector more for `_end`.
+/// Every heap end the programs in the boot area's root set up from a literal
+/// (`Code::ends`), read as Katana runs them: from 0x8c010000. Reads
+/// the first `SCAN_BYTES` of each `.BIN`, all of the boot program, and one
+/// sector more for `_end`. Nothing for a Windows CE disc, and nothing in a KOS
+/// program: their RAM has rules of their own.
 pub fn disc_katana_heaps(disc: &dyn DiscFormat) -> Vec<DiscHeap> {
     let root = crate::disc_formats::iso9660::list_root(disc, disc.boot_sector());
+    let boot = crate::disc_formats::types::ip_bin_at(disc, disc.boot_sector())
+        .and_then(|h| crate::disc_formats::iso9660::boot_file_name(&h));
+    if boot.as_deref().is_some_and(|b| b.eq_ignore_ascii_case("0WINCEOS.BIN")) {
+        return vec![];
+    }
     let mut out = vec![];
     for e in root.iter().filter(|e| {
         !e.is_dir
@@ -319,9 +637,12 @@ pub fn disc_katana_heaps(disc: &dyn DiscFormat) -> Vec<DiscHeap> {
             && e.size >= SCAN_BYTES
             && e.size <= crate::disc_formats::iso9660::MAX_FILE_BYTES
     }) {
-        let Ok(head) = disc.read_sector(e.lba, SCAN_BYTES / 2048) else {
+        let whole = boot.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(&e.name));
+        let scan = if whole { e.size } else { SCAN_BYTES };
+        let Ok(mut head) = disc.read_sector(e.lba, scan.div_ceil(2048)) else {
             continue;
         };
+        head.truncate(scan as usize);
         let word = |a: u32| {
             let off = p1(a).checked_sub(KATANA_LOAD)?;
             if a & 3 != 0 || off + 4 > e.size {
@@ -336,12 +657,12 @@ pub fn disc_katana_heaps(disc: &dyn DiscFormat) -> Vec<DiscHeap> {
                 }
             }
         };
-        let found: Vec<KatanaHeap> = (0..head.len())
-            .step_by(2)
-            .filter_map(|i| sbinit_at(&head, KATANA_LOAD, i, &word))
-            .collect();
-        if let [h] = found.as_slice() {
-            out.push(DiscHeap { file: e.name.clone(), lba: e.lba, size: e.size, heap: *h });
+        if is_kos_binary(&head) {
+            continue;
+        }
+        let code = Code { data: &head, base: KATANA_LOAD, read_word: &word };
+        for h in code.ends(KATANA_LOAD + e.size) {
+            out.push(DiscHeap { file: e.name.clone(), lba: e.lba, size: e.size, heap: h });
         }
     }
     out
@@ -376,12 +697,13 @@ impl DiscHeap {
 }
 
 /// Where the loader goes when its base would be inside a syMalloc heap: the
-/// top of the lowest-ending heap it is in, if every heap it then sits in can
-/// be lowered past it.
-pub fn katana_loader_base(heaps: &[KatanaHeap], base: u32) -> Option<u32> {
+/// highest base `free` accepts at the top of the lowest-ending heap it is in
+/// (or up to `TOP_SLACK` under it), if every heap it then sits in can be
+/// lowered past it.
+pub fn katana_loader_base(heaps: &[KatanaHeap], base: u32, free: &dyn Fn(u32) -> bool) -> Option<u32> {
     let inside = |b: u32| heaps.iter().filter(move |h| h.patch(b).map_or(true, |p| p.is_some()));
-    let top = inside(base).filter_map(|h| h.loader_base()).min()?;
-    inside(top).all(|h| h.patch(top).is_ok()).then_some(top)
+    let lowest = inside(base).filter(|h| h.loader_base().is_some()).min_by_key(|h| h.end)?;
+    lowest.loader_bases().find(|&b| inside(b).all(|h| h.patch(b).is_ok()) && free(b))
 }
 
 /// Put the disc patches into a read of `buf.len()` bytes from `start`. Only a
@@ -484,9 +806,17 @@ mod tests {
         img
     }
 
+    /// The one end a program sets up.
+    fn one_end(img: &[u8]) -> KatanaHeap {
+        match program_heaps(img, 0x8c01_0000).as_slice() {
+            [h] => *h,
+            other => panic!("expected one end, found {other:?}"),
+        }
+    }
+
     #[test]
     fn jet_set_radios_heap_is_found_and_the_loader_goes_at_its_top() {
-        let h = katana_heap(&jsr_like(), 0x8c01_0000).expect("sbInitSystem");
+        let h = one_end(&jsr_like());
         assert_eq!((h.start, h.end, h.end_at), (0x8c35_d740, 0x8c80_0000, 0x8c01_3fe8));
         assert_eq!(h.loader_base(), Some(0x8c7f_0000));
         assert_eq!(h.patch(0x8c7f_0000).unwrap(), Some((0x8c01_3fe8, 0x8c7f_0000)));
@@ -495,17 +825,186 @@ mod tests {
         assert_eq!(h.patch(0x8c30_0000).unwrap(), None);
         assert!(h.patch(0x8c65_0000).is_err());
         // The bases the learned map gave move to the top; one above stays.
-        assert_eq!(katana_loader_base(&[h], 0x8c65_0000), Some(0x8c7f_0000));
-        assert_eq!(katana_loader_base(&[h], 0x8c58_0000), Some(0x8c7f_0000));
-        assert_eq!(katana_loader_base(&[h], 0x8cef_0000), None);
+        assert_eq!(katana_loader_base(&[h], 0x8c65_0000, &|_| true), Some(0x8c7f_0000));
+        assert_eq!(katana_loader_base(&[h], 0x8c58_0000, &|_| true), Some(0x8c7f_0000));
+        assert_eq!(katana_loader_base(&[h], 0x8cef_0000, &|_| true), None);
     }
 
     #[test]
-    fn a_heap_end_another_instruction_loads_is_not_taken() {
+    fn a_heap_end_another_function_loads_is_not_taken() {
         let mut img = jsr_like();
-        // mov.l @(disp,pc),r1 naming the same literal, from 0x3f70.
+        // sbInitSystem returns (rts; nop), and mov.l @(disp,pc),r1 naming the
+        // same literal follows, from 0x3f70: another function's use of it.
+        img[0x3f60..0x3f62].copy_from_slice(&0x000bu16.to_le_bytes());
+        img[0x3f62..0x3f64].copy_from_slice(&0x0009u16.to_le_bytes());
         img[0x3f70..0x3f72].copy_from_slice(&0xd11du16.to_le_bytes());
-        assert_eq!(katana_heap(&img, 0x8c01_0000), None);
+        assert_eq!(program_heaps(&img, 0x8c01_0000), vec![]);
+    }
+
+    /// Skies of Arcadia PAL's sbInitSystem (1ST_READ.BIN, 0x8c015e02): the
+    /// heap's end is `_end`'s segment | 0x0d000000, its literal loaded again at
+    /// 0x8c015e54; `&_end` pointed at a word kept inside this smaller image.
+    fn skies_like() -> Vec<u8> {
+        let mut img = vec![0u8; 0x6000];
+        let code: [u16; 14] = [
+            0xd32a, 0xd12a, 0x6512, 0x2539, 0xd22a, 0x252b, 0xd12a, 0xd327, 0x6032, 0x201b, 0xe2e0, 0x2029,
+            0x3508, 0x75e0,
+        ];
+        for (k, op) in code.iter().enumerate() {
+            img[0x5e02 + 2 * k..0x5e04 + 2 * k].copy_from_slice(&op.to_le_bytes());
+        }
+        img[0x5e54..0x5e56].copy_from_slice(&0xd117u16.to_le_bytes());
+        for (at, w) in [
+            (0x5eac, 0xe000_0000u32),
+            (0x5eb0, 0x8c01_5f00),
+            (0x5eb4, 0x0d00_0000),
+            (0x5eb8, 0x8000_0000),
+            (0x5f00, 0x8c55_34c0),
+        ] {
+            img[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn a_heap_to_the_top_of_ram_is_found_and_the_loader_goes_under_the_maple_list() {
+        let h = one_end(&skies_like());
+        // The start is what the size is computed from: `_end` rounded, before
+        // the 32 bytes sbInitSystem takes off both sides afterwards.
+        assert_eq!((h.start, h.end, h.end_at), (0x8c55_34c0, 0x8d00_0000, 0x8c01_5eb4));
+        assert_eq!(h.loader_base(), Some(0x8cff_0000));
+        // The literal keeps its segment bits (none): the end is `_end`'s.
+        assert_eq!(h.patch(0x8cfe_0000).unwrap(), Some((0x8c01_5eb4, 0x0cfe_0000)));
+        assert!(h.patch(0x8cf0_0000).is_err());
+        // 0x8cff0000 named by the title (its Maple DMA list): the next one down.
+        let free = |b: u32| b != 0x8cff_0000;
+        assert_eq!(katana_loader_base(&[h], 0x8cfd_0000, &free), Some(0x8cfe_0000));
+        assert_eq!(katana_loader_base(&[h], 0x8cfd_0000, &|_| false), None);
+    }
+
+    /// Tony Hawk's Pro Skater 2 PAL's sbInitSystem (1ST_READ.BIN, 0x8c062e10):
+    /// the same heap as Skies of Arcadia's, scheduled differently, with the
+    /// displacements and literals of the real program.
+    fn thps2_like() -> Vec<u8> {
+        let mut img = vec![0u8; 0x5_4000];
+        let code: [u16; 14] = [
+            0xd13b, 0x6512, 0xd43b, 0xd13c, 0x245b, 0x2519, 0xd13b, 0xe8e0, 0x251b, 0x2489, 0xd13a, 0x358c,
+            0x3548, 0x7420,
+        ];
+        for (k, op) in code.iter().enumerate() {
+            img[0x5_2e10 + 2 * k..0x5_2e12 + 2 * k].copy_from_slice(&op.to_le_bytes());
+        }
+        for (at, w) in [
+            (0x5_2f00, 0x8c05_3eb4u32),
+            (0x5_2f04, 0x8000_0000),
+            (0x5_2f08, 0xe000_0000),
+            (0x5_2f0c, 0x0d00_0000),
+            (0x5_2f10, 0x8c04_81c4),
+            (0x4_3eb4, 0x8c34_9580),
+        ] {
+            img[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn the_second_scheduling_of_a_heap_to_the_top_is_found_too() {
+        let h = one_end(&thps2_like());
+        assert_eq!((h.start, h.end, h.end_at), (0x8c34_9580, 0x8d00_0000, 0x8c06_2f0c));
+        assert_eq!(h.patch(0x8cfd_0000).unwrap(), Some((0x8c06_2f0c, 0x0cfd_0000)));
+        // It names 0x8cfe0000 and 0x8cff0000 (gdFs buffers) and 0x0cff0000.
+        let free = |b: u32| b < 0x8cfe_0000;
+        assert_eq!(katana_loader_base(&[h], 0x8ce0_0000, &free), Some(0x8cfd_0000));
+        // Without its `sub r4,r5` nothing says 0x0d000000 is an end.
+        let mut img = thps2_like();
+        img[0x5_2e28..0x5_2e2a].copy_from_slice(&0x0009u16.to_le_bytes());
+        assert_eq!(program_heaps(&img, 0x8c01_0000), vec![]);
+    }
+
+    #[test]
+    fn a_top_of_ram_end_loaded_from_outside_sbinitsystem_is_not_taken() {
+        let mut img = skies_like();
+        // mov.l @(disp,pc),r1 naming the same literal, in a function that
+        // returns (rts; nop) before the sequence.
+        img[0x5d00..0x5d02].copy_from_slice(&0xd16cu16.to_le_bytes());
+        img[0x5d02..0x5d04].copy_from_slice(&0x000bu16.to_le_bytes());
+        img[0x5d04..0x5d06].copy_from_slice(&0x0009u16.to_le_bytes());
+        assert_eq!(program_heaps(&img, 0x8c01_0000), vec![]);
+        // In sbInitSystem itself (0x8c015e54 already loads it again): taken.
+        assert_eq!(one_end(&skies_like()).end_at, 0x8c01_5eb4);
+    }
+
+    /// Unreal Tournament PAL's three heap set-ups (1ST_READ.BIN): sbInitSystem
+    /// (0x8c05b0e8), a function sizing the heap again from the same literal
+    /// pool (0x8c05b1a6), and another set-up with a pool of its own
+    /// (0x8c05b26a), with the opcodes and literals of the real program; each
+    /// function ends with rts here, as there.
+    fn ut_like() -> Vec<u8> {
+        let mut img = vec![0u8; 0x4_b400];
+        let put = |img: &mut Vec<u8>, at: usize, ops: &[u16]| {
+            for (k, op) in ops.iter().enumerate() {
+                img[at + 2 * k..at + 2 * k + 2].copy_from_slice(&op.to_le_bytes());
+            }
+        };
+        // jsr @r1 with `mov #-32,r8` in its delay slot: r8 outlives the call.
+        put(&mut img, 0x4_b0e4, &[0x410b, 0xe8e0]);
+        put(&mut img, 0x4_b0e8, &[
+            0xdb40, 0xd441, 0xd141, 0x65b2, 0x245b, 0x2519, 0xd140, 0x251b, 0x2489, 0xd140, 0x358c, 0x3548,
+            0x410b, 0x7420, 0x000b, 0x0009,
+        ]);
+        put(&mut img, 0x4_b1a6, &[
+            0xdc11, 0xd111, 0x62c2, 0xe3e0, 0x212b, 0x2139, 0xd323, 0x7120, 0x2312, 0xd30e, 0x2239, 0xd30e,
+            0x71e0, 0x223b, 0x72e0, 0xdc1f, 0x3218, 0xd11f, 0x4c0b, 0x2122, 0x000b, 0x0009,
+        ]);
+        put(&mut img, 0x4_b26a, &[
+            0xd10a, 0xd40a, 0x6512, 0x245b, 0xe1e0, 0x2419, 0xd109, 0x2519, 0xd109, 0x251b, 0xd109, 0x75e0,
+            0x3548, 0x410b, 0x7420, 0x6fe3, 0x4f26, 0x000b, 0x6ef6,
+        ]);
+        for (at, w) in [
+            (0x4_13acusize, 0x8c31_3740u32), // &_end's word (0x8c0513ac), read by all three
+            (0x4_b1ec, 0x8c05_13ac),
+            (0x4_b1f0, 0x8000_0000),
+            (0x4_b1f4, 0xe000_0000),
+            (0x4_b1f8, 0x0cfd_d000),
+            (0x4_b1fc, 0x8c01_63fc),
+            (0x4_b240, 0x8c2e_8400),
+            (0x4_b244, 0x8c1d_554c),
+            (0x4_b248, 0x8c2c_f010),
+            (0x4_b294, 0x8c05_13ac),
+            (0x4_b298, 0x8000_0000),
+            (0x4_b29c, 0xe000_0000),
+            (0x4_b2a0, 0x0cfd_d000),
+            (0x4_b2a4, 0x8c01_63fc),
+        ] {
+            img[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn a_heap_end_two_functions_share_is_lowered_with_the_third_ones() {
+        let found = program_heaps(&ut_like(), 0x8c01_0000);
+        let ats: Vec<u32> = found.iter().map(|h| h.end_at).collect();
+        assert_eq!(ats, vec![0x8c05_b1f8, 0x8c05_b2a0], "{found:x?}");
+        for h in &found {
+            assert_eq!((h.start, h.end), (0x8c31_3740, 0x8cfd_d000));
+        }
+        // The loader where the middle-of-RAM guess put it goes to the heaps'
+        // top, and both words come down to it.
+        assert_eq!(katana_loader_base(&found, 0x8c94_0000, &|_| true), Some(0x8cfc_0000));
+        for h in &found {
+            assert_eq!(h.patch(0x8cfc_0000).unwrap(), Some((h.end_at, 0x0cfc_0000)));
+        }
+    }
+
+    #[test]
+    fn a_shared_end_one_function_uses_otherwise_is_not_taken() {
+        let mut img = ut_like();
+        // The second function's `sub r1,r2` -> nop: it loads 0x0cfdd000 for
+        // something else, so the word it shares with sbInitSystem stays.
+        img[0x4_b1c6..0x4_b1c8].copy_from_slice(&0x0009u16.to_le_bytes());
+        let ats: Vec<u32> = program_heaps(&img, 0x8c01_0000).iter().map(|h| h.end_at).collect();
+        assert_eq!(ats, vec![0x8c05_b2a0]);
     }
 
     #[test]
@@ -514,7 +1013,7 @@ mod tests {
             file: "JET_PAL.BIN".into(),
             lba: 0x85fe1,
             size: 0x2f_0ae0,
-            heap: katana_heap(&jsr_like(), 0x8c01_0000).unwrap(),
+            heap: one_end(&jsr_like()),
         };
         let p = d.patch(0x8c7f_0000).unwrap().expect("patch");
         assert_eq!((p.lba, p.off), (0x85fe1 + 7, 0x7e8));
