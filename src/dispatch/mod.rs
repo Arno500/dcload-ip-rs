@@ -63,6 +63,7 @@ fn hex<'a>(bytes: impl IntoIterator<Item = &'a u8>) -> String {
 }
 
 mod cdda;
+mod ginsu;
 mod heap;
 mod image;
 mod patches;
@@ -72,8 +73,10 @@ mod session;
 mod swap;
 mod syscalls;
 mod transfer;
+mod vnic;
 
 pub use cdda::*;
+pub use ginsu::*;
 pub use heap::*;
 pub use image::*;
 pub use patches::*;
@@ -83,3 +86,4 @@ pub use session::*;
 use swap::DiscSwap;
 pub use syscalls::*;
 pub use transfer::*;
+pub use vnic::*;

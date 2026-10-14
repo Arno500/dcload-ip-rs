@@ -171,6 +171,48 @@ struct Args {
     #[arg(long)]
     no_gaps_guard: bool,
 
+    /// Do not let a network title use the Broadband Adapter.
+    ///
+    /// By default, a title that carries Sega's ETD Ethernet driver (Unreal
+    /// Tournament) gets the loader built for it (`dcload-resident-net.elf`),
+    /// its driver's entry points pointed at the loader, which shares the
+    /// adapter with it (`src/dispatch/vnic.rs`, loader AGENTS.md 4.21). Pass
+    /// this to give it no adapter instead, as before: its offline path.
+    #[arg(long)]
+    no_vnic: bool,
+
+    /// The network a network title is told it is on.
+    ///
+    /// Such a title uses the adapter only if the console's flash holds its
+    /// settings (written by DreamKey or a web browser). The network loader
+    /// lays them over the title's flash reads, writing nothing: the console's
+    /// own address, static, with this netmask, `--net-gateway` and `--net-dns`.
+    /// Each one not given comes from the DHCP lease the loader carries (taken
+    /// by the dcload the console booted), else 255.255.255.0, the subnet's .1
+    /// and the gateway.
+    #[arg(long, value_name = "A.B.C.D")]
+    net_mask: Option<std::net::Ipv4Addr>,
+
+    /// The gateway a network title is given (see `--net-mask`).
+    #[arg(long, value_name = "A.B.C.D")]
+    net_gateway: Option<std::net::Ipv4Addr>,
+
+    /// The DNS server a network title is given (see `--net-mask`).
+    #[arg(long, value_name = "A.B.C.D")]
+    net_dns: Option<std::net::Ipv4Addr>,
+
+    /// Let a network title read the console's flash as it is: without
+    /// adapter settings there, it offers only the modem.
+    #[arg(long)]
+    no_flash_isp: bool,
+
+    /// Never let a network title write the console's flash. By default the
+    /// loader lets one block through: PSO Ver.2's serial number and access
+    /// key, so they are not asked again next session. Every other write, and
+    /// every erase, goes nowhere.
+    #[arg(long)]
+    no_flash_keep: bool,
+
     /// Do not take the loader out of a title's "HLib" heap.
     ///
     /// By default, a title whose allocator (found by its literal pool) owns all
@@ -1042,7 +1084,13 @@ fn console_ip(host: &str) -> Option<[u8; 4]> {
 ///
 /// Anything that stops it -- no disc, a low base, a probe, no IPv4 address for
 /// the console, no file -- is the universal image, said in the log.
-fn choose_loader_image(args: &Args, loaders: &mut loaders::LoaderSet, has_disc: bool, base: u32) {
+fn choose_loader_image(
+    args: &Args,
+    loaders: &mut loaders::LoaderSet,
+    has_disc: bool,
+    base: u32,
+    net: bool,
+) {
     if args.loader_image == "universal" || args.no_relocate {
         return;
     }
@@ -1071,6 +1119,21 @@ fn choose_loader_image(args: &Args, loaders: &mut loaders::LoaderSet, has_disc: 
         return;
     };
     loaders.use_resident(base, ip, args.port);
+    if net && loaders.use_net() {
+        info!(
+            "loader image: resident with the title's network (no screen, no DHCP; it serves \
+             the title's Ethernet driver) at 0x{base:08x}"
+        );
+        return;
+    }
+    if net {
+        warn!(
+            "this title plays on the network, but there is no {} in {}: it gets the plain \
+             resident loader and will find no adapter -- run `make loaders` and deploy it",
+            loaders::RESIDENT_NET_NAME,
+            loaders.dir().display()
+        );
+    }
     info!("loader image: resident (no screen, no DHCP) at 0x{base:08x}");
 }
 
@@ -1084,19 +1147,62 @@ fn wanted_loader_base(
     running: Option<u32>,
     disc: Option<(&dyn disc_formats::types::DiscFormat, &str)>,
     katana: &[dispatch::DiscHeap],
+    decoded: Option<&dispatch::PsoLate>,
+    ginsu: Option<&dispatch::GinsuApp>,
 ) -> Option<u32> {
     let mut by_hlib = false;
     let want = wanted_loader_base_by_rules(args, running, disc, &mut by_hlib);
-    if by_hlib || katana.is_empty() || args.no_relocate || args.loader_base.is_some() {
+    let decoded_heaps = decoded.map_or(&[][..], |l| &l.heaps[..]);
+    if by_hlib || args.no_relocate || args.loader_base.is_some() {
+        return want;
+    }
+    // A GINSU BOOT (dispatch::ginsu): everything from the program it reads up
+    // to the top of RAM is Ginsu's until that program runs, whatever its heap
+    // says, so the loader goes right under it and the heaps end there.
+    if let Some(app) = ginsu {
+        let (at, xfer) = app.ginsu_reads();
+        // At the bottom of the program's heap, when its start can be moved
+        // above the loader (GinsuApp::heap_bottom); else under what Ginsu reads.
+        match app.heap_bottom() {
+            Ok((base, _)) => {
+                info!(
+                    "Ginsu reads {} to 0x{at:08x}: putting the loader at the bottom of its heap, \
+                     at 0x{base:08x}, the heap started above it",
+                    app.name
+                );
+                return Some(base);
+            }
+            Err(why) => info!("{}: the loader cannot go at the bottom of its heap: {why}", app.name),
+        }
+        let base = app.loader_base();
+        info!(
+            "Ginsu reads {} to 0x{at:08x} and GINXFER to 0x{xfer:08x}, and works from 0x{:08x}: \
+             putting the loader under them, at 0x{base:08x}",
+            app.name,
+            dispatch::GINSU_TOP
+        );
+        return Some(base);
+    }
+    if katana.is_empty() && decoded_heaps.is_empty() {
         return want;
     }
     let base = want.or(running)?;
-    let heaps: Vec<dispatch::KatanaHeap> = katana.iter().map(|d| d.heap).collect();
+    let heaps: Vec<dispatch::KatanaHeap> =
+        katana.iter().map(|d| d.heap).chain(decoded_heaps.iter().copied()).collect();
     // The rules below check a base against the constants of the program this
     // host uploads; the programs the disc serves are checked here, base by base
     // down from the heap's top (Skies of Arcadia's Maple DMA list is in its
-    // heap's last 64 KB).
+    // heap's last 64 KB) -- and the program PSO Ver.2 decodes, which no rule sees.
     let free = |top: u32| {
+        let hits = decoded.map(|l| l.literals_in_loader(top)).unwrap_or_default();
+        if let Some(&(first, _)) = hits.first() {
+            debug!(
+                "the decoded program loads {} constant(s) naming RAM a loader at 0x{top:08x} \
+                 would occupy (0x{first:08x} first); not putting it there",
+                hits.len()
+            );
+            return false;
+        }
         disc.is_some_and(|(d, _)| {
             katana.iter().all(|k| match k.literals_in_loader(d, top) {
                 Ok(hits) if hits.is_empty() => true,
@@ -1123,6 +1229,12 @@ fn wanted_loader_base(
                 .iter()
                 .filter(|d| d.heap.patch(top).is_ok_and(|p| p.is_some()))
                 .map(|d| d.file.as_str())
+                .chain(
+                    decoded_heaps
+                        .iter()
+                        .any(|h| h.patch(top).is_ok_and(|p| p.is_some()))
+                        .then_some("the decoded program"),
+                )
                 .collect();
             let at = |h: &&dispatch::KatanaHeap| h.loader_bases().any(|b| b == top);
             info!(
@@ -2270,6 +2382,59 @@ fn wince_place(args: &Args) -> wince::Place {
     if args.wince_loader_top { wince::Place::Top } else { wince::Place::Bottom }
 }
 
+/// Where the running loader serves a title's network driver (`_vnic_etd`,
+/// `_vnic_pso`: the patches' targets) and is told the driver's callback words
+/// (`g_vnic_slot`, vnic.c); `None` for a loader without it (any but the
+/// network image).
+fn vnic_symbols(args: &Args, base: u32) -> Option<VnicSymbols> {
+    let syms = running_loader_image(args, base).and_then(|(elf, _)| loaders::symbols(&elf)).ok()?;
+    let at = |n: &str| syms.get(n).map(|s| s.0);
+    Some(VnicSymbols {
+        etd: at("vnic_etd")?,
+        pso: at("vnic_pso")?,
+        slot: at("g_vnic_slot")?,
+        late: at("g_vnic_late")?,
+        late_entry: at("g_vnic_late_entry")?,
+        isp: at("g_vnic_isp"),
+        net_cfg: at("g_net_cfg"),
+        flash_keep: at("g_vnic_flash_keep"),
+    })
+}
+
+/// The five words of `g_vnic_isp` (vnic.c): address, netmask, gateway and two
+/// DNS servers, each the number a.b.c.d, as `our_ip` holds it. Each of the
+/// netmask, gateway and DNS server is what `given` says (the options), else
+/// what the DHCP lease said (`lease`, the loader's `g_net_cfg`, 0 = unknown),
+/// else 255.255.255.0, the subnet's .1 and the gateway.
+fn flash_isp_words(ip: [u8; 4], given: [Option<std::net::Ipv4Addr>; 3], lease: [u32; 3]) -> [u32; 5] {
+    let ip = u32::from_be_bytes(ip);
+    let pick = |i: usize, guess: u32| given[i].map(u32::from).or((lease[i] != 0).then_some(lease[i])).unwrap_or(guess);
+    let mask = pick(0, 0xffff_ff00);
+    let gateway = pick(1, (ip & mask) | 1);
+    [ip, mask, gateway, pick(2, gateway), 0]
+}
+
+/// The network image's ways in and the words the host tells it (vnic.c).
+struct VnicSymbols {
+    etd: u32,
+    pso: u32,
+    slot: u32,
+    /// `g_vnic_late`: the words to write into a program the title decodes.
+    late: u32,
+    /// `g_vnic_late_entry`: the word holding `_vnic_late`, what KATSUO.SEA's
+    /// literal is pointed at.
+    late_entry: u32,
+    /// `g_vnic_isp`: the adapter's settings the loader lays over the title's
+    /// flash reads. Absent from a network image that predates them.
+    isp: Option<u32>,
+    /// `g_net_cfg`: the DHCP lease's netmask, router and DNS server, carried
+    /// from the dcload that took it (adapter.h).
+    net_cfg: Option<u32>,
+    /// `g_vnic_flash_keep`: the one block ID whose writes reach the console's
+    /// flash. Absent from a network image that predates it.
+    flash_keep: Option<u32>,
+}
+
 fn ra_ce_room_symbols(args: &Args, base: u32) -> Option<(u32, u32)> {
     let syms = running_loader_image(args, base).and_then(|(elf, _)| loaders::symbols(&elf)).ok()?;
     Some((syms.get("g_ra_ce_room")?.0, syms.get("g_ra_ce_room_words")?.0))
@@ -3369,6 +3534,23 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         );
     }
 
+    // A GINSU BOOT (dispatch::ginsu): the 1ST_READ.BIN is Sega's boot loader
+    // and the title is the program GINSU.INI has it run. Read once: examined
+    // below as a boot binary is, and patched in the sectors served.
+    let ginsu_app: Option<dispatch::GinsuApp> = match disc_reader.as_deref() {
+        Some(d) if matches!(args.command, Commands::UExec { .. }) => dispatch::ginsu_app(d),
+        _ => None,
+    };
+    if let Some(a) = &ginsu_app {
+        info!(
+            "the boot binary is Ginsu's loader: the title is {} ({} bytes at LBA 0x{:08x}), \
+             examined here and patched as it is served",
+            a.name,
+            a.bytes.len(),
+            a.lba
+        );
+    }
+
     // Relocate BEFORE uploading the title. Any chainload replaces the whole
     // loader, so a title uploaded first would be uploaded into an image that is
     // about to be overwritten -- and the game's own RAM is zero-filled by the
@@ -3387,16 +3569,66 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut loaders = loaders::LoaderSet::discover(args.loader_dir.clone());
     // A resident image already running: its symbols come from its own file.
     dispatch::note_running_loader(&loaders, &reply_info);
+    // NETWORK TITLES (dispatch::vnic): one that carries Sega's ETD driver gets
+    // the loader that serves it, so it is decided here, before the loader is
+    // placed, from the disc's boot binary. Its driver is patched after upload.
+    let mut pso_late: Option<dispatch::PsoLate> = None;
+    let net_title = match disc_reader.as_deref() {
+        Some(d) if matches!(args.command, Commands::UExec { .. }) && !args.no_vnic => {
+            let in_boot = disc_formats::boot::extract(d, args.descramble.into(), args.wince_mode())
+                .ok()
+                .filter(|b| !b.wince)
+                .and_then(|b| dispatch::find_net_driver(&b.bytes, 0x8c01_0000))
+                .inspect(|d| info!("this title carries {}: it will share the adapter with the loader", d.name()))
+                .is_some();
+            let in_app = !in_boot
+                && ginsu_app
+                    .as_ref()
+                    .and_then(|a| {
+                        dispatch::find_net_driver(&a.bytes, dispatch::GINSU_APP_LOAD).map(|n| (a, n))
+                    })
+                    .inspect(|(a, n)| {
+                        info!("{} carries {}: it will share the adapter with the loader", a.name, n.name())
+                    })
+                    .is_some();
+            let in_boot = in_boot || in_app;
+            // Phantasy Star Online Ver.2: the program is decoded from three files
+            // by the title itself, so the driver is looked for in it here.
+            if !in_boot {
+                let files: Option<Vec<Vec<u8>>> = dispatch::PSO_V2_FILES
+                    .iter()
+                    .map(|n| {
+                        disc_formats::iso9660::find_in_root(d, d.boot_sector(), n)
+                            .and_then(|e| disc_formats::iso9660::read_file(d, &e).ok())
+                    })
+                    .collect();
+                pso_late = files.and_then(|f| dispatch::find_pso_v2(&f[0], &f[1], &f[2]));
+                if let Some(l) = &pso_late {
+                    info!(
+                        "this title decodes its program from {} and that program carries Phantasy \
+                         Star Online's Ethernet driver (its table at 0x{:08x}): it will share the \
+                         adapter with the loader",
+                        dispatch::PSO_V2_FILES.join(", "),
+                        l.net.pool
+                    );
+                }
+            }
+            in_boot || pso_late.is_some()
+        }
+        _ => false,
+    };
     if matches!(args.command, Commands::UExec { .. })
         && let Some(want) = wanted_loader_base(
             &args,
             running_base,
             disc_reader.as_deref().zip(redirect_disc.as_deref()),
             &katana_heaps,
+            pso_late.as_ref(),
+            ginsu_app.as_ref(),
         )
         .or(running_base)
     {
-        choose_loader_image(&args, &mut loaders, disc_reader.is_some(), want);
+        choose_loader_image(&args, &mut loaders, disc_reader.is_some(), want, net_title);
         match running_base {
             Some(base) => {
                 match dispatch::ensure_loader_base(&mut udpsender, &loaders, base, want) {
@@ -3617,8 +3849,11 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     && let Some(base) = running_base
                 {
                     let kos = dispatch::is_kos_binary(&payload);
+                    // Under a Ginsu boot the base is where Ginsu leaves room,
+                    // whatever the heaps say: they end there, however low.
+                    let deep = ginsu_app.is_some() && args.loader_base.is_none();
                     for h in dispatch::program_heaps(&payload, args.address).into_iter().filter(|_| !kos) {
-                        match h.patch(base) {
+                        match if deep { h.patch_deep(base) } else { h.patch(base) } {
                             Ok(Some(p)) => {
                                 info!(
                                     "heap 0x{:08x}..0x{:08x} of the uploaded program: its end \
@@ -3641,8 +3876,33 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             ),
                         }
                     }
-                    for d in &katana_heaps {
-                        match d.patch(base) {
+                    // The program a Ginsu boot runs, with the loader at the
+                    // bottom of its heap (GinsuApp::heap_bottom): the heap
+                    // starts above the loader instead of ending under it.
+                    let bottom = ginsu_app
+                        .as_ref()
+                        .filter(|_| deep)
+                        .and_then(|a| a.heap_bottom().ok().map(|b| (a, b)))
+                        .filter(|(_, (b, _))| *b == base);
+                    if let Some((app, (_, raise))) = &bottom {
+                        info!(
+                            "heap of {} on the disc: its start raised above the loader, \
+                             {} word(s) in the sectors served: {}",
+                            app.name,
+                            raise.len(),
+                            raise
+                                .iter()
+                                .map(|p| format!("LBA 0x{:08x} +0x{:03x} 0x{:08x}->0x{:08x}", p.lba, p.off, p.was, p.value))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        disc_patches.extend(raise.iter().cloned());
+                    }
+                    for d in katana_heaps
+                        .iter()
+                        .filter(|d| !bottom.as_ref().is_some_and(|(a, _)| a.name.eq_ignore_ascii_case(&d.file)))
+                    {
+                        match d.patch_at(base, deep) {
                             Ok(Some(p)) => {
                                 info!(
                                     "heap 0x{:08x}..0x{:08x} of {} on the disc: its end lowered \
@@ -3702,13 +3962,352 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // disc. `receive_syscalls` watches every read for one landing
                 // on them and puts them back, so the guard survives a reload
                 // instead of being undone by one.
+                //
+                // ONLY FOR A TITLE THE LOADER STAYS UNDER: one served a disc
+                // image. A bare program owns the console -- a new dcload above
+                // all, whose own adapter bring-up this would patch out (it
+                // then sat at "idle..." with the NIC off, 2026-10-11) -- and a
+                // homebrew that drives the BBA does so on purpose.
+                //
+                // NETWORK TITLES (dispatch::vnic): the title's ETD driver is
+                // pointed at the loader, which shares the adapter with it, and
+                // the GAPS guard is then left out -- the title must find the
+                // adapter. Only with the network loader running: any other one
+                // has no `_vnic_etd`, and the title keeps its offline path.
+                let mut vnic_guard: Vec<(u32, u32)> = vec![];
+                if !args.no_vnic
+                    && redirect_disc.is_some()
+                    && let Some(driver) = dispatch::find_net_driver(&payload, args.address)
+                {
+                    match running_base.and_then(|b| vnic_symbols(&args, b)) {
+                        Some(s) => {
+                            let stubs = dispatch::net_driver_patches(&payload, args.address, &driver, s.etd, s.pso);
+                            let told: Vec<(u32, u32)> =
+                                driver.slots().iter().enumerate().map(|(i, &w)| (s.slot + 4 * i as u32, w)).collect();
+                            info!(
+                                "this title's Ethernet driver ({}) now runs on the loader's adapter: \
+                                 {} word(s) of the title pointed at the loader",
+                                driver.name(),
+                                stubs.len()
+                            );
+                            match dispatch::apply_patches(&mut udpsender, &told)
+                                .and_then(|_| dispatch::apply_patches(&mut udpsender, &stubs))
+                            {
+                                Ok(()) => vnic_guard = stubs,
+                                Err(e) => warn!("could not point the title's Ethernet driver at the loader: {e}"),
+                            }
+                        }
+                        None => warn!(
+                            "this title carries {}, but the running loader cannot serve it (not {}, \
+                             or one that predates it); it will find no adapter",
+                            driver.name(),
+                            loaders::RESIDENT_NET_NAME
+                        ),
+                    }
+                }
+                // A GINSU BOOT: the same, in the program it runs, changed in
+                // the sectors served (dispatch::ginsu). Kept apart until the
+                // heap's verdict on the loader is taken, below.
+                let mut app_patches: Vec<dispatch::DiscPatch> = vec![];
+                let mut vnic_on_disc = false;
+                if let Some(app) = ginsu_app.as_ref().filter(|_| !args.no_vnic && redirect_disc.is_some())
+                    && let Some(driver) = dispatch::find_net_driver(&app.bytes, dispatch::GINSU_APP_LOAD)
+                {
+                    match running_base.and_then(|b| vnic_symbols(&args, b)) {
+                        Some(s) => {
+                            let stubs = dispatch::net_driver_patches(
+                                &app.bytes,
+                                dispatch::GINSU_APP_LOAD,
+                                &driver,
+                                s.etd,
+                                s.pso,
+                            );
+                            let told: Vec<(u32, u32)> =
+                                driver.slots().iter().enumerate().map(|(i, &w)| (s.slot + 4 * i as u32, w)).collect();
+                            match app.disc_patches(&stubs) {
+                                Ok(p) => match dispatch::apply_patches(&mut udpsender, &told) {
+                                    Ok(()) => {
+                                        info!(
+                                            "{}'s Ethernet driver ({}) will run on the loader's adapter: \
+                                             {} word(s) pointed at the loader as it is served",
+                                            app.name,
+                                            driver.name(),
+                                            p.len()
+                                        );
+                                        app_patches.extend(p);
+                                        vnic_on_disc = true;
+                                    }
+                                    Err(e) => warn!("could not tell the loader {}'s driver: {e}", app.name),
+                                },
+                                Err((at, _)) => warn!(
+                                    "{}'s driver: the word at 0x{at:08x} is not in the file; its driver \
+                                     keeps the chip",
+                                    app.name
+                                ),
+                            }
+                        }
+                        None => warn!(
+                            "{} carries {}, but the running loader cannot serve it (not {}, or one that \
+                             predates it); it will find no adapter",
+                            app.name,
+                            driver.name(),
+                            loaders::RESIDENT_NET_NAME
+                        ),
+                    }
+                }
+                if let Some(app) = ginsu_app.as_ref().filter(|_| !args.no_gaps_guard && redirect_disc.is_some()) {
+                    // As for a boot binary: a network title keeps its probe and
+                    // loses its switch-off; any other one finds no adapter.
+                    let words = if vnic_on_disc {
+                        dispatch::gaps_power_down_patches(&app.bytes, dispatch::GINSU_APP_LOAD)
+                    } else {
+                        dispatch::gaps_probe_patches(&app.bytes, dispatch::GINSU_APP_LOAD)
+                    };
+                    match app.disc_patches(&words) {
+                        Ok(p) => {
+                            if !p.is_empty() {
+                                info!(
+                                    "{}: {} word(s) of its expansion-port code changed as it is served, \
+                                     so it cannot switch the adapter off",
+                                    app.name,
+                                    p.len()
+                                );
+                            }
+                            app_patches.extend(p);
+                        }
+                        Err((at, _)) => warn!(
+                            "{}: the GAPS word at 0x{at:08x} is not in the file; it may switch the adapter off",
+                            app.name
+                        ),
+                    }
+                }
+                // PSO Ver.2 (dispatch::PsoLate): its program does not exist
+                // before KATSUO.SEA decodes it, so the loader is told the words
+                // to write then, and KATSUO's jump literal is pointed at the
+                // loader as it is served (a guard word, below).
+                let mut katsuo_guard: Option<dispatch::GuardWord> = None;
+                // The flash block whose writes the loader lets through: PSO
+                // Ver.2's serial number and access key, once its entry screen
+                // is patched.
+                let mut flash_keep: Option<u32> = None;
+                if let Some(late) = pso_late.as_ref() {
+                    match running_base.and_then(|b| vnic_symbols(&args, b).map(|s| (b, s))) {
+                        Some((base, s)) => {
+                            // Its heap runs to the top of RAM: the placement put
+                            // the loader at its top, and its end, a word of the
+                            // decoded program, is lowered with the driver's.
+                            let lowered: Vec<(u32, u32)> = late
+                                .heaps
+                                .iter()
+                                .filter_map(|h| match h.patch(base) {
+                                    Ok(Some(p)) => {
+                                        info!(
+                                            "heap 0x{:08x}..0x{:08x} of the decoded program: its end \
+                                             (the word at 0x{:08x}) lowered to 0x{:08x} as it is entered",
+                                            h.start, h.end, p.0, p.1
+                                        );
+                                        Some(p)
+                                    }
+                                    Ok(None) => None,
+                                    Err(why) => {
+                                        warn!(
+                                            "heap 0x{:08x}..0x{:08x} of the decoded program: the loader \
+                                             at 0x{base:08x} cannot be taken out of it: {why}. Expect \
+                                             the heap to overwrite it.",
+                                            h.start, h.end
+                                        );
+                                        None
+                                    }
+                                })
+                                .collect();
+                            // Its expansion probe would switch the adapter off
+                            // as it starts: one word, before the heap's.
+                            let gaps_off: Vec<(u32, u32)> = match late.gaps_off {
+                                Some((lit, stub)) => {
+                                    info!(
+                                        "the decoded program's expansion probe switches off the slot it \
+                                         finds; its G2 write (the literal at 0x{lit:08x}) will be pointed \
+                                         at an `rts ; mov #0,r0` (0x{stub:08x}) as it is entered, so it \
+                                         sees the adapter and leaves it on"
+                                    );
+                                    vec![(lit, stub)]
+                                }
+                                None => {
+                                    warn!(
+                                        "the decoded program's expansion probe was not recognised; if it \
+                                         switches the adapter off, the loader goes deaf as it starts"
+                                    );
+                                    vec![]
+                                }
+                            };
+                            // Its serial-number entry screen: the checks are
+                            // answered "valid", whatever is typed.
+                            if late.serial_checks.is_empty() {
+                                warn!(
+                                    "the decoded program's serial-number checks were not recognised; \
+                                     the entry screen keeps refusing numbers Sega did not issue"
+                                );
+                            } else {
+                                flash_keep = Some(dispatch::PSO_V2_SERIAL_BLOCK);
+                                info!(
+                                    "the decoded program's {} serial-number check(s) (PRIME.PRS) will \
+                                     accept whatever is typed: {}",
+                                    late.serial_checks.len(),
+                                    late.serial_checks
+                                        .iter()
+                                        .map(|(a, v)| format!("0x{a:08x}=0x{v:08x}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                            }
+                            let first: Vec<(u32, u32)> =
+                                gaps_off.iter().chain(&late.serial_checks).copied().collect();
+                            let more: Vec<(u32, u32)> = first.iter().chain(&lowered).copied().collect();
+                            // The driver's words, the probe's and the serial
+                            // checks always fit (9 of 10).
+                            let words = dispatch::pso_v2_late_words(late, s.pso, &more)
+                                .or_else(|e| {
+                                    warn!("the decoded program's heap ends are left as they are: {e}");
+                                    dispatch::pso_v2_late_words(late, s.pso, &first)
+                                });
+                            let pairs = words.as_ref().map_or(0, |w| w[0]);
+                            let told: Result<Vec<(u32, u32)>, String> = words.map(|words| {
+                                late.net
+                                    .slots
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &w)| (s.slot + 4 * i as u32, w))
+                                    .chain(words.iter().enumerate().map(|(i, &w)| (s.late + 4 * i as u32, w)))
+                                    .collect()
+                            });
+                            match told.and_then(|t| {
+                                dispatch::apply_patches(&mut udpsender, &t).map_err(|e| e.to_string())
+                            }) {
+                                Ok(()) => {
+                                    info!(
+                                        "Phantasy Star Online's driver will be pointed at the loader \
+                                         when KATSUO.SEA enters the decoded program ({} pair(s) to \
+                                         write; its literal at 0x{:08x} -> 0x{:08x})",
+                                        pairs,
+                                        late.katsuo_at,
+                                        s.late_entry
+                                    );
+                                    katsuo_guard = Some(dispatch::GuardWord {
+                                        at: late.katsuo_at,
+                                        value: s.late_entry,
+                                        was: Some(late.entry_word),
+                                    });
+                                }
+                                Err(e) => warn!(
+                                    "could not tell the loader Phantasy Star Online's words ({e}); its \
+                                     driver will run on the chip and the loader will go deaf when it starts"
+                                ),
+                            }
+                        }
+                        None => warn!(
+                            "this title's decoded program carries Phantasy Star Online's Ethernet driver, \
+                             but the running loader cannot serve it (not {}, or one that predates it); it \
+                             will find no adapter",
+                            loaders::RESIDENT_NET_NAME
+                        ),
+                    }
+                }
+                // The adapter's settings in flash (vnic.c, "THE NETWORK
+                // SETTINGS IN FLASH"): without them Unreal Tournament offers
+                // only the modem. Laid over its reads by the loader; the
+                // console's flash is never written.
+                if (!vnic_guard.is_empty() || katsuo_guard.is_some() || vnic_on_disc) && !args.no_flash_isp {
+                    let syms = running_base.and_then(|b| vnic_symbols(&args, b));
+                    match (syms.as_ref().and_then(|s| s.isp), console_ip(&args.host)) {
+                        (Some(at), Some(ip)) => {
+                            // The lease the loader carries, if the dcload that
+                            // took it knew to hand it on.
+                            let lease = syms
+                                .as_ref()
+                                .and_then(|s| s.net_cfg)
+                                .and_then(|a| {
+                                    dispatch::receive_data(
+                                        &mut udpsender,
+                                        Some(std::time::Duration::from_millis(500)),
+                                        a & 0x1fff_ffff,
+                                        12,
+                                        true,
+                                    )
+                                    .ok()
+                                })
+                                .filter(|b| b.len() == 12)
+                                .map_or([0; 3], |b| {
+                                    [0, 4, 8].map(|i| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]))
+                                });
+                            if lease == [0; 3] {
+                                debug!(
+                                    "no DHCP lease carried by the loader (a static address, or a CD dcload \
+                                     that predates it): the title's netmask, gateway and DNS are guessed \
+                                     unless given"
+                                );
+                            }
+                            let w = flash_isp_words(ip, [args.net_mask, args.net_gateway, args.net_dns], lease);
+                            let told: Vec<(u32, u32)> =
+                                w.iter().enumerate().map(|(i, &v)| (at + 4 * i as u32, v)).collect();
+                            match dispatch::apply_patches(&mut udpsender, &told) {
+                                Ok(()) => info!(
+                                    "the title will read adapter settings from flash: {} static, netmask \
+                                     {}, gateway {}, DNS {} (laid over its reads, never written to the flash)",
+                                    std::net::Ipv4Addr::from(w[0]),
+                                    std::net::Ipv4Addr::from(w[1]),
+                                    std::net::Ipv4Addr::from(w[2]),
+                                    std::net::Ipv4Addr::from(w[3])
+                                ),
+                                Err(e) => warn!("could not give the loader the adapter's settings: {e}"),
+                            }
+                            match (flash_keep, syms.as_ref().and_then(|s| s.flash_keep)) {
+                                _ if args.no_flash_keep => {}
+                                (Some(id), Some(at)) => match dispatch::apply_patches(&mut udpsender, &[(at, id)]) {
+                                    Ok(()) => info!(
+                                        "the serial number and access key typed will be saved in the \
+                                         console's flash (block {id} of partition 2, the only block \
+                                         written; --no-flash-keep to keep the flash untouched)"
+                                    ),
+                                    Err(e) => warn!("could not tell the loader to keep flash block {id}: {e}"),
+                                },
+                                (Some(_), None) => warn!(
+                                    "the running loader cannot save the serial number in flash (it \
+                                     predates it): it will be asked every session"
+                                ),
+                                (None, _) => {}
+                            }
+                        }
+                        (None, _) => warn!(
+                            "the running loader cannot lay adapter settings over the title's flash \
+                             reads (it predates them): unless the flash holds some, it will offer \
+                             only the modem"
+                        ),
+                        (_, None) => warn!(
+                            "cannot resolve {} to an IPv4 address for the title's adapter settings",
+                            args.host
+                        ),
+                    }
+                }
                 let mut gaps_guard: Vec<(u32, u32)> = vec![];
-                if !args.no_gaps_guard {
+                if !args.no_gaps_guard && redirect_disc.is_none() {
+                    debug!("no disc image served: the GAPS guard is left off, the program owns the adapter");
+                } else if !args.no_gaps_guard && vnic_guard.is_empty() && katsuo_guard.is_none() {
                     gaps_guard = dispatch::gaps_probe_patches(&payload, args.address);
                     if !gaps_guard.is_empty()
                         && let Err(e) = dispatch::apply_patches(&mut udpsender, &gaps_guard)
                     {
                         warn!("could not neutralise the GAPS probe: {e}");
+                    }
+                } else if !args.no_gaps_guard {
+                    // A network title must find the adapter, so its probe
+                    // stays; only the switch-off that follows it goes. Left
+                    // in, Unreal Tournament powered the bridge down before
+                    // its first disc read (2026-10-12).
+                    gaps_guard = dispatch::gaps_power_down_patches(&payload, args.address);
+                    if !gaps_guard.is_empty()
+                        && let Err(e) = dispatch::apply_patches(&mut udpsender, &gaps_guard)
+                    {
+                        warn!("could not keep the title from switching the adapter off: {e}");
                     }
                 }
                 if !heap_guard.is_empty()
@@ -3843,9 +4442,11 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // The heap now starts right above the loader: reads landing
                 // there are the title's allocator at work, not a near miss.
                 let loader_out_of_heap = !heap_guard.is_empty() || !disc_patches.is_empty();
-                let guards = dispatch::guard_words(
+                disc_patches.extend(app_patches);
+                let mut guards = dispatch::guard_words(
                     &[
                         gaps_guard,
+                        vnic_guard,
                         heap_guard,
                         vga_guard,
                         ppf_guard,
@@ -3857,6 +4458,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     &as_on_disc,
                     args.address,
                 );
+                // Not in the upload: KATSUO.SEA is read later, by the title.
+                guards.extend(katsuo_guard);
                 // Last, so a patch always wins over the bytes it replaces --
                 // whether they came from the title, from IP.BIN, or from both.
                 if !args.patch.is_empty()
@@ -4090,6 +4693,33 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_network_title_is_given_the_options_then_the_lease_then_a_guess() {
+        use std::net::Ipv4Addr;
+        // Nothing known: a /24, its .1 as gateway and DNS server.
+        assert_eq!(
+            flash_isp_words([192, 168, 1, 64], [None; 3], [0; 3]),
+            [0xc0a8_0140, 0xffff_ff00, 0xc0a8_0101, 0xc0a8_0101, 0]
+        );
+        // The lease the loader carries.
+        let lease = [0xffff_0000, 0xc0a8_00fe, 0x0808_0808];
+        assert_eq!(
+            flash_isp_words([192, 168, 1, 64], [None; 3], lease),
+            [0xc0a8_0140, 0xffff_0000, 0xc0a8_00fe, 0x0808_0808, 0]
+        );
+        // An option wins over the lease; what it leaves out still comes from it.
+        let given = [Some(Ipv4Addr::new(255, 0, 0, 0)), None, Some(Ipv4Addr::new(9, 9, 9, 9))];
+        assert_eq!(
+            flash_isp_words([10, 0, 0, 7], given, lease),
+            [0x0a00_0007, 0xff00_0000, 0xc0a8_00fe, 0x0909_0909, 0]
+        );
+        // A guessed gateway follows the netmask it is derived from.
+        assert_eq!(
+            flash_isp_words([10, 0, 0, 7], [Some(Ipv4Addr::new(255, 0, 0, 0)), None, None], [0; 3]),
+            [0x0a00_0007, 0xff00_0000, 0x0a00_0001, 0x0a00_0001, 0]
+        );
+    }
 
     /// The default output name comes out of the IMAGE, and nothing in an image
     /// stops those sixteen bytes reading `../../.bashrc`. `extract` would then

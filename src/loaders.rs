@@ -258,6 +258,11 @@ pub const RELOCATABLE_NAME: &str = "dcload-relocatable.elf";
 /// AGENTS.md 4.18): what runs under a title. The hops stay the universal image.
 pub const RESIDENT_NAME: &str = "dcload-resident.elf";
 
+/// The resident image for a title that plays on the network: the same, Katana
+/// only, plus the title's ETD driver served by the loader (`dispatch::vnic`,
+/// loader AGENTS.md 4.21). Served only to a title whose driver was recognised.
+pub const RESIDENT_NET_NAME: &str = "dcload-resident-net.elf";
+
 /// Where a relocated loader may be put, and the step between candidates.
 ///
 /// The floor is `ISOLDR_DEFAULT_ADDR`, which is DreamShell's own answer to
@@ -1125,6 +1130,8 @@ pub struct LoaderSet {
     /// What the resident image is told before upload: the console's address and
     /// the port its syscalls answer on (`variants::patch_resident`).
     resident: Option<([u8; 4], u16)>,
+    /// The resident image served is the network one (`RESIDENT_NET_NAME`).
+    net: bool,
 }
 
 impl LoaderSet {
@@ -1135,6 +1142,7 @@ impl LoaderSet {
             explicit: true,
             resident_at: None,
             resident: None,
+            net: false,
         }
     }
 
@@ -1169,6 +1177,7 @@ impl LoaderSet {
             explicit: named,
             resident_at: None,
             resident: None,
+            net: false,
         }
     }
 
@@ -1185,9 +1194,21 @@ impl LoaderSet {
         self.resident_at == Some(base) && self.has_resident()
     }
 
-    /// The resident image, if `make loaders` built it.
+    /// Serve the network resident image instead of the plain one, if it was
+    /// built. False when it was not: the title then gets the plain one.
+    pub fn use_net(&mut self) -> bool {
+        self.net = self.resident_path_for(true).is_some();
+        self.net
+    }
+
+    /// The resident image served, if `make loaders` built it.
     pub fn resident_path(&self) -> Option<PathBuf> {
-        let p = self.dir.join(RESIDENT_NAME);
+        self.resident_path_for(self.net)
+    }
+
+    /// The plain or the network resident image, if `make loaders` built it.
+    pub fn resident_path_for(&self, net: bool) -> Option<PathBuf> {
+        let p = self.dir.join(if net { RESIDENT_NET_NAME } else { RESIDENT_NAME });
         p.is_file().then_some(p)
     }
 

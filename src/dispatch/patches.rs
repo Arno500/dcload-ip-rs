@@ -71,6 +71,10 @@ const GAPS_CORROBORATION_SPAN: usize = 4096;
 /// probe fail, which is the empty-port path every title supports. The constant
 /// only counts when a slot-window literal sits near it.
 pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
+    if is_dcload_image(buf) {
+        debug!("the program is a dcload: its own adapter code is left alone");
+        return vec![];
+    }
     let spans = payload_spans(buf, address);
 
     let mut out = vec![];
@@ -95,6 +99,20 @@ pub fn gaps_probe_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
     }
     out.extend(gaps_control_patches(buf, address));
     out
+}
+
+/// Whether `buf` is a dcload (any build, resident or not): the start of its
+/// VERS reply, `"dcload-ip <version> using "`, is in every one. Uploading a
+/// new loader with a GAPS guard on it patched out its own adapter bring-up
+/// (2026-10-11): it stayed at "idle..." with the NIC never enabled.
+pub fn is_dcload_image(buf: &[u8]) -> bool {
+    const TAG: &[u8] = b"dcload-ip ";
+    buf.windows(TAG.len()).enumerate().any(|(i, w)| {
+        w == TAG && buf.get(i + TAG.len()..i + TAG.len() + 16).is_some_and(|rest| {
+            rest.iter().take_while(|&&c| c.is_ascii_digit() || c == b'.').count() >= 3
+                && rest.windows(7).any(|x| x == b" using ")
+        })
+    })
 }
 
 /// The GAPS bridge's control register, without its segment.
@@ -149,6 +167,173 @@ fn gaps_control_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
              so it finds no adapter and cannot reset it",
             out.len()
         );
+    }
+    out
+}
+
+/// The Katana library's key for a slot's control register, before the slot's
+/// window is folded in: `(base & 0xff00) << 8 | 0x5a00a500`, which is
+/// `0x5a14a500` for the BBA's window at `0xa1001400`.
+const GAPS_KEY_BASE: u32 = 0x5a00_a500;
+/// How far before the key's load the switch-off function may start.
+const GAPS_OFF_ENTRY_SPAN: usize = 48;
+/// How much of each switch-off function is read for its register offset.
+const GAPS_OFF_BODY: usize = 0x60;
+/// `add #24,r5` and `add #20,r5`: the slot base plus the control register's
+/// offset (0x18), or the interrupt enable's (0x14), as the write's address.
+const ADD_0X18_R5: u16 = 0x7518;
+const ADD_0X14_R5: u16 = 0x7514;
+/// `sts.l pr,@-r15`, the first instruction of both functions.
+const STS_PR: u16 = 0x4f22;
+
+/// Where a `bsr` at offset `at` lands, if `op` is one.
+fn bsr_target(op: u16, at: usize) -> Option<usize> {
+    let disp = (((op & 0xfff) as i32) << 20) >> 20;
+    (op & 0xf000 == 0xb000).then(|| (at as i64 + 4 + 2 * disp as i64) as usize)
+}
+
+/// The Katana library's two switch-off functions in `data` (offsets): the
+/// control register's (loads `GAPS_KEY_BASE`, adds 0x18), and the interrupt
+/// enable's (adds 0x14, called just before the other). Both empty if the
+/// probe is not there.
+fn gaps_off_functions(data: &[u8]) -> (HashSet<usize>, HashSet<usize>) {
+    let ops = || (0..data.len().saturating_sub(1)).step_by(2);
+    let body_has = |f: usize, op: u16| {
+        (f..(f + GAPS_OFF_BODY).min(data.len().saturating_sub(1)))
+            .step_by(2)
+            .any(|i| le16(data, i) == op)
+    };
+    let keys: HashSet<usize> = words(data).filter(|&(_, w)| w == GAPS_KEY_BASE).map(|(i, _)| i).collect();
+    if keys.is_empty() {
+        return Default::default();
+    }
+    let ctrl_off: HashSet<usize> = ops()
+        .filter(|&i| pc_load(le16(data, i), i).is_some_and(|(_, t)| keys.contains(&t)))
+        .filter_map(|i| {
+            (0..=GAPS_OFF_ENTRY_SPAN)
+                .step_by(2)
+                .filter_map(|back| i.checked_sub(back))
+                .find(|&f| le16(data, f) == STS_PR)
+        })
+        .filter(|&f| body_has(f, ADD_0X18_R5))
+        .collect();
+    let calls_to = |targets: &HashSet<usize>| -> Vec<usize> {
+        ops().filter(|&i| bsr_target(le16(data, i), i).is_some_and(|t| targets.contains(&t))).collect()
+    };
+    let irq_off: HashSet<usize> = calls_to(&ctrl_off)
+        .iter()
+        .filter_map(|&c| {
+            (2..=8)
+                .step_by(2)
+                .filter_map(|back| c.checked_sub(back))
+                .find_map(|j| bsr_target(le16(data, j), j))
+        })
+        .filter(|&t| t < data.len() && le16(data, t) == STS_PR && body_has(t, ADD_0X14_R5))
+        .collect();
+    (ctrl_off, irq_off)
+}
+
+/// `rts ; mov #0,r0`: a function that returns 0.
+const RTS_RETURN_0: [u16; 2] = [0x000b, 0xe000];
+
+/// The same switch-off made harmless with ONE word, for a program the loader
+/// patches itself and that has room for few (PSO Ver.2's decoded program,
+/// `dispatch::PsoLate`, 2026-10-13: its probe at 0x8c37a37e has the twelve
+/// calls of its bootstrap's, and the loader holds eight words).
+///
+/// Both functions call the G2 write through one literal of their pool
+/// (`mov.l @(disp,PC),rN ; ... ; jsr @rN`) and return success when it returns
+/// 0. That literal, if nothing else in the program loads it, is pointed at an
+/// `rts ; mov #0,r0` of the program's own: the slot is recorded, nothing is
+/// written to it. `None` if the program does not look exactly like that.
+pub fn gaps_power_down_redirect(buf: &[u8], address: u32) -> Option<(u32, u32)> {
+    let base = address & 0x1fff_ffff;
+    let data = buf;
+    let (ctrl_off, irq_off) = gaps_off_functions(data);
+    let funcs: Vec<usize> = ctrl_off.union(&irq_off).copied().collect();
+    if ctrl_off.len() != 1 || irq_off.len() != 1 {
+        return None;
+    }
+    // The literal each function jumps through: the pc-relative load into the
+    // register its first `jsr` names.
+    let jsr_literal = |f: usize| -> Option<usize> {
+        let end = (f + GAPS_OFF_BODY).min(data.len().saturating_sub(1));
+        let jsr = (f..end).step_by(2).find(|&i| le16(data, i) & 0xf0ff == 0x400b)?;
+        let reg = (le16(data, jsr) >> 8) & 0xf;
+        (f..jsr).step_by(2).rev().find_map(|i| pc_load(le16(data, i), i).filter(|&(r, _)| r == reg).map(|(_, t)| t))
+    };
+    let lits: HashSet<usize> = funcs.iter().map(|&f| jsr_literal(f)).collect::<Option<_>>()?;
+    let [lit] = lits.into_iter().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let users = (0..data.len().saturating_sub(1))
+        .step_by(2)
+        .filter(|&i| pc_load(le16(data, i), i).is_some_and(|(_, t)| t == lit))
+        .count();
+    if users != funcs.len() {
+        return None;
+    }
+    let stub = (0..data.len().saturating_sub(3))
+        .step_by(2)
+        .find(|&i| le16(data, i) == RTS_RETURN_0[0] && le16(data, i + 2) == RTS_RETURN_0[1])?;
+    Some((p1(base) + lit as u32, p1(base) + stub as u32))
+}
+
+/// Let a network title find the Broadband Adapter without switching it off
+/// (2026-10-12).
+///
+/// WHY. The Katana library's expansion probe (Unreal Tournament PAL
+/// 0x8c020338, Phantasy Star Online v2.011 0x8c31d5xx, PSO Ver.2's bootstrap
+/// 0x8c01d1xx) looks for `"GAPS"` in the G2 slot windows and, for every slot
+/// that answers, records it and powers it down: 0 to base+0x14, then the key
+/// `0x5a14a500` to base+0x18 -- Sonic Adventure 2's switch-off (loader
+/// AGENTS.md 4.12). Its shutdown does it again for every slot it recorded.
+/// `gaps_probe_patches` makes the probe fail, which is right for a title kept
+/// offline; a title whose driver runs on the loader (`dispatch::vnic`) must see
+/// the slot, or it reports no adapter. Left intact, the probe switched the
+/// adapter off under Unreal Tournament on the console before its first disc
+/// read, and the title went back to the BIOS menu when `gdFsInit` failed.
+///
+/// HOW. The control-register function loads `GAPS_KEY_BASE` and adds 0x18 to
+/// its base; the other is the `bsr` just before each call to it, and adds
+/// 0x14. Every `bsr` to either becomes a `nop`: its delay slot (the base into
+/// r4) then runs as a plain instruction, and the probe records the slot.
+pub fn gaps_power_down_patches(buf: &[u8], address: u32) -> Vec<(u32, u32)> {
+    if is_dcload_image(buf) {
+        return vec![];
+    }
+    let mut out = vec![];
+    for (base, data) in payload_spans(buf, address) {
+        let ops = || (0..data.len().saturating_sub(1)).step_by(2);
+        let (ctrl_off, irq_off) = gaps_off_functions(data);
+        if ctrl_off.is_empty() {
+            continue;
+        }
+        let calls_to = |targets: &HashSet<usize>| -> Vec<usize> {
+            ops().filter(|&i| bsr_target(le16(data, i), i).is_some_and(|t| targets.contains(&t))).collect()
+        };
+        let calls: Vec<usize> = calls_to(&ctrl_off.union(&irq_off).copied().collect());
+        // One word per aligned pair of instructions: two calls may share it.
+        let mut by_word: Vec<(usize, u32)> = vec![];
+        for &c in &calls {
+            let a = c & !3;
+            let shift = if c & 2 != 0 { 16 } else { 0 };
+            let nop = |w: u32| (w & !(0xffff << shift)) | (0x0009 << shift);
+            match by_word.iter_mut().find(|(w, _)| *w == a) {
+                Some((_, v)) => *v = nop(*v),
+                None if a + 4 <= data.len() => by_word.push((a, nop(le32(data, a)))),
+                None => {}
+            }
+        }
+        if let Some(&f) = ctrl_off.iter().min() {
+            info!(
+                "this title's expansion probe switches off the slot it finds (at 0x{:08x}); \
+                 {} call(s) to its two switch-off functions removed, so it sees the adapter and leaves it on",
+                p1(base) + f as u32,
+                calls.len()
+            );
+        }
+        out.extend(by_word.into_iter().map(|(a, w)| (p1(base) + a as u32, w)));
     }
     out
 }
@@ -684,6 +869,104 @@ mod tests {
                 (0x8c1c_5f60, 0xac1c_5ac0),
             ]
         );
+    }
+
+    #[test]
+    fn a_dcload_is_never_patched() {
+        let mut img = ut_bba_like();
+        img[0x100..0x100 + 22].copy_from_slice(b"dcload-ip 2.0.4 using ");
+        assert!(is_dcload_image(&img));
+        assert_eq!(gaps_probe_patches(&img, 0x0c01_0000), vec![]);
+        // The name alone, in a title's strings, is not a loader.
+        let mut img = ut_bba_like();
+        img[0x100..0x100 + 10].copy_from_slice(b"dcload-ip ");
+        assert!(!is_dcload_image(&img));
+        assert_eq!(gaps_probe_patches(&img, 0x0c01_0000).len(), 3);
+    }
+
+    /// Unreal Tournament PAL's expansion probe (0x8c020338) for its first slot:
+    /// `bsr` to the interrupt-enable switch-off (0x8c0205fc), `bsr` to the
+    /// control-register one (0x8c020674), each with `mov r13,r4` in its delay
+    /// slot, at the offsets and with the opcodes of the real program.
+    fn ut_probe_like() -> Vec<u8> {
+        let mut img = vec![0u8; 0x1_0800];
+        for (at, op) in [
+            (0x1_03f4usize, 0xb102u16), // bsr 0x8c0205fc
+            (0x1_03f6, 0x64d3),         // mov r13,r4
+            (0x1_03f8, 0xb13c),         // bsr 0x8c020674
+            (0x1_03fa, 0x64d3),
+            (0x1_05fc, 0x4f22), // sts.l pr,@-r15
+            (0x1_062a, 0x7514), // add #20,r5
+            (0x1_0674, 0x4f22),
+            (0x1_067e, 0xd117), // mov.l @(0x8c0206dc),r1
+            (0x1_06ac, 0x7518), // add #24,r5
+        ] {
+            img[at..at + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        img[0x1_06dc..0x1_06e0].copy_from_slice(&0x5a00_a500u32.to_le_bytes());
+        img
+    }
+
+    #[test]
+    fn a_network_titles_probe_keeps_the_slot_and_loses_the_switch_off() {
+        assert_eq!(
+            gaps_power_down_patches(&ut_probe_like(), 0x0c01_0000),
+            vec![(0x8c02_03f4, 0x64d3_0009), (0x8c02_03f8, 0x64d3_0009)]
+        );
+        // Without its offset, the key alone is not the switch-off.
+        let mut img = ut_probe_like();
+        img[0x1_06ac..0x1_06ae].copy_from_slice(&0x0009u16.to_le_bytes());
+        assert_eq!(gaps_power_down_patches(&img, 0x0c01_0000), vec![]);
+        // The control register's call alone: the other is only taken with it.
+        let mut img = ut_probe_like();
+        img[0x1_062a..0x1_062c].copy_from_slice(&0x0009u16.to_le_bytes());
+        assert_eq!(gaps_power_down_patches(&img, 0x0c01_0000), vec![(0x8c02_03f8, 0x64d3_0009)]);
+        let mut img = ut_probe_like();
+        img[0x100..0x100 + 22].copy_from_slice(b"dcload-ip 2.0.4 using ");
+        assert_eq!(gaps_power_down_patches(&img, 0x0c01_0000), vec![]);
+    }
+
+    #[test]
+    fn the_probes_g2_write_is_pointed_at_a_function_returning_0() {
+        let mut img = ut_probe_like();
+        for (at, op) in [
+            (0x1_0600usize, 0xd337u16), // mov.l @(0x8c0206e0),r3
+            (0x1_0610, 0x430b),         // jsr @r3
+            (0x1_0690, 0xd313),         // mov.l @(0x8c0206e0),r3
+            (0x1_06a0, 0x430b),
+            (0x1_0700, 0x000b), // rts
+            (0x1_0702, 0xe000), // mov #0,r0
+        ] {
+            img[at..at + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        img[0x1_06e0..0x1_06e4].copy_from_slice(&0x8c36_e384u32.to_le_bytes());
+        assert_eq!(gaps_power_down_redirect(&img, 0x0c01_0000), Some((0x8c02_06e0, 0x8c02_0700)));
+        // Somebody else loads the same literal: it is not the probe's alone.
+        let mut other = img.clone();
+        other[0x1_06c0..0x1_06c2].copy_from_slice(&0xd107u16.to_le_bytes());
+        assert_eq!(gaps_power_down_redirect(&other, 0x0c01_0000), None);
+        // The two functions jump through different literals.
+        let mut two = img.clone();
+        two[0x1_0600..0x1_0602].copy_from_slice(&0xd338u16.to_le_bytes());
+        assert_eq!(gaps_power_down_redirect(&two, 0x0c01_0000), None);
+        // No function returning 0 to point it at.
+        let mut none = img;
+        none[0x1_0702..0x1_0704].copy_from_slice(&0xe001u16.to_le_bytes());
+        assert_eq!(gaps_power_down_redirect(&none, 0x0c01_0000), None);
+    }
+
+    /// With `DCLOAD_ETD_BIN` naming Unreal Tournament PAL's 1ST_READ.BIN: the
+    /// probe's three slots and its shutdown's three, two calls each.
+    #[test]
+    fn unreal_tournaments_probe_loses_its_twelve_switch_off_calls() {
+        let Ok(path) = std::env::var("DCLOAD_ETD_BIN") else {
+            return;
+        };
+        let img = std::fs::read(path).expect("DCLOAD_ETD_BIN");
+        let p = gaps_power_down_patches(&img, 0x0c01_0000);
+        assert_eq!(p.len(), 12);
+        assert!(p.contains(&(0x8c02_03f4, 0x64d3_0009)));
+        assert!(p.iter().all(|&(a, _)| (0x8c02_03f0..0x8c02_0490).contains(&a)));
     }
 
     #[test]

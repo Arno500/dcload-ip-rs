@@ -309,6 +309,17 @@ fn ends_ram(w: u32) -> bool {
 /// A literal: its offset in the program, the word, and where it was loaded.
 type Lit = (usize, u32, usize);
 
+/// A word read through a pointer a literal holds (`mov.l @Rm,Rn`, Rm loaded
+/// from the literal): the deref's offset, Rm, the pointer's literal and the
+/// word read. What a heap's start is computed from (`&_end`, then `_end`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Via {
+    deref: usize,
+    rm: usize,
+    ptr: Lit,
+    word: u32,
+}
+
 /// What a register holds, as far as one straight read can tell.
 #[derive(Clone, Copy, Debug, Default)]
 struct Val {
@@ -316,11 +327,13 @@ struct Val {
     v: Option<u32>,
     /// The literal it still names.
     lit: Option<Lit>,
+    /// The word read through a pointer it still names.
+    via: Option<Via>,
 }
 
 impl Val {
     fn known(v: u32) -> Self {
-        Val { v: Some(v), lit: None }
+        Val { v: Some(v), lit: None, via: None }
     }
 }
 
@@ -330,10 +343,18 @@ fn carry(lit: Option<Lit>, v: Option<u32>) -> Option<Lit> {
     ((v & 0x1fff_ffff).abs_diff(l.1 & 0x1fff_ffff) <= SAME_RAM).then_some(l)
 }
 
+/// `via`, if `v` still names the RAM of the word it read.
+fn carry_via(via: Option<Via>, v: Option<u32>) -> Option<Via> {
+    let (w, v) = (via?, v?);
+    ((v & 0x1fff_ffff).abs_diff(w.word & 0x1fff_ffff) <= SAME_RAM).then_some(w)
+}
+
 /// A heap size the evaluator saw: `end - start`, `end` from a literal.
 struct Size {
     lit: Lit,
     start: u32,
+    /// The word `start` was computed from, when it was read through a pointer.
+    start_via: Option<Via>,
 }
 
 /// What an instruction does to control flow, after its delay slot if it has one.
@@ -369,8 +390,12 @@ impl Code<'_> {
         let uimm = (op & 0xff) as u32;
         let none = Val::default();
         // An address register moved by `by`: known if it was, naming nothing.
-        let moved = |x: Val, by: i32| Val { v: x.v.map(|v| v.wrapping_add(by as u32)), lit: None };
-        let alu = |a: Val, b: Val, v: Option<u32>| Val { v, lit: carry(a.lit, v).or_else(|| carry(b.lit, v)) };
+        let moved = |x: Val, by: i32| Val { v: x.v.map(|v| v.wrapping_add(by as u32)), lit: None, via: None };
+        let alu = |a: Val, b: Val, v: Option<u32>| Val {
+            v,
+            lit: carry(a.lit, v).or_else(|| carry(b.lit, v)),
+            via: carry_via(a.via, v).or_else(|| carry_via(b.via, v)),
+        };
         match op >> 12 {
             0x0 => match op & 0xf {
                 0xb if op == 0x000b || op == 0x002b => return Flow::Stop,
@@ -397,7 +422,7 @@ impl Code<'_> {
             0x3 => match op & 0xf {
                 0x8 => {
                     if let (Some(lit), Some(_), Some(start)) = (r[n].lit, r[n].v, r[m].v) {
-                        seen.push(Size { lit, start });
+                        seen.push(Size { lit, start, start_via: r[m].via });
                     }
                     r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a.wrapping_sub(b)));
                 }
@@ -410,15 +435,15 @@ impl Code<'_> {
             0x4 => match op & 0xff {
                 0x0b => return Flow::Call,
                 0x2b => return Flow::Stop,
-                0x00 | 0x20 => r[n] = Val { v: r[n].v.map(|v| v << 1), lit: None },
-                0x01 => r[n] = Val { v: r[n].v.map(|v| v >> 1), lit: None },
-                0x21 => r[n] = Val { v: r[n].v.map(|v| ((v as i32) >> 1) as u32), lit: None },
-                0x08 => r[n] = Val { v: r[n].v.map(|v| v << 2), lit: None },
-                0x09 => r[n] = Val { v: r[n].v.map(|v| v >> 2), lit: None },
-                0x18 => r[n] = Val { v: r[n].v.map(|v| v << 8), lit: None },
-                0x19 => r[n] = Val { v: r[n].v.map(|v| v >> 8), lit: None },
-                0x28 => r[n] = Val { v: r[n].v.map(|v| v << 16), lit: None },
-                0x29 => r[n] = Val { v: r[n].v.map(|v| v >> 16), lit: None },
+                0x00 | 0x20 => r[n] = Val { v: r[n].v.map(|v| v << 1), lit: None, via: None },
+                0x01 => r[n] = Val { v: r[n].v.map(|v| v >> 1), lit: None, via: None },
+                0x21 => r[n] = Val { v: r[n].v.map(|v| ((v as i32) >> 1) as u32), lit: None, via: None },
+                0x08 => r[n] = Val { v: r[n].v.map(|v| v << 2), lit: None, via: None },
+                0x09 => r[n] = Val { v: r[n].v.map(|v| v >> 2), lit: None, via: None },
+                0x18 => r[n] = Val { v: r[n].v.map(|v| v << 8), lit: None, via: None },
+                0x19 => r[n] = Val { v: r[n].v.map(|v| v >> 8), lit: None, via: None },
+                0x28 => r[n] = Val { v: r[n].v.map(|v| v << 16), lit: None, via: None },
+                0x29 => r[n] = Val { v: r[n].v.map(|v| v >> 16), lit: None, via: None },
                 0x10 => r[n] = moved(r[n], -1),
                 0x04 | 0x05 | 0x24 | 0x25 => r[n] = none,
                 x if x & 0xf == 0x6 || x & 0xf == 0x7 => r[n] = moved(r[n], 4),
@@ -429,16 +454,20 @@ impl Code<'_> {
             },
             0x5 => {
                 let at = r[m].v.map(|v| v.wrapping_add((op & 0xf) as u32 * 4));
-                r[n] = Val { v: at.and_then(|a| (self.read_word)(a)), lit: None };
+                r[n] = Val { v: at.and_then(|a| (self.read_word)(a)), lit: None, via: None };
             }
             0x6 => match op & 0xf {
                 0x3 => r[n] = r[m],
                 0x2 | 0x6 => {
                     let v = r[m].v.and_then(|a| (self.read_word)(a));
+                    // `mov.l @Rm,Rn` through a literal: what it read, and how.
+                    let via = (op & 0xf == 0x2)
+                        .then(|| r[m].lit.zip(v).map(|(ptr, word)| Via { deref: i, rm: m, ptr, word }))
+                        .flatten();
                     if op & 0xf == 0x6 && m != n {
                         r[m] = moved(r[m], 4);
                     }
-                    r[n] = Val { v, lit: None };
+                    r[n] = Val { v, lit: None, via };
                 }
                 0x4 | 0x5 => {
                     if m != n {
@@ -475,7 +504,7 @@ impl Code<'_> {
                 r[n] = match (at.checked_add(4)).is_some_and(|e| e <= self.data.len()) {
                     true => {
                         let w = le32(self.data, at);
-                        Val { v: Some(w), lit: ends_ram(w).then_some((at, w, i)) }
+                        Val { v: Some(w), lit: ends_ram(w).then_some((at, w, i)), via: None }
                     }
                     false => none,
                 };
@@ -516,6 +545,113 @@ impl Code<'_> {
         !(a.min(b)..a.max(b)).step_by(2).any(|k| self.op(k).is_some_and(Self::stops))
     }
 
+    /// Whether `rm` is dead from `i` on: written before anything may read it,
+    /// read straight on (no branch, no return), or clobbered by a call when it
+    /// is r0..r7. Conservative: a register in an operand field is a read.
+    fn dead_from(&self, mut i: usize, rm: usize) -> bool {
+        let mut call = false;
+        for _ in 0..256 {
+            let Some(op) = self.op(i) else { return false };
+            let (n, m) = (((op >> 8) & 0xf) as usize, ((op >> 4) & 0xf) as usize);
+            let writes = match op >> 12 {
+                0x9 | 0xd | 0xe => n == rm,
+                0x6 => n == rm && m != rm,
+                _ => false,
+            };
+            if writes {
+                return true;
+            }
+            let reads = match op >> 12 {
+                0x9 | 0xa | 0xb | 0xd | 0xe => false,
+                0x7 => n == rm,
+                0x8 | 0xc => rm == 0 || (op >> 12 == 0x8 && m == rm),
+                _ => n == rm || m == rm,
+            };
+            // A conditional branch: where it goes is not read.
+            let cond = matches!(op >> 8, 0x89 | 0x8b | 0x8d | 0x8f);
+            if reads || cond || Self::stops(op) {
+                return false;
+            }
+            if call {
+                // The delay slot ran; the callee clobbers r0..r7 and keeps r8..r14.
+                if rm < 8 {
+                    return true;
+                }
+                call = false;
+            }
+            if op >> 12 == 0xb || op & 0xf0ff == 0x400b || op & 0xf0ff == 0x0003 {
+                call = true;
+            }
+            i += 2;
+        }
+        false
+    }
+
+    /// The words that raise the start of every heap this program sizes to
+    /// `target` or above, its end unchanged: each `mov.l @Rm,Rn` that read
+    /// the start through a pointer literal becomes `mov Rm,Rn`, and the
+    /// literal holds the start itself. Refused unless every load of such a
+    /// literal is one of those reads and Rm is dead after each.
+    fn raise_starts(&self, image_end: u32, target: u32) -> Result<Vec<(u32, u32)>, String> {
+        let floor = p1(self.base);
+        let ends: Vec<u32> = self.ends(image_end).iter().map(|h| h.end_at).collect();
+        let sizes: Vec<Size> =
+            self.sizes().into_iter().filter(|s| ends.contains(&floor.wrapping_add(s.lit.0 as u32))).collect();
+        if sizes.is_empty() {
+            return Err("no heap".into());
+        }
+        let mut words: Vec<(usize, u32)> = vec![];
+        let put_half = |words: &mut Vec<(usize, u32)>, at: usize, half: u16| {
+            let wa = at & !3;
+            let w = words.iter_mut().find(|(a, _)| *a == wa).map(|(_, w)| w);
+            let w = match w {
+                Some(w) => w,
+                None => {
+                    words.push((wa, le32(self.data, wa)));
+                    &mut words.last_mut().expect("pushed").1
+                }
+            };
+            let sh = (at & 2) * 8;
+            *w = (*w & !(0xffff << sh)) | ((half as u32) << sh);
+        };
+        let mut ptrs: Vec<(Lit, u32, u32)> = vec![];
+        for s in &sizes {
+            let v = s.start_via.ok_or_else(|| {
+                format!("the heap ending at the word 0x{:08x} has a start not read through a pointer", floor + s.lit.0 as u32)
+            })?;
+            if p1(s.start) >= target {
+                continue;
+            }
+            if !self.dead_from(v.deref + 2, v.rm) {
+                return Err(format!("r{} is used again after 0x{:08x}", v.rm, floor + v.deref as u32));
+            }
+            let op = le16(self.data, v.deref);
+            put_half(&mut words, v.deref, op + 1); // mov.l @Rm,Rn -> mov Rm,Rn
+            match ptrs.iter_mut().find(|(l, _, _)| l.0 == v.ptr.0) {
+                Some(p) => p.2 = p.2.min(p1(s.start)),
+                None => ptrs.push((v.ptr, v.word, p1(s.start))),
+            }
+        }
+        for &(lit, word, start) in &ptrs {
+            let at = lit.0;
+            let derefs: Vec<usize> =
+                sizes.iter().filter_map(|s| s.start_via).filter(|v| v.ptr.0 == at).map(|v| v.ptr.2).collect();
+            let all = (at.saturating_sub(PC_REACH)..at)
+                .step_by(2)
+                .filter(|&j| self.op(j).and_then(|o| pc_load(o, j)).is_some_and(|(_, t)| t == at));
+            if let Some(j) = all.into_iter().find(|j| !derefs.contains(j)) {
+                return Err(format!(
+                    "the pointer at 0x{:08x} is also loaded at 0x{:08x}, for something else",
+                    floor + at as u32,
+                    floor + j as u32
+                ));
+            }
+            put_half(&mut words, at, (word.wrapping_add(target - start)) as u16);
+            put_half(&mut words, at + 2, (word.wrapping_add(target - start) >> 16) as u16);
+        }
+        Ok(words.into_iter().map(|(a, w)| (floor.wrapping_add(a as u32), w)).collect())
+    }
+
     /// Every heap end this program sets up from a literal.
     fn ends(&self, image_end: u32) -> Vec<KatanaHeap> {
         let sizes = self.sizes();
@@ -544,6 +680,21 @@ impl Code<'_> {
         }
         out
     }
+}
+
+/// The words of a program run from `base` that move the start of every heap
+/// it sizes up to `target` (the loader at the bottom of the heap, under it:
+/// `Code::raise_starts`), as (RAM address, word). Unreal Tournament NTSC's
+/// UTDC.BIN (2026-10-12): `_end` read through `&_end` in three places, the
+/// end a constant; its BSS is cleared up to `_end` by the same word, so the
+/// word itself cannot move.
+pub fn heap_start_raise(data: &[u8], base: u32, target: u32) -> Result<Vec<(u32, u32)>, String> {
+    let word = |a: u32| {
+        let off = p1(a).checked_sub(p1(base))? as usize;
+        (a & 3 == 0 && off + 4 <= data.len()).then(|| le32(data, off))
+    };
+    let image_end = p1(base).wrapping_add(data.len() as u32);
+    Code { data, base, read_word: &word }.raise_starts(image_end, p1(target))
 }
 
 /// Every heap end a program sets up from a literal (above), read as it runs
@@ -595,6 +746,24 @@ impl KatanaHeap {
         }
         Ok(Some((self.end_at, (lo & 0x1fff_ffff) | (self.end_raw & 0xe000_0000))))
     }
+
+    /// `patch` for a base the placement did not choose but was given (a Ginsu
+    /// boot, `dispatch::ginsu`): anywhere in the heap, as long as `MIN_LEFT`
+    /// of it stays under the loader. The heap above it is given up, however
+    /// much that is.
+    pub fn patch_deep(&self, base: u32) -> Result<Option<(u32, u32)>, String> {
+        let (lo, hi) = (p1(base), p1(base) + crate::loaders::LOADER_SPAN);
+        if hi <= self.start || lo >= self.end {
+            return Ok(None);
+        }
+        if lo & 0xffff != 0 || lo < self.start + MIN_LEFT {
+            return Err(format!(
+                "it would leave the heap (0x{:08x}..0x{:08x}) less than 0x{MIN_LEFT:x} under it",
+                self.start, self.end
+            ));
+        }
+        Ok(Some((self.end_at, (lo & 0x1fff_ffff) | (self.end_raw & 0xe000_0000))))
+    }
 }
 
 /// A program on the disc that sets up a syMalloc heap.
@@ -630,6 +799,9 @@ pub fn disc_katana_heaps(disc: &dyn DiscFormat) -> Vec<DiscHeap> {
     if boot.as_deref().is_some_and(|b| b.eq_ignore_ascii_case("0WINCEOS.BIN")) {
         return vec![];
     }
+    // A Ginsu boot runs another program, whose heap is set up past what the
+    // first bytes show (Unreal Tournament NTSC's UTDC.BIN, dispatch::ginsu).
+    let app = super::ginsu_app_name(disc);
     let mut out = vec![];
     for e in root.iter().filter(|e| {
         !e.is_dir
@@ -637,7 +809,7 @@ pub fn disc_katana_heaps(disc: &dyn DiscFormat) -> Vec<DiscHeap> {
             && e.size >= SCAN_BYTES
             && e.size <= crate::disc_formats::iso9660::MAX_FILE_BYTES
     }) {
-        let whole = boot.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(&e.name));
+        let whole = [&boot, &app].iter().any(|n| n.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(&e.name)));
         let scan = if whole { e.size } else { SCAN_BYTES };
         let Ok(mut head) = disc.read_sector(e.lba, scan.div_ceil(2048)) else {
             continue;
@@ -680,9 +852,15 @@ impl DiscHeap {
         Ok(literals_in_loader_footprint(&bytes, KATANA_LOAD, base))
     }
 
-    /// The sector word that lowers this heap's end to a loader at `base`.
+    /// The sector word that lowers this heap's end to a loader at `base`;
+    /// `deep` lowers it past `TOP_SLACK` (`KatanaHeap::patch_deep`).
     pub fn patch(&self, base: u32) -> Result<Option<DiscPatch>, String> {
-        let Some((at, value)) = self.heap.patch(base)? else {
+        self.patch_at(base, false)
+    }
+
+    pub fn patch_at(&self, base: u32, deep: bool) -> Result<Option<DiscPatch>, String> {
+        let lowered = if deep { self.heap.patch_deep(base)? } else { self.heap.patch(base)? };
+        let Some((at, value)) = lowered else {
             return Ok(None);
         };
         let off = at - KATANA_LOAD;
@@ -995,6 +1173,46 @@ mod tests {
         for h in &found {
             assert_eq!(h.patch(0x8cfc_0000).unwrap(), Some((h.end_at, 0x0cfc_0000)));
         }
+    }
+
+    /// `ut_like` with sbInitSystem's r11 written before its return, as the
+    /// real function does before using it again (UT NTSC 0x8c05b0c6).
+    fn ut_like_r11_dead() -> Vec<u8> {
+        let mut img = ut_like();
+        for (at, op) in [(0x4_b104usize, 0xeb00u16), (0x4_b106, 0x000b), (0x4_b108, 0x0009)] {
+            img[at..at + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn a_heap_start_read_through_end_is_raised_by_its_reads_and_literals() {
+        let mut words = heap_start_raise(&ut_like_r11_dead(), 0x8c01_0000, 0x8c33_0000).expect("raised");
+        words.sort();
+        assert_eq!(
+            words,
+            vec![
+                (0x8c05_b0ec, 0x65b3_d141), // mov.l @r11,r5 -> mov r11,r5
+                (0x8c05_b1a8, 0x62c3_d111), // mov.l @r12,r2 -> mov r12,r2
+                (0x8c05_b1ec, 0x8c33_0000), // &_end -> the start
+                (0x8c05_b26c, 0x6513_d40a), // mov.l @r1,r5 -> mov r1,r5
+                (0x8c05_b294, 0x8c33_0000),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heap_start_is_not_raised_while_its_pointer_is_still_live() {
+        // ut_like's sbInitSystem returns with r11 = &_end: who knows who reads it.
+        let why = heap_start_raise(&ut_like(), 0x8c01_0000, 0x8c33_0000).unwrap_err();
+        assert!(why.contains("r11"), "{why}");
+        // &_end loaded once more, for something else.
+        let mut img = ut_like_r11_dead();
+        for (at, op) in [(0x4_b1e0usize, 0xd302u16), (0x4_b1e2, 0x000b), (0x4_b1e4, 0x0009)] {
+            img[at..at + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        let why = heap_start_raise(&img, 0x8c01_0000, 0x8c33_0000).unwrap_err();
+        assert!(why.contains("also loaded"), "{why}");
     }
 
     #[test]

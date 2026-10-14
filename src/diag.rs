@@ -323,6 +323,25 @@ const GROUPS: &[(&str, &[(&str, Fmt)])] = &[
         ],
     ),
     (
+        // WITH_VNIC loaders only (dcload-resident-net.elf, loader AGENTS.md
+        // 4.21): the title's own network driver, served by the loader. on =
+        // the title's traffic is on (CtlXmit); rx/tx = frames handed to it
+        // and sent for it; rx_drop = it had no buffer; tx_fail = the adapter
+        // refused one.
+        "Network title",
+        &[
+            ("g_vnic_on", Fmt::Num),
+            ("g_vnic_rx", Fmt::Num),
+            ("g_vnic_rx_drop", Fmt::Num),
+            ("g_vnic_tx", Fmt::Num),
+            ("g_vnic_tx_fail", Fmt::Num),
+            // Where the title was at its last 16 interrupts: SPC and SSR in
+            // pairs, the latest at [(g_irq_pc_at - 1) & 15] (loader irq.c).
+            ("g_irq_pc_at", Fmt::Num),
+            ("g_irq_pc", Fmt::HexList),
+        ],
+    ),
+    (
         // WITH_RCHEEVOS loaders only (loader AGENTS.md 4.20). g_ra_gen is the
         // generation of the last table the loader took: 0 with RetroAchievements on means no
         // RACT ever reached it.

@@ -351,9 +351,12 @@ pub fn note_running_loader(
     reply: &crate::loaders::VersionReply,
 ) {
     let image = match (reply.variant.filter(|w| w.resident), reply.base) {
-        (Some(_), Some(base)) => match loaders
-            .resident_path()
-            .ok_or_else(|| format!("no {} here", crate::loaders::RESIDENT_NAME))
+        (Some(w), Some(base)) => match loaders
+            .resident_path_for(w.vnic)
+            .ok_or_else(|| {
+                let name = if w.vnic { crate::loaders::RESIDENT_NET_NAME } else { crate::loaders::RESIDENT_NAME };
+                format!("no {name} here")
+            })
             .and_then(|p| {
                 let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
                 crate::loaders::relocate(&bytes, base)

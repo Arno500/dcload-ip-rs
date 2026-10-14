@@ -25,6 +25,9 @@ pub struct VariantWord {
     pub mark: bool,
     pub disc: bool,
     pub resident: bool,
+    /// The title's own network served by the loader (`dcload-resident-net.elf`,
+    /// `dispatch::vnic`).
+    pub vnic: bool,
 }
 
 impl VariantWord {
@@ -43,6 +46,7 @@ impl VariantWord {
             mark: bit(11),
             disc: bit(12),
             resident: bit(13),
+            vnic: bit(15),
         })
     }
 
@@ -121,7 +125,10 @@ mod tests {
         let w = 0xA500_0000u32 | 1 | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13;
         let v = VariantWord::from_word(w).unwrap();
         assert_eq!((v.layout, v.os), (1, 0));
-        assert!(v.cdda && v.bba && v.lan && v.mark && v.disc && v.resident);
+        assert!(v.cdda && v.bba && v.lan && v.mark && v.disc && v.resident && !v.vnic);
+        // The network image: Katana only, RetroAchievements, bit 15.
+        let v = VariantWord::from_word(w | 1 << 4 | 1 << 14 | 1 << 15).unwrap();
+        assert!(v.os == 1 && v.resident && v.vnic);
         assert_eq!(VariantWord::from_word(0x0000_0102), None);
     }
 
@@ -144,8 +151,9 @@ mod tests {
         let Ok(dir) = std::env::var("DCLOAD_LOADER_DIR") else {
             return;
         };
-        let Ok(bytes) = std::fs::read(std::path::Path::new(&dir).join(loaders::RESIDENT_NAME)) else {
-            return;
+        for name in [loaders::RESIDENT_NAME, loaders::RESIDENT_NET_NAME] {
+        let Ok(bytes) = std::fs::read(std::path::Path::new(&dir).join(name)) else {
+            continue;
         };
         for base in [0x8c36_0000u32, 0x8ce0_0000, 0x8cee_0000, 0x8cfe_0000] {
             let mut moved = loaders::relocate(&bytes, base).unwrap();
@@ -156,6 +164,11 @@ mod tests {
             assert_eq!(&moved[at..at + 4], &0xc0a8_0140u32.to_le_bytes());
             let at = file_offset(&moved, syms["dcload_syscall_port"].0).unwrap();
             assert_eq!(&moved[at..at + 2], &53535u16.to_le_bytes());
+            // The network image carries its way in, and the words it is told.
+            if name == loaders::RESIDENT_NET_NAME {
+                assert!(["vnic_etd", "vnic_pso", "g_vnic_slot"].iter().all(|s| syms.contains_key(*s)));
+            }
+        }
         }
     }
 }

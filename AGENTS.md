@@ -328,6 +328,70 @@ upload, verified, re-applied on reload, and listed by `identify`
   served (`DiscPatch`, applied in `SectorServer::serve` wherever the read
   lands, only over the disc's own word). Not for an HLib title.
 
+  **PSO Ver.2's decoded program** (`dispatch::PsoLate`, 2026-10-13) carries
+  the same expansion probe as its bootstrap (`0x8c37a37e`, twelve switch-off
+  calls); left alone it switched the adapter off as the program started (the
+  last disc read answered, then the loader silent, the title back in the BIOS
+  menu). The loader writes the decoded program's words itself, ten at most
+  (`VNIC_LATE_MAX`; eight until 2026-10-14), so the twelve `nop`s do not fit:
+  `gaps_power_down_redirect` points the one literal both switch-off functions
+  jump through (their G2 write, `0x8c37a3e0`) at an `rts ; mov #0,r0` of the
+  program's own (`0x8c010510`), only if nothing else loads that literal.
+  **Its serial-number screen** (before going online) checks the number with
+  PRIME.PRS, a module the program loads (`"prime.prs"`, three validators of
+  Sega's prime-product scheme, held in one word); Sega's numbers are no longer
+  issued. `pso_serial_check_patches` turns each call into the module
+  (`mov.l @r0,r0 ; mov.l @(4|8,r0),r0 ; jsr @r0`) into `mov #1,r0`, so
+  whatever is typed is accepted: two pairs, and **no number is carried by the
+  host** (user's decision, 2026-10-14). The number itself is kept in flash
+  (partition 2, logical block 7, a 32-byte record tagged `'S1'`): the host
+  tells the loader to let writes of that block, and of no other, reach the
+  console's flash (`g_vnic_flash_keep` = `PSO_V2_SERIAL_BLOCK`, loader
+  AGENTS.md §4.21; `--no-flash-keep` to write nothing), so what was typed is
+  not asked again. With the driver's six, the probe's and the heap's end: ten.
+
+  **A Ginsu boot** (`dispatch::ginsu`, 2026-10-12): the `1ST_READ.BIN` is
+  Sega's boot loader, and the title is the program `GINSU.INI`'s `[GINSU]
+  FirstApp` section names in `Ginsu.Command`, copied to 0x8c010000 and run.
+  That program is read whole before the loader is placed and examined as the
+  boot binary is: its heap (searched whole, not its first 64 KB), its network
+  driver (the network image, `vnic`), its expansion-port probe (the GAPS guard,
+  or for a network title only its switch-off). Its words change in the sectors
+  served (`GinsuApp::disc_patches`), never in RAM. Unreal Tournament NTSC:
+  `UTDC.BIN`, 2.6 MB, the PAL `1ST_READ.BIN`'s ETD (`ETD_Init` at
+  `0x8c1c3ff4`) and the same twelve switch-off calls; served as the boot
+  binary alone, its driver reset the adapter after the last read of
+  `UTDC.BIN` (the loader silent, no GAPS word of the program patched).
+  **Where Ginsu reads decides the base** (`GinsuApp::loader_base`): it reads
+  GINXFER.BIN to the 64 KB boundary under `GINSU_TOP` (0x8cfe0000, its file
+  system's work area; its directory at 0x8cff0000) minus its size, and the
+  program to the 64 KB boundary under that minus the program's; all of it is
+  Ginsu's until the program runs. The loader goes right under the program,
+  before any other rule but `--loader-base`, and every heap it is in ends
+  there however low (`KatanaHeap::patch_deep`, past `TOP_SLACK`). UT NTSC:
+  `UTDC.BIN` at `0x8cd50000..0x8cfcd000`, GINXFER at `0x8cfd0000`, loader at
+  `0x8cd40000`, UT's heap `0x8c312ca0..0x8cfdd000` cut to `..0x8cd40000`.
+  Measured on the console (2026-10-12): at `0x8cfc0000` (the heap's top) the
+  loader refused the program's read and Ginsu returned to the BIOS menu.
+  **The loader goes at the bottom of the program's heap first**
+  (`GinsuApp::heap_bottom`, same day): the 64 KB boundary over its start, the
+  start raised above the loader (`heap_start_raise`, below), Ginsu's own heap
+  (to the top of RAM) ending under it like any heap. UT NTSC: loader at
+  `0x8c320000`, heap `0x8c330000..0x8cfdd000`, 117 KB given up instead of
+  2.6 MB. Only when that is refused does the loader go under the program, as
+  above. Run on the console (2026-10-12): Ginsu and UT boot, and UT froze
+  loading its first online level exactly as with the loader under the
+  program (UT allocates the level from its heap's top, wherever that is):
+  the heap was not the cause.
+  **Raising a start** (`Code::raise_starts`): UT computes its heap's start
+  from `_end`, read through a literal `&_end` (`mov.l @Rm,Rn`) in its three
+  set-ups, and its crt0 clears the BSS up to the same word, so the word itself
+  cannot move. Each read becomes `mov Rm,Rn` and the literal holds the new
+  start (less what the code adds), the end, from the top bits, unchanged.
+  Refused unless every load of the literal is such a read and Rm is dead
+  after it (written before any read, no branch or return between; a call
+  kills r0..r7). Not yet measured on the console.
+
   | Title (PAL) | Heap | End literal(s) | Loader |
   | --- | --- | --- | --- |
   | Jet Set Radio | `0x8c0a9120..` (1ST_READ), `0x8c35d740..0x8c800000` (JET_PAL/JET) | `0x8c013e60`, `0x8c013fe8` | `0x8c7f0000`, **measured** (2026-10-10): levels load and play; at `0x8c650000`/`0x8c580000` (the learned map's holes, inside the heap) it was overwritten while a level loaded |

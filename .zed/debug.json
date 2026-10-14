@@ -308,6 +308,13 @@
       "192.168.1.64",
       "--infinite",
       "--diag",
+      "--net-dns", "138.197.20.130",
+      "--net-gateway","192.168.1.254",
+      "--no-marks",
+      // "-vv",
+      // "--no-vnic",
+      "--loader-dir", "../../../loaders-vnic",
+      // "--patch", "0x8c01b3e8=0x8c00fd00",
       // "--boot-ipbin",
       // "--loader-base", "0x8cfe0000",
       // "--loader-base", "0x8c650000",
@@ -315,7 +322,9 @@
       // "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Grand Theft Auto 2 v1.003 (2000)(Take 2)(PAL)(M5)[!].zip",
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Jet Set Radio v1.002 (2000)(Sega)(PAL)(M4)[!].zip",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.004 (2001)(Infogrames)(PAL)[!].zip",
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.000 (2001)(Infogrames)(NTSC)(US)[!].zip",
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\NBA 2K2 v1.001 (2001)(Sega)(PAL)[!].zip",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Phantasy Star Online Ver. 2 v1.000 (2002)(Sega)(PAL)(M5)[!][req. serial].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -338,12 +347,20 @@
       "--host",
       "192.168.1.130",
       "--infinite",
+      "--diag",
+      "--loader-dir", "../../../loaders-vnic-flycast",
+      // Unreal Tournament: its "GAPS" probe (0x8c020582) answers 1 at once, so
+      // flycast's BBA is seen as the console's is.
+      // "--patch", "0x8c020580=0x000b0009", "--patch", "0x8c020584=0xe300e001",
+      // Its two ways back to the BIOS menu loop on themselves instead.
+      // "--patch", "0x8c014e28=0x0009affe", "--patch", "0x8c044cfc=0xaffe0009", "--patch", "0x8c044d00=0x654e0009",
       // flycast needs a set built with DREAMCAST_IP=192.168.1.130 and
       // CDDA_TICKS_X8192=580480; build it into a directory of its own and
       // name it here. Only "loaders" (DHCP, console clock) is kept.
       "u-exec",
-      "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
+      // "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Shenmue II v1.001 (2001)(Sega)(PAL)(M4)(Disc 1 of 4)[!].zip",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.000 (2001)(Infogrames)(NTSC)(US)[!].zip",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -447,8 +464,9 @@
       "--host",
       "192.168.1.64",
       "--infinite",
+      "--loader-dir", "../../../loaders-vnic",
       "u-exec",
-      "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
+      "$ZED_WORKTREE_ROOT/../../../loaders-vnic/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
@@ -471,7 +489,7 @@
       "--host",
       "192.168.1.130",
       "u-exec",
-      "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
+      "$ZED_WORKTREE_ROOT/../../../loaders/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
