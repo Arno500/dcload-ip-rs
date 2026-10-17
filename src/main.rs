@@ -2092,6 +2092,14 @@ fn gd_bios_entry(args: &Args, base: u32) -> Result<u32, String> {
         .ok_or_else(|| format!("{label} predates it"))
 }
 
+/// Where the running loader takes a title's G1 DMA-end word and its argument
+/// (`g_gd_dmaend_slot`, `g_gd_dmaend_param`, loader cdfs_syscalls.c). `None`
+/// for an image built without them (the network image, an older set).
+fn gd_dmaend_symbols(args: &Args, base: u32) -> Option<(u32, u32)> {
+    let syms = running_loader_image(args, base).and_then(|(elf, _)| loaders::symbols(&elf)).ok()?;
+    Some((syms.get("g_gd_dmaend_slot")?.0, syms.get("g_gd_dmaend_param")?.0))
+}
+
 /// The running loader's staging buffers for reads into translated addresses
 /// (`_gd_stage` in `.hiram`, `_gd_stage_big` above `_end`; dcload-ip
 /// cdfs_syscalls.c): the ranges of the loader a disc read is meant to land on.
@@ -3535,8 +3543,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     // A GINSU BOOT (dispatch::ginsu): the 1ST_READ.BIN is Sega's boot loader
-    // and the title is the program GINSU.INI has it run. Read once: examined
-    // below as a boot binary is, and patched in the sectors served.
+    // and the title is the program GINSU.INI (or the configuration built into
+    // the boot loader) has it run. Read once: examined below as a boot binary
+    // is, and patched in the sectors served.
     let ginsu_app: Option<dispatch::GinsuApp> = match disc_reader.as_deref() {
         Some(d) if matches!(args.command, Commands::UExec { .. }) => dispatch::ginsu_app(d),
         _ => None,
@@ -3549,6 +3558,12 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             a.bytes.len(),
             a.lba
         );
+        if !a.variants.is_empty() {
+            info!(
+                "Ginsu may run {} instead (chosen at run time): each is patched the same way",
+                a.variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
     }
 
     // Relocate BEFORE uploading the title. Any chainload replaces the whole
@@ -3900,7 +3915,9 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     }
                     for d in katana_heaps
                         .iter()
-                        .filter(|d| !bottom.as_ref().is_some_and(|(a, _)| a.name.eq_ignore_ascii_case(&d.file)))
+                        .filter(|d| {
+                            !bottom.as_ref().is_some_and(|(a, _)| a.programs().any(|p| p.name.eq_ignore_ascii_case(&d.file)))
+                        })
                     {
                         match d.patch_at(base, deep) {
                             Ok(Some(p)) => {
@@ -4079,6 +4096,95 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                             "{}: the GAPS word at 0x{at:08x} is not in the file; it may switch the adapter off",
                             app.name
                         ),
+                    }
+                }
+                // A Ginsu program that calls the BIOS GD driver body by its
+                // address, as the boot binary above may: NBA 2K2's VCCD layer
+                // (13 literals 0x8c0010f0 in each MAIN*.BIN, no 0x8c0000bc at
+                // all). Unredirected, it polled the physical drive and never
+                // asked the host for a sector. Every program Ginsu may run.
+                if let Some(app) = ginsu_app.as_ref().filter(|_| redirect_disc.is_some()) {
+                    let direct: usize = app
+                        .programs()
+                        .map(|p| dispatch::gd_body_patches(&p.bytes, dispatch::GINSU_APP_LOAD, 0).len())
+                        .sum();
+                    if direct > 0 {
+                        match running_base
+                            .ok_or_else(|| "the loader does not report its base".to_string())
+                            .and_then(|b| gd_bios_entry(&args, b))
+                        {
+                            Ok(entry) => {
+                                for p in app.programs() {
+                                    let words = dispatch::gd_body_patches(&p.bytes, dispatch::GINSU_APP_LOAD, entry);
+                                    match p.disc_patches(&words) {
+                                        Ok(d) => {
+                                            if !d.is_empty() {
+                                                info!(
+                                                    "{} calls the BIOS GD driver directly from {} place(s); \
+                                                     pointed at the loader's emulation (0x{entry:08x}) as it is served",
+                                                    p.name,
+                                                    d.len()
+                                                );
+                                            }
+                                            app_patches.extend(d);
+                                        }
+                                        Err((at, _)) => warn!(
+                                            "{}: the GD driver literal at 0x{at:08x} is not in the file; \
+                                             that call reaches the real drive",
+                                            p.name
+                                        ),
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(
+                                "{} calls the BIOS GD driver directly from {direct} place(s), and they \
+                                 will reach the real drive: no _gd_bios_entry in the running loader \
+                                 ({e}) -- redeploy loaders/",
+                                app.name
+                            ),
+                        }
+                    }
+                }
+                // A DMA stream that moves on the title's G1 DMA-end interrupt
+                // (NBA 2K2's VCCD: one sector a piece, the continuation in a
+                // word its handler takes). Nothing raises that interrupt, so
+                // the loader is told the word and does the handler's work
+                // after each piece (loader g_gd_dmaend_slot).
+                if redirect_disc.is_some() {
+                    let found: Vec<(String, (u32, u32))> = match ginsu_app.as_ref() {
+                        Some(app) => app
+                            .programs()
+                            .filter_map(|p| dispatch::gd_dma_end_slot(&p.bytes, dispatch::GINSU_APP_LOAD).map(|s| (p.name.clone(), s)))
+                            .collect(),
+                        None => dispatch::gd_dma_end_slot(&payload, args.address)
+                            .map(|s| ("the boot binary".to_string(), s))
+                            .into_iter()
+                            .collect(),
+                    };
+                    if let Some((name, (slot, param))) = found.first() {
+                        if found.iter().any(|(_, s)| s != &(*slot, *param)) {
+                            warn!(
+                                "the programs disagree on their G1 DMA-end word ({}); the loader is told {name}'s",
+                                found.iter().map(|(n, (s, _))| format!("{n} 0x{s:08x}")).collect::<Vec<_>>().join(", ")
+                            );
+                        }
+                        match running_base.and_then(|b| gd_dmaend_symbols(&args, b)) {
+                            Some((at_slot, at_param)) => {
+                                match dispatch::apply_patches(&mut udpsender, &[(at_param, *param), (at_slot, *slot)]) {
+                                    Ok(()) => info!(
+                                        "{name} moves its DMA streams on the G1 DMA-end interrupt, which nothing \
+                                         raises: the loader calls the continuation it leaves at 0x{slot:08x} \
+                                         after each piece"
+                                    ),
+                                    Err(e) => warn!("could not tell the loader {name}'s G1 DMA-end word: {e}"),
+                                }
+                            }
+                            None => warn!(
+                                "{name} waits for the G1 DMA-end interrupt after each piece of a DMA stream, \
+                                 and the running loader cannot stand in for it (no g_gd_dmaend_slot) -- \
+                                 redeploy loaders/: expect it to stop at its first stream"
+                            ),
+                        }
                     }
                 }
                 // PSO Ver.2 (dispatch::PsoLate): its program does not exist
@@ -4334,8 +4440,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // A title that calls the BIOS GD driver by its own address
                 // instead of through the syscall vectors bypasses the
                 // emulation and reads the physical drive. Windows CE does
-                // (dispatch::gd_body_patches). Always on, found by content:
-                // no Katana title measured carries the literal. Guarded like
+                // (dispatch::gd_body_patches). Always on, found by content;
+                // a Katana program Ginsu runs can too (NBA 2K2, below). Guarded like
                 // the others, because a module CE reloads carries it again.
                 let mut gd_guard: Vec<(u32, u32)> = vec![];
                 let direct = dispatch::gd_body_patches(&payload, args.address, 0).len();

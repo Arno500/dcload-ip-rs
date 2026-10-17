@@ -299,6 +299,19 @@ pub struct KatanaHeap {
     end_raw: u32,
 }
 
+/// Whether `op` names register `r` in an operand field (conservative: a
+/// field that is a register in any form of the instruction counts).
+fn names_reg(op: u16, r: usize) -> bool {
+    let (n, m) = (((op >> 8) & 0xf) as usize, ((op >> 4) & 0xf) as usize);
+    match op >> 12 {
+        0x9 | 0xd | 0xe | 0x7 => n == r,
+        0xa | 0xb => false,
+        0x8 => r == 0 || m == r,
+        0xc => r == 0,
+        _ => n == r || m == r,
+    }
+}
+
 /// Whether `w` can be the end of RAM a heap or stack runs to: an address in
 /// main RAM or one past it, in P0, P1 or P2.
 fn ends_ram(w: u32) -> bool {
@@ -321,7 +334,7 @@ struct Via {
 }
 
 /// What a register holds, as far as one straight read can tell.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Val {
     /// Its value, when every input was known.
     v: Option<u32>,
@@ -349,12 +362,17 @@ fn carry_via(via: Option<Via>, v: Option<u32>) -> Option<Via> {
     ((v & 0x1fff_ffff).abs_diff(w.word & 0x1fff_ffff) <= SAME_RAM).then_some(w)
 }
 
-/// A heap size the evaluator saw: `end - start`, `end` from a literal.
+/// A heap size the evaluator saw: `end - start`, `end` from a literal, or
+/// from a word of the program read through a pointer literal (`end_ptr`).
+/// For the latter `lit` names that word: its offset in the program, its
+/// value, and where the pointer was loaded.
 struct Size {
     lit: Lit,
     start: u32,
     /// The word `start` was computed from, when it was read through a pointer.
     start_via: Option<Via>,
+    /// The pointer literal the end was read through, when it was.
+    end_ptr: Option<Lit>,
 }
 
 /// What an instruction does to control flow, after its delay slot if it has one.
@@ -422,7 +440,14 @@ impl Code<'_> {
             0x3 => match op & 0xf {
                 0x8 => {
                     if let (Some(lit), Some(_), Some(start)) = (r[n].lit, r[n].v, r[m].v) {
-                        seen.push(Size { lit, start, start_via: r[m].via });
+                        seen.push(Size { lit, start, start_via: r[m].via, end_ptr: None });
+                    } else if let (Some(via), Some(_), Some(start)) = (r[n].via, r[n].v, r[m].v)
+                        && ends_ram(via.word)
+                    {
+                        // The end is a word of the program (NBA 2K2's MAIN.BIN
+                        // keeps its heap's bounds in two words of .data).
+                        let at = p1(via.ptr.1).wrapping_sub(p1(self.base)) as usize;
+                        seen.push(Size { lit: (at, via.word, via.ptr.2), start, start_via: r[m].via, end_ptr: Some(via.ptr) });
                     }
                     r[n] = alu(r[n], r[m], r[n].v.zip(r[m].v).map(|(a, b)| a.wrapping_sub(b)));
                 }
@@ -521,18 +546,74 @@ impl Code<'_> {
     }
 
     /// Read the program straight through, and every heap size seen.
+    ///
+    /// What follows an unconditional transfer is reached only by a branch: it
+    /// starts from what every forward branch to it knew (`bt`/`bf`, and `bra`
+    /// after its delay slot), registers they disagree on unknown, or from
+    /// nothing when none goes there; `nop`s right after the transfer are
+    /// padding, never run. NBA 2K2's MAIN.BIN sizes its heap past two
+    /// if/elses whose `bra`s used to end everything known.
     fn sizes(&self) -> Vec<Size> {
         let mut seen = vec![];
         let mut r = [Val::default(); 16];
-        let mut pending: Option<Flow> = None;
+        let mut pending: Option<(Flow, Option<isize>)> = None;
+        let mut into: std::collections::HashMap<usize, [Val; 16]> = Default::default();
+        let mut dead = false;
         let mut i = 0;
+        // What a branch from `from` to `from + disp` brings there, forward only.
+        let note = |into: &mut std::collections::HashMap<usize, [Val; 16]>, from: usize, disp: isize, r: &[Val; 16]| {
+            if disp <= 0 {
+                return;
+            }
+            into.entry(from + disp as usize)
+                .and_modify(|m| {
+                    for (a, b) in m.iter_mut().zip(r) {
+                        if a != b {
+                            *a = Val::default();
+                        }
+                    }
+                })
+                .or_insert(*r);
+        };
         while let Some(op) = self.op(i) {
+            if dead {
+                match into.remove(&i) {
+                    Some(m) => {
+                        r = m;
+                        dead = false;
+                    }
+                    // Alignment after a transfer: never run.
+                    None if op == 0x0009 => {
+                        i += 2;
+                        continue;
+                    }
+                    None => {
+                        r = [Val::default(); 16];
+                        dead = false;
+                    }
+                }
+            }
+            // A forward `bt`/`bf` (no delay slot): its target gets this state.
+            if matches!(op >> 8, 0x89 | 0x8b) {
+                note(&mut into, i, 4 + op as u8 as i8 as isize * 2, &r);
+            }
             let flow = self.step(op, i, &mut r, &mut seen);
             // The delay slot ran: now the branch.
             match pending.take() {
-                Some(Flow::Call) => r[..8].fill(Val::default()),
-                Some(Flow::Stop) => r = [Val::default(); 16],
-                _ if !matches!(flow, Flow::Next) => pending = Some(flow),
+                Some((Flow::Call, _)) => r[..8].fill(Val::default()),
+                Some((Flow::Stop, to)) => {
+                    // `to` is relative to the branch, one instruction back.
+                    if let Some(d) = to {
+                        note(&mut into, i - 2, d, &r);
+                    }
+                    r = [Val::default(); 16];
+                    dead = true;
+                }
+                _ if !matches!(flow, Flow::Next) => {
+                    // `bra`: its target, forward, once the slot has run.
+                    let to = (op >> 12 == 0xa).then(|| 4 + ((((op & 0xfff) as i32) << 20) >> 19) as isize);
+                    pending = Some((flow, to));
+                }
                 _ => {}
             }
             i += 2;
@@ -625,6 +706,17 @@ impl Code<'_> {
             if !self.dead_from(v.deref + 2, v.rm) {
                 return Err(format!("r{} is used again after 0x{:08x}", v.rm, floor + v.deref as u32));
             }
+            // Nor before it: the pointer must serve this read alone. NBA 2K2's
+            // MAIN.BIN reads the start through the same register, adjusts it
+            // and writes it back first (0x8c243e68, 0x8c243e70): with the
+            // pointer moved, that write would land at the new start.
+            if let Some(j) = (v.ptr.2 + 2..v.deref).step_by(2).find(|&j| self.op(j).is_some_and(|o| names_reg(o, v.rm))) {
+                return Err(format!(
+                    "r{} is used at 0x{:08x}, between the pointer's load and the read",
+                    v.rm,
+                    floor + j as u32
+                ));
+            }
             let op = le16(self.data, v.deref);
             put_half(&mut words, v.deref, op + 1); // mov.l @Rm,Rn -> mov Rm,Rn
             match ptrs.iter_mut().find(|(l, _, _)| l.0 == v.ptr.0) {
@@ -652,6 +744,65 @@ impl Code<'_> {
         Ok(words.into_iter().map(|(a, w)| (floor.wrapping_add(a as u32), w)).collect())
     }
 
+    /// `raise_starts` for a start kept in a word of the program rather than
+    /// in crt0's `_end`: the word itself holds the new start. NBA 2K2's
+    /// MAIN.BIN (2026-10-15) reads its heap's bounds from two words of .data
+    /// (0x8c708b44, 0x8c708b48), the start read again elsewhere through the
+    /// same pointer, so no read can become a move. Taken only when crt0 does
+    /// not clear the BSS up to that word: the old start must also be a literal
+    /// the program loads (the BSS bound), and no load of a pointer to the word
+    /// may sit in the same function as a load of that literal.
+    fn raise_start_words(&self, image_end: u32, target: u32) -> Result<Vec<(u32, u32)>, String> {
+        let floor = p1(self.base);
+        let ends: Vec<u32> = self.ends(image_end).iter().map(|h| h.end_at).collect();
+        let sizes: Vec<Size> =
+            self.sizes().into_iter().filter(|s| ends.contains(&floor.wrapping_add(s.lit.0 as u32))).collect();
+        if sizes.is_empty() {
+            return Err("no heap".into());
+        }
+        // Every `mov.l @(disp,pc)` loading a word `want` accepts.
+        let loads_of = |want: &dyn Fn(u32) -> bool| -> Vec<usize> {
+            (0..self.data.len())
+                .step_by(2)
+                .filter(|&j| {
+                    self.op(j)
+                        .and_then(|o| pc_load(o, j))
+                        .is_some_and(|(_, t)| t + 4 <= self.data.len() && want(le32(self.data, t)))
+                })
+                .collect()
+        };
+        let mut out: Vec<(u32, u32)> = vec![];
+        for s in sizes.iter().filter(|s| p1(s.start) < target) {
+            let v = s.start_via.ok_or_else(|| {
+                format!("the heap ending at the word 0x{:08x} has a start not read through a pointer", floor + s.lit.0 as u32)
+            })?;
+            let at = p1(v.ptr.1);
+            let off = at.wrapping_sub(floor);
+            if at & 3 != 0 || off as usize + 4 > self.data.len() {
+                return Err(format!("the start's word 0x{at:08x} is not in the program"));
+            }
+            let bound = loads_of(&|w| names_ram(w) && p1(w) == p1(v.word));
+            if bound.is_empty() {
+                return Err(format!("the start 0x{:08x} is not also a literal: crt0 may clear the BSS through its word", v.word));
+            }
+            let ptrs = loads_of(&|w| w == v.ptr.1);
+            for &a in &ptrs {
+                if let Some(&b) = bound.iter().find(|&&b| self.same_stretch(a, b)) {
+                    return Err(format!(
+                        "the function at 0x{:08x} loads both the start's word and the start (0x{:08x})",
+                        floor + a as u32,
+                        floor + b as u32
+                    ));
+                }
+            }
+            let value = (p1(target) & 0x1fff_ffff) | (v.word & 0xe000_0000);
+            if !out.iter().any(|&(a, _)| a == at) {
+                out.push((at, value));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every heap end this program sets up from a literal.
     fn ends(&self, image_end: u32) -> Vec<KatanaHeap> {
         let sizes = self.sizes();
@@ -669,11 +820,18 @@ impl Code<'_> {
             {
                 continue;
             }
-            // Every load of the word sizes a heap, or is in a function that does.
+            // An end read through a pointer: the word must be the program's,
+            // and the pointer is what is checked below.
+            if s.end_ptr.is_some() && at + 4 > self.data.len() {
+                continue;
+            }
+            let word_at = s.end_ptr.map_or(at, |p| p.0);
+            // Every load of the word (or of the pointer to it) sizes a heap, or
+            // is in a function that does.
             let sizing: Vec<usize> = sizes.iter().filter(|t| t.lit.0 == at).map(|t| t.lit.2).collect();
-            let loaders = (at.saturating_sub(PC_REACH)..at)
+            let loaders = (word_at.saturating_sub(PC_REACH)..word_at)
                 .step_by(2)
-                .filter(|&j| self.op(j).and_then(|o| pc_load(o, j)).is_some_and(|(_, t)| t == at));
+                .filter(|&j| self.op(j).and_then(|o| pc_load(o, j)).is_some_and(|(_, t)| t == word_at));
             if loaders.into_iter().all(|j| sizing.iter().any(|&k| k == j || self.same_stretch(j, k))) {
                 out.push(KatanaHeap { start, end, end_at, end_raw: raw });
             }
@@ -694,7 +852,9 @@ pub fn heap_start_raise(data: &[u8], base: u32, target: u32) -> Result<Vec<(u32,
         (a & 3 == 0 && off + 4 <= data.len()).then(|| le32(data, off))
     };
     let image_end = p1(base).wrapping_add(data.len() as u32);
-    Code { data, base, read_word: &word }.raise_starts(image_end, p1(target))
+    let code = Code { data, base, read_word: &word };
+    code.raise_starts(image_end, p1(target))
+        .or_else(|e| code.raise_start_words(image_end, p1(target)).map_err(|e2| format!("{e}; and {e2}")))
 }
 
 /// Every heap end a program sets up from a literal (above), read as it runs

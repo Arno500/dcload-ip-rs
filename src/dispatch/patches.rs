@@ -365,6 +365,66 @@ pub fn gd_body_patches(buf: &[u8], address: u32, entry: u32) -> Vec<(u32, u32)> 
     out
 }
 
+/// Holly's normal interrupt status, and the word before it (a base some
+/// handlers read it from at +4).
+const ISTNRM: [u32; 2] = [0xa05f_6900, 0xa05f_68fc];
+
+/// A title's G1 DMA-end handler that takes its continuation from a word of its
+/// own: `(word, argument)`, the word in P1. NBA 2K2's VCCD layer, at
+/// 0x8c24af20 in MAIN.BIN:
+///
+/// ```text
+///   mov.l  @(disp,PC),r2   ; 0x0c7c6868        its state
+///   mov.l  @(11,r2),r4     ; the continuation  (word = state + 44)
+///   mov    #0,r1
+///   mov.l  r1,@(11,r2)     ; cleared
+///   mov.l  @(disp,PC),r1   ; 0x8c0010f0        the BIOS GD driver
+///   mov    #0,r5           ; the argument
+///   mov    #5,r7           ; G1DmaEnd
+/// ```
+///
+/// after a read of ISTNRM. The loader does the same after each DMA piece of a
+/// stream, since nothing raises that interrupt (loader `g_gd_dmaend_slot`).
+/// `None` unless exactly one such word is found.
+pub fn gd_dma_end_slot(buf: &[u8], address: u32) -> Option<(u32, u32)> {
+    const BACK: usize = 10;
+    let mut found: Vec<(u32, u32)> = vec![];
+    for (_, data) in payload_spans(buf, address) {
+        let op = |i: usize| le16(data, i);
+        let lit = |i: usize| pc_load(op(i), i).filter(|&(_, t)| t + 4 <= data.len()).map(|(r, t)| (r, le32(data, t)));
+        for g in (0..data.len().saturating_sub(1)).step_by(2) {
+            if op(g) != 0xe705 || g < BACK * 2 {
+                continue;
+            }
+            let win = (g - BACK * 2..g).step_by(2);
+            let calls_driver = win.clone().any(|i| lit(i).is_some_and(|(_, w)| GD_DRIVER_BODY.contains(&w)));
+            let param = win.clone().filter(|&i| op(i) & 0xff00 == 0xe500).last().map(|i| op(i) as u8 as i8 as i32 as u32);
+            let Some(load) = win.clone().filter(|&i| op(i) & 0xff00 == 0x5400).last() else { continue };
+            let (m, d) = ((op(load) >> 4) & 0xf, op(load) & 0xf);
+            // The same word cleared: `mov #0,Rk` then `mov.l Rk,@(d,Rm)`.
+            let cleared = (load..g).step_by(2).any(|i| {
+                let s = op(i);
+                s & 0xf000 == 0x1000 && (s >> 8) & 0xf == m && s & 0xf == d && {
+                    let k = (s >> 4) & 0xf;
+                    (load..i).step_by(2).any(|j| op(j) == 0xe000 | (k << 8))
+                }
+            });
+            let state = (load.saturating_sub(BACK * 2)..load)
+                .step_by(2)
+                .filter_map(|i| lit(i).filter(|&(r, _)| r == m).map(|(_, w)| w))
+                .last();
+            let reads_istnrm = (g.saturating_sub(64 * 2)..g).step_by(2).any(|i| lit(i).is_some_and(|(_, w)| ISTNRM.contains(&w)));
+            if let (true, true, true, Some(p), Some(s)) = (calls_driver, cleared, reads_istnrm, param, state)
+                && names_ram(s)
+            {
+                found.push((p1(s).wrapping_add(d as u32 * 4), p));
+            }
+        }
+    }
+    found.dedup();
+    (found.len() == 1).then(|| found[0])
+}
+
 /// Make a title read "VGA" from the cable check: the port read becomes `mov #0`.
 ///
 /// Found by content: a `mov.l @(disp,PC),Rn` loading `PDTRA`, then a read
@@ -1317,6 +1377,37 @@ mod tests {
         p[34..38].copy_from_slice(&0x8c00_10f0u32.to_le_bytes());
         let got = gd_body_patches(&p, 0x0c01_0000, 0x8c8a_4400);
         assert_eq!(got, vec![(0x8c01_0008, 0x8c8a_4400), (0x8c01_0014, 0xac8a_4400)]);
+    }
+
+    /// A G1 DMA-end handler shaped as NBA 2K2's: ISTNRM read, the
+    /// continuation taken from state + 44 and cleared, G1DmaEnd(it, 0).
+    fn dma_end_handler(clear: bool) -> Vec<u8> {
+        let mut p = vec![0u8; 0x80];
+        let lits = [(0x60, 0xa05f_68fcu32), (0x64, 0x0c7c_6868), (0x68, 0x8c00_10f0)];
+        for (at, w) in lits {
+            p[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let load = |i: usize, reg: u16, lit: usize| 0xd000 | (reg << 8) | ((lit - ((i + 4) & !3)) / 4) as u16;
+        let mut code: Vec<u16> = vec![0x0009; 10];
+        code.push(load(20, 1, 0x60));
+        code.push(load(22, 2, 0x64));
+        code.push(0x542b); // mov.l @(11,r2),r4
+        code.push(0xe100); // mov #0,r1
+        code.push(if clear { 0x121b } else { 0x0009 }); // mov.l r1,@(11,r2)
+        code.push(load(30, 1, 0x68));
+        code.push(0xe500); // mov #0,r5
+        code.push(0xe705); // mov #5,r7
+        for (k, op) in code.iter().enumerate() {
+            p[k * 2..k * 2 + 2].copy_from_slice(&op.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn a_dma_end_handler_names_the_word_it_takes_its_continuation_from() {
+        assert_eq!(gd_dma_end_slot(&dma_end_handler(true), 0x0c01_0000), Some((0x8c7c_6894, 0)));
+        // A word read but not cleared is not that handler.
+        assert_eq!(gd_dma_end_slot(&dma_end_handler(false), 0x0c01_0000), None);
     }
 
     #[test]

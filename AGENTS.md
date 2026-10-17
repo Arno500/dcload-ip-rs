@@ -254,8 +254,25 @@ upload, verified, re-applied on reload, and listed by `identify`
 - **Direct BIOS GD driver calls** (`gd_body_patches`, always on). Every
   4-aligned `0x8c0010f0`/`0xac0010f0` is rewritten to the loader's
   `_gd_bios_entry` (`main.rs::gd_bios_entry`), since a direct call bypasses
-  the syscall vectors the loader holds. Windows CE does this; Katana titles
-  do not.
+  the syscall vectors the loader holds. Windows CE does this, and so does
+  NBA 2K2's Visual Concepts CD layer (`VCCD`): its `MAIN*.BIN` carry 13
+  literals and no `0x8c0000bc` at all. A Ginsu boot's programs are patched
+  in the sectors served, every program Ginsu may run; unpatched, MAIN.BIN
+  rendered its frames and never asked the host for a sector (flycast,
+  2026-10-17). The boot binaries of the other Katana titles measured carry
+  none.
+- **A DMA stream moved by the G1 DMA-end interrupt** (`gd_dma_end_slot`).
+  The loader never raises that interrupt. NBA 2K2's VCCD reads its
+  DMAREAD_STREAM one sector a piece and waits for it: its handler (after an
+  ISTNRM read) takes its continuation from a word of its own, clears it and
+  calls `G1DmaEnd(word, 0)`. Found by content (the clear, `mov #5,r7`, the
+  driver literal), in the boot binary or every program of a Ginsu boot; the
+  word's P1 address and the argument go into the resident loader's
+  `g_gd_dmaend_slot` / `g_gd_dmaend_param` before `EXEC` (`gd_dmaend_symbols`),
+  and the loader does the handler's work after each piece (loader AGENTS.md
+  4.5). Only one word can be told: programs that disagree get a warning.
+  Not in the network image. NBA 2K2: `0x8c7c6894`, argument 0, the same in
+  its four `MAIN*.BIN`.
 - **Windows CE** (`boot::WinCe`, `wince.rs`). Recognised by name
   (`0WINCEOS.BIN`, whose first 2048-byte sector is dropped, as DreamShell's
   isoldr does) or by `"ECEC"` at +64; entered through the disc's second
@@ -301,11 +318,18 @@ upload, verified, re-applied on reload, and listed by `identify`
   rounded). A small evaluator reads each program straight through: literals,
   immediates, words read through a known pointer (`&_end`), the ALU operations
   sbInitSystem uses, and which literal a value still names (the same RAM give
-  or take `SAME_RAM`, 0x40: `& ~31`, `+ 32`, the segment); rts/bra/jmp end what
-  it knows, a call clobbers r0..r7, conditional branches are read through. A
-  literal is taken only if **every** instruction loading it sizes a heap or is
-  in a function that does (no rts/bra/jmp between): a word also used as a
-  buffer address would move the buffer onto the loader. At least `MIN_LEFT`
+  or take `SAME_RAM`, 0x40: `& ~31`, `+ 32`, the segment); a call clobbers
+  r0..r7, conditional branches are read through. rts/bra/jmp end what it
+  knows, except that what follows one starts from what every forward
+  `bt`/`bf`/`bra` to it knew (registers they disagree on unknown), and `nop`s
+  right after one are padding (2026-10-15: NBA 2K2's MAIN.BIN sizes its heap
+  past two if/elses). A literal is taken only if **every** instruction loading
+  it sizes a heap or is in a function that does (no rts/bra/jmp between): a
+  word also used as a buffer address would move the buffer onto the loader.
+  **The end may also be a word of the program read through a pointer
+  literal** (NBA 2K2's MAIN.BIN keeps its heap's bounds in two words of
+  .data, `0x8c708b44`/`0x8c708b48`, and sizes it `*end - *start`): that word
+  is the one lowered, and the rule above applies to the pointer's loads. At least `MIN_LEFT`
   (1 MB) of heap; nothing for a Windows CE disc (`0WINCEOS.BIN`) or a KOS
   program. Not seen: an end passed as an end (`init(start, end)`), an end that
   is not a literal, a constant-size heap (HLib, above), a stack moved to the
@@ -353,6 +377,19 @@ upload, verified, re-applied on reload, and listed by `identify`
   **A Ginsu boot** (`dispatch::ginsu`, 2026-10-12): the `1ST_READ.BIN` is
   Sega's boot loader, and the title is the program `GINSU.INI`'s `[GINSU]
   FirstApp` section names in `Ginsu.Command`, copied to 0x8c010000 and run.
+  **Or the configuration is built into the boot loader** (2026-10-15, NBA 2K2
+  PAL): no GINSU.INI, a `SNIG` block (`0x8c06fb00`) naming `\manifest.bin`
+  and `\ginxfer.bin`, neither on the disc (Ginsu falls back to JOHNNIE.BIN,
+  8436 bytes, a name in its code), and the program chosen in code by the
+  console's language among MAIN.BIN, MAINF.BIN, MAING.BIN and MAINS.BIN. The
+  programs are then the root `.BIN` files the boot loader names (64 KB or
+  more, not itself, not the transfer program) that set up a heap, the first
+  named reported and the others its `variants`, each patched alike; a missing
+  transfer program is taken to fit the 64 KB under `GINSU_TOP`. Measured on
+  the console (2026-10-14), before this: MAIN.BIN read to
+  `0x8c8d0000..0x8cfc8dc4`, then silence with the loader at `0x8cfd0000`
+  (JOHNNIE.BIN's read refused) and a reset at Start with it at `0x8cfe0000`
+  (the file system's work area).
   That program is read whole before the loader is placed and examined as the
   boot binary is: its heap (searched whole, not its first 64 KB), its network
   driver (the network image, `vnic`), its expansion-port probe (the GAPS guard,
@@ -388,9 +425,19 @@ upload, verified, re-applied on reload, and listed by `identify`
   set-ups, and its crt0 clears the BSS up to the same word, so the word itself
   cannot move. Each read becomes `mov Rm,Rn` and the literal holds the new
   start (less what the code adds), the end, from the top bits, unchanged.
-  Refused unless every load of the literal is such a read and Rm is dead
+  Refused unless every load of the literal is such a read, Rm is dead
   after it (written before any read, no branch or return between; a call
-  kills r0..r7). Not yet measured on the console.
+  kills r0..r7) and named by nothing between the pointer's load and the read
+  (NBA 2K2 reads the start through the same register, adjusts it and writes
+  it back first). **Then the start's word itself is raised**
+  (`Code::raise_start_words`), only when crt0 does not clear the BSS through
+  it: the old start must also be a literal the program loads (the BSS bound)
+  and no load of a pointer to the word may sit in a function that loads that
+  literal. NBA 2K2: MAIN.BIN's `0x8c708b44` `0x0c7f5040` -> `0x0c810000` in
+  all four programs, loader at `0x8c800000` (above every program's BSS, under
+  `0x8c8d0000` where Ginsu reads them; the boot loader never wrote
+  `0x8c340000..0x8c8d0000`), the boot loader's heap ending there. 44 KB of
+  MAIN.BIN's 8.2 MB heap given up. Not yet measured on the console.
 
   | Title (PAL) | Heap | End literal(s) | Loader |
   | --- | --- | --- | --- |

@@ -190,10 +190,11 @@ impl<'a> SectorServer<'a> {
         }
         let mut buf = buf;
         self.guard_in_flight(start, dc_address, &mut buf);
-        if patch_disc_read(&self.disc_patches, start, &mut buf) > 0 {
+        let patched = patch_disc_read(&self.disc_patches, start, &mut buf);
+        if patched > 0 {
             info!(
-                "LBA 0x{start:08x} -> 0x{dc_address:08x} carries a syMalloc heap's end: \
-                 lowered to the loader's base in the data sent"
+                "LBA 0x{start:08x} -> 0x{dc_address:08x} carries {patched} word(s) patched for the \
+                 loader (a heap's bounds, a network driver, a probe): changed in the data sent"
             );
         }
         let buf = buf;
