@@ -1087,6 +1087,7 @@ impl DiscHeap {
 
     /// The sector word that lowers this heap's end to a loader at `base`;
     /// `deep` lowers it past `TOP_SLACK` (`KatanaHeap::patch_deep`).
+    #[cfg(test)]
     pub fn patch(&self, base: u32) -> Result<Option<DiscPatch>, String> {
         self.patch_at(base, false)
     }

@@ -260,7 +260,8 @@ unsafe extern "C" fn cb_done(ud: *mut c_void, what: c_int, result: c_int, msg: *
     let ev = match what {
         ffi::DONE_LOGIN => Event::Login { ok, message },
         ffi::DONE_MEDIA => Event::Media { result, message },
-        _ => Event::Load { ok, message },
+        ffi::DONE_LOAD => Event::Load { ok, message },
+        _ => return,
     };
     unsafe { env(ud) }.borrow_mut().events.push(ev);
 }

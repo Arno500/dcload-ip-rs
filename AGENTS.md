@@ -288,8 +288,17 @@ upload, verified, re-applied on reload, and listed by `identify`
   matched nothing (its rich presence said "RALLY2.EXE=0xA85000 -- Add to
   RAScript!!"). `--wince-loader-top` restores the old placement. `pio_patches` sends
   CE's GD driver down its PIO path, because its DMA path waits for a G1
-  interrupt this transport never raises. Reads into the loader's `_gd_stage*`
-  buffers are not collisions (`loader_stage`). `--no-wince` uploads it whole.
+  interrupt this transport never raises. Two shapes are known: Sega Rally 2's
+  inline choice (`DMA_CHOICE`, a `bf` made a `bra`) and Railroad Tycoon II's
+  DMA function, whose 32-byte alignment test is made to fail
+  (`DMA_ALIGN_TEST`, a `bt` made a `nop`). Reads into the loader's `_gd_stage*`
+  buffers are not collisions (`loader_stage`). On a VGA box (`--vga`, `auto`
+  by default), a root `.EXE` that asks DirectDraw for PAL's 25 Hz mode with
+  flag `0x4000` (Railroad Tycoon II PAL's `RT2DC.EXE`) is served asking for
+  60 Hz, flags 0, the only 640x480 mode DDHAL lists for VGA
+  (`vga_display_mode_patches`, `DiscPatch`es); unpatched, its `SetDisplayMode`
+  fails and the game stays on a black screen, with or without dcload.
+  `--no-wince` uploads it whole.
   Open questions: the loader's `docs/wince-investigation.md`.
 - **HLib heap** (`dispatch/heap.rs`, on by default, `--no-heap-guard`). A
   Katana allocator that owns all the RAM a title leaves free, recognised by its

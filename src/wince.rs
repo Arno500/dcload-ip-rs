@@ -211,23 +211,116 @@ const DMA_CHOICE: [u8; 12] = [
     0xf4, 0x52, 0x28, 0x22, 0x1e, 0x8b, 0xf6, 0x51, 0x18, 0x21, 0x1b, 0x8b,
 ];
 
-/// Make CE's GD driver read aligned requests by PIO (see [`DMA_CHOICE`]).
-/// Returned as the aligned word to write. Empty unless the pattern occurs
-/// exactly once, halfword-aligned.
-pub fn pio_patches(payload: &[u8], load: u32) -> Vec<(u32, u32)> {
-    let hits: Vec<usize> = (0..payload.len().saturating_sub(DMA_CHOICE.len()))
+/// The other shape of CE's GD driver, in Railroad Tycoon II's `0WINCEOS.BIN`
+/// (PAL v1.002 and US Gold, the same file): the caller does not choose DMA
+/// itself but calls a DMA function (`0x8c0a5bb0`) first, and takes the PIO
+/// path (PIOREAD, PIOREAD_STREAM_EX) when that function answers `0xc0000182`.
+/// It answers so when a page of the request is not 32-byte aligned:
+///
+/// ```text
+///   1f e2   mov    #31,r2
+///   28 2c   tst    r2,r12           ; page address
+///   02 8b   bf     unaligned
+///   41 50   mov.l  @(4,r4),r0       ; page length
+///   1f c8   tst    #31,r0
+///   11 89   bt     next_page        <- becomes `nop` (09 00)
+/// unaligned:                        ; unlock the pages, return 0xc0000182
+/// ```
+///
+/// Every page then looks unaligned, and every read goes the driver's own PIO
+/// way, from each of the DMA function's three callers (bounce buffer included).
+const DMA_ALIGN_TEST: [u8; 12] = [
+    0x1f, 0xe2, 0x28, 0x2c, 0x02, 0x8b, 0x41, 0x50, 0x1f, 0xc8, 0x11, 0x89,
+];
+
+/// Where `pat` occurs in `payload`, halfword-aligned, if exactly once.
+fn find_once(payload: &[u8], pat: &[u8]) -> Option<usize> {
+    let hits: Vec<usize> = (0..payload.len().saturating_sub(pat.len()))
         .step_by(2)
-        .filter(|&i| payload[i..i + DMA_CHOICE.len()] == DMA_CHOICE)
+        .filter(|&i| payload[i..i + pat.len()] == *pat)
+        .collect();
+    let [i] = hits[..] else {
+        return None;
+    };
+    Some(i)
+}
+
+/// Make CE's GD driver read aligned requests by PIO (see [`DMA_CHOICE`] and
+/// [`DMA_ALIGN_TEST`]). Returned as the aligned word to write. Empty unless
+/// one of the patterns occurs exactly once, halfword-aligned.
+pub fn pio_patches(payload: &[u8], load: u32) -> Vec<(u32, u32)> {
+    // The halfword to rewrite: `bf` -> `bra` (same displacement), or `bt` -> `nop`.
+    let (at, new) = if let Some(i) = find_once(payload, &DMA_CHOICE) {
+        (i + 4, [payload[i + 4], 0xa0])
+    } else if let Some(i) = find_once(payload, &DMA_ALIGN_TEST) {
+        (i + 10, [0x09, 0x00])
+    } else {
+        return vec![];
+    };
+    // Write the aligned word holding it.
+    let w = at & !3;
+    let mut bytes = [payload[w], payload[w + 1], payload[w + 2], payload[w + 3]];
+    bytes[at - w..at - w + 2].copy_from_slice(&new);
+    vec![(p1(load).wrapping_add(w as u32), u32::from_le_bytes(bytes))]
+}
+
+/// Railroad Tycoon II PAL's `RT2DC.EXE` (`0x47640`) sets the refresh rate and
+/// flags its `SetDisplayMode(640, 480, bpp, refresh, flags)` will ask for,
+/// whatever the cable:
+///
+/// ```text
+///   .. d2   mov.l  @(disp,pc),r2    ; &refresh
+///   19 e3   mov    #25,r3           <- `mov #60,r3` (3c e3)
+///   32 22   mov.l  r3,@r2
+///   40 e2   mov    #64,r2           <- `mov #0,r2` (00 e2)
+///   .. d1   mov.l  @(disp,pc),r1    ; &flags
+///   18 42   shll8  r2               ; 0x4000
+/// ```
+///
+/// 25 Hz with flag `0x4000` is a PAL television mode in DDHAL's table. With a
+/// VGA box DDHAL lists only 640x480 at 60 Hz, flags 0, so the call fails and
+/// the game sits on a black screen after loading the program. On a VGA box
+/// the program asks for that mode instead.
+const PAL_DISPLAY_MODE: [Option<u8>; 12] = [
+    None, Some(0xd2), Some(0x19), Some(0xe3), Some(0x32), Some(0x22),
+    Some(0x40), Some(0xe2), None, Some(0xd1), Some(0x18), Some(0x42),
+];
+
+/// The words of a CE program to change for a VGA box (see
+/// [`PAL_DISPLAY_MODE`]), as `(byte offset in the file, was, value)`, offsets
+/// 4-aligned. Empty unless the pattern occurs exactly once, halfword-aligned.
+pub fn vga_display_mode_patches(exe: &[u8]) -> Vec<(usize, u32, u32)> {
+    let n = PAL_DISPLAY_MODE.len();
+    let hits: Vec<usize> = (0..exe.len().saturating_sub(n))
+        .step_by(2)
+        .filter(|&i| PAL_DISPLAY_MODE.iter().zip(&exe[i..i + n]).all(|(p, b)| p.is_none_or(|p| p == *b)))
         .collect();
     let [i] = hits[..] else {
         return vec![];
     };
-    // The `bf` is the halfword at i+4; write the aligned word holding it.
-    let bf = i + 4;
-    let w = bf & !3;
-    let mut bytes = [payload[w], payload[w + 1], payload[w + 2], payload[w + 3]];
-    bytes[bf - w + 1] = 0xa0;
-    vec![(p1(load).wrapping_add(w as u32), u32::from_le_bytes(bytes))]
+    let mut new = exe[i..i + n].to_vec();
+    new[2] = 60;
+    new[6] = 0;
+    // The aligned words the eight bytes from `i + 2` fall in.
+    let mut out = vec![];
+    let mut w = (i + 2) & !3;
+    while w < i + 8 {
+        let was = u32::from_le_bytes(exe[w..w + 4].try_into().expect("4 bytes"));
+        let mut bytes = was.to_le_bytes();
+        for (k, b) in bytes.iter_mut().enumerate() {
+            if let Some(j) = (w + k).checked_sub(i)
+                && j < n
+            {
+                *b = new[j];
+            }
+        }
+        let value = u32::from_le_bytes(bytes);
+        if value != was {
+            out.push((w, was, value));
+        }
+        w += 4;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -338,5 +431,54 @@ mod tests {
         p[0..12].copy_from_slice(&DMA_CHOICE);
         p[32..44].copy_from_slice(&DMA_CHOICE);
         assert!(pio_patches(&p, LOAD).is_empty());
+    }
+
+    #[test]
+    fn turns_the_dma_functions_alignment_test_into_a_fallback() {
+        // Railroad Tycoon II: the `bt` at 0x8c0a5d72 is the high half of the
+        // word at 0x8c0a5d70.
+        let mut p = vec![0u8; 0x9_6000];
+        p[0x9_5d68..0x9_5d74].copy_from_slice(&DMA_ALIGN_TEST);
+        let got = pio_patches(&p, LOAD);
+        assert_eq!(got, vec![(0x8c0a_5d70, u32::from_le_bytes([0x1f, 0xc8, 0x09, 0x00]))]);
+        // Low half.
+        let mut p = vec![0u8; 64];
+        p[2..14].copy_from_slice(&DMA_ALIGN_TEST);
+        assert_eq!(pio_patches(&p, LOAD), vec![(LOAD + 12, u32::from_le_bytes([0x09, 0x00, 0, 0]))]);
+        // Sega Rally 2's shape wins when both are there.
+        p[32..44].copy_from_slice(&DMA_CHOICE);
+        assert_eq!(pio_patches(&p, LOAD)[0].0, LOAD + 36);
+    }
+
+    const RT2_MODE: [u8; 12] = [0x30, 0xd2, 0x19, 0xe3, 0x32, 0x22, 0x40, 0xe2, 0x0e, 0xd1, 0x18, 0x42];
+
+    #[test]
+    fn a_pal_display_mode_becomes_vgas() {
+        // Railroad Tycoon II PAL: at 0x36a40 in RT2DC.EXE, word-aligned.
+        let mut p = vec![0u8; 64];
+        p[16..28].copy_from_slice(&RT2_MODE);
+        assert_eq!(
+            vga_display_mode_patches(&p),
+            vec![
+                (16, u32::from_le_bytes([0x30, 0xd2, 0x19, 0xe3]), u32::from_le_bytes([0x30, 0xd2, 0x3c, 0xe3])),
+                (20, u32::from_le_bytes([0x32, 0x22, 0x40, 0xe2]), u32::from_le_bytes([0x32, 0x22, 0x00, 0xe2])),
+            ]
+        );
+        // Halfword-aligned: the two immediates are low halves.
+        let mut p = vec![0u8; 64];
+        p[18..30].copy_from_slice(&RT2_MODE);
+        let got = vga_display_mode_patches(&p);
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![20, 24]);
+        assert_eq!(got[0].2.to_le_bytes(), [0x3c, 0xe3, 0x32, 0x22]);
+        assert_eq!(got[1].2.to_le_bytes(), [0x00, 0xe2, 0x0e, 0xd1]);
+        // Twice, or another refresh rate: nothing.
+        let mut p = vec![0u8; 64];
+        p[0..12].copy_from_slice(&RT2_MODE);
+        p[32..44].copy_from_slice(&RT2_MODE);
+        assert!(vga_display_mode_patches(&p).is_empty());
+        let mut p = vec![0u8; 64];
+        p[16..28].copy_from_slice(&RT2_MODE);
+        p[18] = 30;
+        assert!(vga_display_mode_patches(&p).is_empty());
     }
 }

@@ -4566,17 +4566,51 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     let pio = wince::pio_patches(&payload, args.address);
                     if pio.is_empty() {
                         warn!(
-                            "Windows CE: the GD driver's DMA/PIO choice was not found, so aligned                              reads stay on DMA streams, which wait for an interrupt this                              transport never raises -- expect loading to stall"
+                            "Windows CE: the GD driver's DMA/PIO choice was not found, so aligned \
+                             reads stay on DMA streams, which wait for an interrupt this \
+                             transport never raises -- expect loading to stall"
                         );
                     } else {
                         info!(
-                            "Windows CE: its GD driver will read aligned requests by PIO (0x{:08x}),                              whose pieces it chains itself",
+                            "Windows CE: its GD driver will read aligned requests by PIO (0x{:08x}), \
+                             whose pieces it chains itself",
                             pio[0].0
                         );
                         wince_guard.extend(pio);
                     }
                     if let Err(e) = dispatch::apply_patches(&mut udpsender, &wince_guard) {
                         warn!("could not patch the Windows CE image: {e}");
+                    }
+                    // A PAL program that asks DirectDraw for a television mode
+                    // DDHAL does not list on a VGA box (Railroad Tycoon II:
+                    // black screen). Changed in the sectors served.
+                    if vga && let Some(disc) = disc_reader.as_deref() {
+                        let root = disc_formats::iso9660::list_root(disc, disc.boot_sector());
+                        for e in root.iter().filter(|e| {
+                            !e.is_dir && e.name.to_ascii_uppercase().ends_with(".EXE")
+                        }) {
+                            let Ok(exe) = disc_formats::iso9660::read_file(disc, e) else { continue };
+                            let words = wince::vga_display_mode_patches(&exe);
+                            if words.is_empty() {
+                                continue;
+                            }
+                            info!(
+                                "Windows CE: {} asks for a PAL television display mode; on this \
+                                 VGA box it asks for 640x480 at 60 Hz instead ({} word(s) in the \
+                                 sectors served)",
+                                e.name,
+                                words.len()
+                            );
+                            app_patches.extend(words.into_iter().map(|(off, was, value)| {
+                                dispatch::DiscPatch {
+                                    file: e.name.clone(),
+                                    lba: e.lba + (off / 2048) as u32,
+                                    off: off % 2048,
+                                    was,
+                                    value,
+                                }
+                            }));
+                        }
                     }
                 }
                 // `--patch` words inside the image are guarded too: Shenmue II
