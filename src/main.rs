@@ -1441,6 +1441,44 @@ fn wanted_loader_base_by_rules(
         }
     }
 
+    // A KOS TITLE TAKES RAM FROM ITS IMAGE UP: code, then a BSS its start-up
+    // zeroes, then a heap growing to 64 KB under the top, where the kernel
+    // thread's stack is. The only 64 KB it can give up without a hole in the
+    // middle is the top, which its top of RAM is then lowered under
+    // (`lower_kos_mem_top`). Super Mario 64's SM64.BIN, which its 1ST_READ.BIN
+    // loads and runs, ends its BSS at 0x8ce6dfe0: at the 0x8ce00000 every
+    // chainload passes through, its start-up zeroed the loader, and the first
+    // disc read after that went nowhere (2026-10-26).
+    if dispatch::is_kos_binary(&boot) {
+        let top = 0x8d00_0000 - loaders::LOADER_SPAN;
+        let ends: Vec<(String, u32)> = std::iter::once(("the boot binary".to_string(), &boot[..]))
+            .filter_map(|(n, b)| dispatch::kos_program_end(b, args.address).map(|e| (n, e)))
+            .chain(dispatch::disc_kos_program_ends(disc))
+            .collect();
+        for (name, end) in &ends {
+            debug!("KOS: {name} ends at 0x{end:08x}, BSS included");
+        }
+        if let Some((name, end)) = ends.iter().filter(|(_, e)| e + 0x1_0000 > top).max_by_key(|(_, e)| *e) {
+            warn!(
+                "KOS: {name} ends at 0x{end:08x}, which leaves no room for its kernel stack \
+                 under a loader at 0x{top:08x}; putting it there anyway, the highest it can go"
+            );
+        }
+        if running == Some(top) {
+            info!("KOS title: keeping the loader at the top of RAM, at 0x{top:08x}");
+            return None;
+        }
+        info!(
+            "KOS title: putting the loader at the top of RAM, at 0x{top:08x}, so that every \
+             byte under it stays the title's, in one piece{}",
+            ends.iter()
+                .max_by_key(|(_, e)| *e)
+                .map(|(n, e)| format!(" ({n} ends at 0x{e:08x})"))
+                .unwrap_or_default()
+        );
+        return Some(top);
+    }
+
     // WHICH ADDRESSES WERE ON THE TABLE, not just the one that won. Measured
     // 2026-08-27: a run picked 0x8ce00000 when the policy says 0x8cef8000,
     // because the loader set it was reading did not have the latter -- and the
@@ -2492,24 +2530,22 @@ fn tell_loader_kos(args: &Args, conn: &mut DcIoUDP, running_base: Option<u32>) -
 
 /// Lower a KOS title's top of RAM under the loader (`kos_mem_top_patches`):
 /// its heap and main stack otherwise reach 0x8cff0000..0x8d000000, through a
-/// high loader and through a low one's buffers. Never fatal.
-fn lower_kos_mem_top(conn: &mut DcIoUDP, running_base: Option<u32>, boot: &[u8], address: u32) {
+/// high loader and through a low one's buffers. Never fatal. Returns the new
+/// top, for the KOS programs the disc serves later (`disc_kos_programs`).
+fn lower_kos_mem_top(conn: &mut DcIoUDP, running_base: Option<u32>, boot: &[u8], address: u32) -> Option<u32> {
     let Some(base) = running_base else {
         warn!("KOS title: the loader does not report its base; its top of RAM is left alone");
-        return;
+        return None;
     };
     let p1 = |a: u32| (a & 0x1fff_ffff) | 0x8c00_0000;
     let load = p1(address);
     // The lowest part of the loader above the title: the whole span of a high
     // loader, the Maple/.hiram buffers of a low one.
-    let Some(top) = loaders::live_footprint(base)
+    let top = loaders::live_footprint(base)
         .into_iter()
         .map(|(start, _)| p1(start))
         .filter(|&start| start > load)
-        .min()
-    else {
-        return;
-    };
+        .min()?;
     match dispatch::kos_mem_top_patches(boot, load, top) {
         Ok(patches) => {
             info!(
@@ -2526,6 +2562,7 @@ fn lower_kos_mem_top(conn: &mut DcIoUDP, running_base: Option<u32>, boot: &[u8],
             "KOS title, but {e}: its heap and stack may reach the loader at 0x{base:08x}"
         ),
     }
+    Some(top)
 }
 
 /// Paint the witness words and bring up their check, or say why not
@@ -4585,8 +4622,30 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 // masks interrupts across a disc read's wait, so no thread's
                 // printf can enter the loader in the middle of one.
                 let kos_told = kos && has_disc && tell_loader_kos(&args, &mut udpsender, running_base);
-                if kos {
-                    lower_kos_mem_top(&mut udpsender, running_base, &payload, args.address);
+                if kos
+                    && let Some(top) = lower_kos_mem_top(&mut udpsender, running_base, &payload, args.address)
+                    && let Some(disc) = disc_reader.as_deref()
+                {
+                    for (file, found) in dispatch::disc_kos_programs(disc, top) {
+                        match found {
+                            Ok(p) => {
+                                info!(
+                                    "KOS program {file} on the disc: top of RAM lowered to \
+                                     0x{top:08x} too, {} word(s) in the sectors served: {}",
+                                    p.len(),
+                                    p.iter()
+                                        .map(|p| format!("LBA 0x{:08x} +0x{:03x} 0x{:08x}->0x{:08x}", p.lba, p.off, p.was, p.value))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                                disc_patches.extend(p);
+                            }
+                            Err(e) => warn!(
+                                "KOS program {file} on the disc, but {e}: if the title runs it, \
+                                 its heap and stack may reach the loader"
+                            ),
+                        }
+                    }
                 }
                 // After the IP.BIN header, which lands in the dead image these
                 // words belong to once the loader has moved.

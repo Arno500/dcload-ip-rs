@@ -313,7 +313,7 @@
       "--no-marks",
       // "-vv",
       // "--no-vnic",
-      "--loader-dir", "../../../loaders-vnic",
+      // "--loader-base", "0x8cfe0000",
       // "--patch", "0x8c01b3e8=0x8c00fd00",
       // "--boot-ipbin",
       // "--loader-base", "0x8cfe0000",
@@ -324,7 +324,9 @@
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Jet Set Radio v1.002 (2000)(Sega)(PAL)(M4)[!].zip",
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.000 (2001)(Infogrames)(NTSC)(US)[!].zip",
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\NBA 2K2 v1.001 (2001)(Sega)(PAL)[!].zip",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Phantasy Star Online Ver. 2 v1.000 (2002)(Sega)(PAL)(M5)[!][req. serial].zip",
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Phantasy Star Online Ver. 2 v1.000 (2002)(Sega)(PAL)(M5)[!][req. serial].zip",
+      // "C:\\Users\\arnod\\Downloads\\mario64.cdi",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Railroad Tycoon II v1.002 (2000)(Take 2)(PAL)(M3)[!].zip"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -348,7 +350,7 @@
       "192.168.1.130",
       "--infinite",
       "--diag",
-      "--loader-dir", "../../../loaders-vnic-flycast",
+      // "--loader-dir", "loaders-vnic-flycast",
       // Unreal Tournament: its "GAPS" probe (0x8c020582) answers 1 at once, so
       // flycast's BBA is seen as the console's is.
       // "--patch", "0x8c020580=0x000b0009", "--patch", "0x8c020584=0xe300e001",
@@ -360,7 +362,9 @@
       "u-exec",
       // "C:\\Users\\arnod\\Downloads\\dca-liberty-ode.cdi"
       // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Shenmue II v1.001 (2001)(Sega)(PAL)(M4)(Disc 1 of 4)[!].zip",
-      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.000 (2001)(Infogrames)(NTSC)(US)[!].zip",
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Unreal Tournament v1.000 (2001)(Infogrames)(NTSC)(US)[!].zip",
+      // "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\NBA 2K2 v1.001 (2001)(Sega)(PAL)[!].zip",
+      "V:\\Téléchargements\\DreamcastCollectionByGhostwareMulti-region\\Railroad Tycoon II v1.002 (2000)(Take 2)(PAL)(M3)[!].zip"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": {
@@ -464,9 +468,9 @@
       "--host",
       "192.168.1.64",
       "--infinite",
-      "--loader-dir", "../../../loaders-vnic",
+      "--loader-dir", "loaders",
       "u-exec",
-      "$ZED_WORKTREE_ROOT/../../../loaders-vnic/dcload-relocatable.elf"
+      "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
@@ -489,7 +493,7 @@
       "--host",
       "192.168.1.130",
       "u-exec",
-      "$ZED_WORKTREE_ROOT/../../../loaders/dcload-relocatable.elf"
+      "$ZED_WORKTREE_ROOT/loaders/dcload-relocatable.elf"
       // "\\\\wsl.localhost\\Debian\\opt\\toolchains\\dc\\dcload-ip\\target-src\\1st_read\\loader.elf"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",

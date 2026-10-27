@@ -661,10 +661,13 @@ fn join_and_check_path(
     relative: String,
     allow_non_existent: bool,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    // No directory mounted (`--mount`): the file is not there, as dc-tool
+    // answers. A KOS title probes /pc before /cd (Super Mario 64's loader
+    // tries /pc/sm64.bin first) and must get -1, not a host that panics.
     let base = state
         .base_path
         .as_ref()
-        .expect("Base path should not be empty there");
+        .ok_or_else(|| format!("{relative}: no directory is mounted on /pc (--mount)"))?;
 
     let sanitized = sanitize_relative(Path::new(&relative));
 
@@ -791,4 +794,23 @@ pub fn render_console_bytes(data: &[u8]) -> String {
         return format!("{} (le32 0x{w:08x})", hex.join(" "));
     }
     hex.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without `--mount`, opening a /pc file is refused, not a panic: Super
+    /// Mario 64's loader probes /pc/sm64.bin before /cd.
+    #[test]
+    fn a_pc_file_without_a_mount_is_not_there() {
+        let mut state = FSSyscallState {
+            base_path: None,
+            emulated_current_dir: Path::new(".").to_path_buf(),
+            openfiles: vec![],
+            opendirs: vec![],
+        };
+        assert!(open(0, 0o644, "/sm64.bin".into(), &mut state, false).is_err());
+        assert!(unlink("/sm64.bin".into(), &state).is_err());
+    }
 }

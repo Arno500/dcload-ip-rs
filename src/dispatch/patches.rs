@@ -809,10 +809,23 @@ pub fn patch_in_flight(guards: &[GuardWord], dc_address: u32, buf: &mut [u8]) ->
 const KOS_STACK_16M: u32 = 0x8d00_0000;
 const KOS_STACK_32M: u32 = 0x8e00_0000;
 
-/// The two words that lower a KOS binary's top of RAM to `top`, keeping its
-/// heap and stacks below a high loader. `arch_stack_32m` becomes the 16 MB
-/// mirror of `top`, so the memory size test still answers 16 MB. `load` is
-/// where `boot` is loaded (P1).
+/// `THD_KERNEL_STACK_SIZE` (`thread.h`): the kernel thread's stack is the
+/// 64 KB under the top of RAM, and the heap (`mm_sbrk`) stops there.
+const KOS_KERNEL_STACK: u32 = 0x1_0000;
+
+/// The words that lower a KOS binary's top of RAM to `top`, keeping its heap
+/// and stacks below a high loader. `arch_stack_32m` becomes the 16 MB mirror of
+/// `top`, so the memory size test still answers 16 MB. `load` is where `boot`
+/// is loaded (P1).
+///
+/// A KOS built by a toolchain without the 32 MB patch has `_arch_mem_top` as
+/// the constant 0x8d000000 (`arch.h`), not the variable `startup.S` sets: the
+/// kernel thread's stack base (`thd_init`) and the heap's limit (`mm_sbrk`)
+/// are then literals, 0x8cff0000 and 0x8cfeffff (`>=` compiled as `cmp/hi`).
+/// Lowering only the start-up stack under them made `thd_schedule()` find the
+/// kernel thread below its own stack: "Thread stack underrun" at the first
+/// switch, then a double fault for ever (Super Mario 64's loader, KOS 2.2.1).
+/// Every such literal a `mov.l @(disp,PC)` loads moves with the top.
 pub fn kos_mem_top_patches(boot: &[u8], load: u32, top: u32) -> Result<Vec<(u32, u32)>, String> {
     let word = |at: usize| boot.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     // The word a pointer names, if it names one inside the image.
@@ -827,11 +840,54 @@ pub fn kos_mem_top_patches(boot: &[u8], load: u32, top: u32) -> Result<Vec<(u32,
             (named(p16)? == KOS_STACK_16M && named(p32)? == KOS_STACK_32M).then_some((p16, p32))
         })
         .collect();
+    let fixed = KOS_STACK_16M - KOS_KERNEL_STACK;
+    let moved = |w: u32| (w == fixed || w == fixed - 1).then(|| top - KOS_KERNEL_STACK - (fixed - w));
+    let mut constant: Vec<(u32, u32)> = (0..boot.len().saturating_sub(1))
+        .step_by(2)
+        .filter_map(|i| pc_load(le16(boot, i), i))
+        .filter_map(|(_, at)| Some((load + at as u32, moved(word(at)?)?)))
+        .collect();
+    constant.sort_unstable();
+    constant.dedup();
     match found[..] {
-        [(p16, p32)] => Ok(vec![(p16, top), (p32, top.wrapping_add(0x0100_0000))]),
+        [(p16, p32)] => {
+            Ok([vec![(p16, top), (p32, top.wrapping_add(0x0100_0000))], constant].concat())
+        }
         [] => Err("no arch_stack_16m/arch_stack_32m pair in the literal pool".into()),
         _ => Err(format!("{} candidate arch_stack pairs, refusing to guess", found.len())),
     }
+}
+
+/// Where a KOS program ends in RAM, BSS included: KOS's `end`, from the
+/// `memset(_bss_start, 0, end - _bss_start)` of `arch_main` (`init.c`). That
+/// is `mov.l` loads of both into r4 and r6 (directly or through a `mov Rn,r6`)
+/// a few instructions before `sub r4,r6`, `_bss_start` next to the end of the
+/// file. `boot` is loaded at `load`.
+pub fn kos_program_end(boot: &[u8], load: u32) -> Option<u32> {
+    const SUB_R4_R6: u16 = 0x3648;
+    const WINDOW: usize = 8;
+    let p1 = |a: u32| (a & 0x1fff_ffff) | 0x8c00_0000;
+    let file_end = p1(load).wrapping_add(boot.len() as u32);
+    let word = |at: usize| boot.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let mut best: Option<u32> = None;
+    for i in (0..boot.len().saturating_sub(1)).step_by(2).filter(|&i| le16(boot, i) == SUB_R4_R6) {
+        let mut regs: [Option<u32>; 16] = [None; 16];
+        for j in (i.saturating_sub(2 * WINDOW)..i).step_by(2) {
+            let op = le16(boot, j);
+            if let Some((rn, at)) = pc_load(op, j) {
+                regs[rn as usize] = word(at);
+            } else if op & 0xf00f == 0x6003 {
+                // mov Rm,Rn
+                regs[((op >> 8) & 0xf) as usize] = regs[((op >> 4) & 0xf) as usize];
+            }
+        }
+        let (Some(bss), Some(end)) = (regs[4], regs[6]) else { continue };
+        let (bss, end) = (p1(bss), p1(end));
+        if bss.abs_diff(file_end) <= 0x800 && end > bss && end <= 0x8d00_0000 {
+            best = best.max(Some(end));
+        }
+    }
+    best
 }
 
 /// A KOS binary, recognised by the three consecutive aligned words `startup.S`
@@ -1097,6 +1153,48 @@ mod tests {
         assert!(kos_mem_top_patches(&words(&[load + 4, KOS_STACK_16M]), load, 0x8cfe_8000).is_err());
     }
 
+    /// A KOS with a constant top of RAM: the literals derived from it that code
+    /// loads move too; the same words as plain data do not.
+    #[test]
+    fn a_constant_kos_top_of_ram_moves_its_kernel_stack_and_heap_limit() {
+        let load = 0x8c01_0000;
+        let words = |ws: &[u32]| ws.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        // 0: mov.l @(1,PC),r1 ; mov.l @(1,PC),r2 -> 8, 12. 16: the pool pair;
+        // 24, 28: the variables; 32: an unloaded 0x8cff0000.
+        let code = 0xd202_d101u32;
+        let boot = words(&[
+            code, 0x0009_0009, 0x8cff_0000, 0x8cfe_ffff, load + 28, load + 24,
+            KOS_STACK_32M, KOS_STACK_16M, 0x8cff_0000,
+        ]);
+        let got = kos_mem_top_patches(&boot, load, 0x8ce0_0000).expect("found");
+        assert_eq!(
+            got,
+            vec![
+                (load + 28, 0x8ce0_0000),
+                (load + 24, 0x8de0_0000),
+                (load + 8, 0x8cdf_0000),
+                (load + 12, 0x8cde_ffff),
+            ]
+        );
+    }
+
+    /// `arch_main`'s BSS memset, as gcc 14 builds it: `mov.l end,r8 ; mov.l
+    /// _bss_start,r4 ; mov r8,r6 ; jsr ; sub r4,r6`. A `_bss_start` far from the
+    /// file's end is somebody else's subtraction.
+    #[test]
+    fn a_kos_programs_end_is_read_from_its_bss_memset() {
+        let load: u32 = 0x8c01_0000;
+        let ops = |v: &[u16]| v.iter().flat_map(|o| o.to_le_bytes()).collect::<Vec<u8>>();
+        // 0: mov.l @(3,PC),r8 -> 16 ; 2: mov.l @(4,PC),r4 -> 20 ; 4: mov r8,r6
+        // 6: jsr @r1 ; 8: sub r4,r6 ; 10..16: nops ; 16: end ; 20: _bss_start
+        let mut boot = ops(&[0xd803, 0xd404, 0x6683, 0x410b, 0x3648, 9, 9, 9]);
+        boot.extend(0x8c0a_0000u32.to_le_bytes());
+        boot.extend((load + 24).to_le_bytes());
+        assert_eq!(kos_program_end(&boot, load), Some(0x8c0a_0000));
+        let far = [&boot[..20], &(load + 0x4000).to_le_bytes()[..]].concat();
+        assert_eq!(kos_program_end(&far, load), None);
+    }
+
     /// Needs `DCLOAD_TEST_KOS_BIN`: an unscrambled KOS binary loaded at 0x8c010000.
     #[test]
     fn a_real_kos_binary_has_one_top_of_ram() {
@@ -1104,7 +1202,10 @@ mod tests {
         let boot = std::fs::read(p).expect("read");
         assert!(is_kos_binary(&boot));
         let got = kos_mem_top_patches(&boot, 0x8c01_0000, 0x8cfe_8000).expect("found");
-        assert_eq!(got.len(), 2, "{got:x?}");
+        // The pair, plus the kernel stack and heap limit of a constant top.
+        assert!(got.len() == 2 || got.len() == 4, "{got:x?}");
+        let end = kos_program_end(&boot, 0x8c01_0000).expect("its BSS memset");
+        assert!(end > 0x8c01_0000 + boot.len() as u32 && end < 0x8d00_0000, "0x{end:08x}");
     }
 
     /// A raw image of `len` zero bytes with the given words set.

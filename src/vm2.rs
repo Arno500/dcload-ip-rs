@@ -125,6 +125,20 @@ fn warm_up_rounds() -> usize {
         .unwrap_or(WARM_UP_ROUNDS)
 }
 
+/// Rounds the bus gets to settle before `EXEC` when the scan disturbed it
+/// (`settle`): a VM2 told a new game reloads, a slot sent a RESET comes back.
+/// A round is one `DEVINFO` per controller and per slot it reports, paced like
+/// KOS, so about 50 ms with one card: 100 rounds is five seconds at worst,
+/// paid only by a session that needed them. `DCLOAD_VM2_SETTLE_ROUNDS` tunes it.
+const SETTLE_ROUNDS: usize = 100;
+
+fn settle_rounds() -> usize {
+    std::env::var("DCLOAD_VM2_SETTLE_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SETTLE_ROUNDS)
+}
+
 /// How long to leave the Maple bus alone between transactions.
 ///
 /// **KOS never starts two DMA bursts closer together than one vblank.** It
@@ -520,6 +534,11 @@ fn reported_units(frame: &[u8]) -> Vec<u8> {
 }
 
 fn announce_on(bus: &mut impl MapleBus, product: &str, name: Option<&str>) -> Vec<Device> {
+    scan(bus, product, name, settle_rounds())
+}
+
+/// `announce_on` with the number of `settle` rounds given (0: none).
+fn scan(bus: &mut impl MapleBus, product: &str, name: Option<&str>, rounds: usize) -> Vec<Device> {
     let mut told = Vec::new();
     if product.is_empty() {
         debug!("VM2: the disc names no product number, nothing to send");
@@ -530,6 +549,8 @@ fn announce_on(bus: &mut impl MapleBus, product: &str, name: Option<&str>) -> Ve
 
     let payload = set_id_payload(product, name);
     let mut silent = 0;
+    // The bus was left changing: a card reloading a game, a slot reset.
+    let mut disturbed = false;
     // What every slot that was NOT a known card answered. Printed in full only
     // when the scan ends empty: silence then is the one outcome that needs
     // explaining, and a working session does not want eight lines of it.
@@ -601,6 +622,7 @@ fn announce_on(bus: &mut impl MapleBus, product: &str, name: Option<&str>) -> Ve
                      sent a Maple RESET and asked again"
                 ));
                 let _ = bus.transact(port, unit, MAPLE_COMMAND_RESET, &[]);
+                disturbed = true;
                 devinfo = probe(bus, port, unit, MAPLE_COMMAND_DEVINFO).ok();
             }
             let Ok(frame) = probe(bus, port, unit, MAPLE_COMMAND_ALLINFO) else {
@@ -636,6 +658,7 @@ fn announce_on(bus: &mut impl MapleBus, product: &str, name: Option<&str>) -> Ve
             match answer {
                 Some(MAPLE_RESPONSE_OK) => {
                     info!("VM2: {device} switched to {product}");
+                    disturbed = true;
                     told.push(device);
                 }
                 Some(code) => warn!("VM2: {device} refused the game ID (Maple response {code})"),
@@ -657,7 +680,87 @@ fn announce_on(bus: &mut impl MapleBus, product: &str, name: Option<&str>) -> Ve
             debug!("VM2: {line}");
         }
     }
+    if disturbed && rounds > 0 {
+        settle(bus, rounds);
+    }
     told
+}
+
+/// What one round of `settle` saw: each port's reported slots, and which of
+/// them answered `DEVINFO`.
+type BusState = Vec<(u8, Vec<(u8, bool)>)>;
+
+fn bus_state(bus: &mut impl MapleBus) -> BusState {
+    let mut state = Vec::new();
+    for port in 0..4u8 {
+        let Ok(controller) = probe(bus, port, 0, MAPLE_COMMAND_DEVINFO) else { continue };
+        if controller[0] as i8 != MAPLE_RESPONSE_DEVINFO {
+            continue;
+        }
+        let units = reported_units(&controller)
+            .into_iter()
+            .map(|unit| {
+                let ok = probe(bus, port, unit, MAPLE_COMMAND_DEVINFO)
+                    .is_ok_and(|f| f[0] as i8 == MAPLE_RESPONSE_DEVINFO);
+                (unit, ok)
+            })
+            .collect();
+        state.push((port, units));
+    }
+    state
+}
+
+/// Leave the bus as KOS expects to find it, or say why it is not.
+///
+/// A KOS title enumerates the bus at boot and `maple_wait_scan()` waits,
+/// with no time limit, until every port is done. A card still reloading the
+/// game it was just told (a VMUPro), or a slot the controller reports and that
+/// does not answer, kept Super Mario 64 on a black screen before its first
+/// line of code (2026-10-26); unplugging the cards was the only way out. So
+/// after a scan that changed something, the bus is read again until two rounds
+/// in a row agree and every reported slot answers. A slot still silent half way
+/// gets one more RESET. Bounded (`SETTLE_ROUNDS`); never fatal.
+fn settle(bus: &mut impl MapleBus, rounds: usize) {
+    let mut last: Option<BusState> = None;
+    let mut reset: Vec<(u8, u8)> = Vec::new();
+    for round in 1..=rounds {
+        let state = bus_state(bus);
+        let whole = state.iter().all(|(_, units)| units.iter().all(|&(_, ok)| ok));
+        if whole && last.as_ref() == Some(&state) {
+            debug!("VM2: the Maple bus is steady after {round} round(s)");
+            return;
+        }
+        if round == rounds / 2 {
+            for (port, units) in &state {
+                for &(unit, _) in units.iter().filter(|(_, ok)| !ok) {
+                    if !reset.contains(&(*port, unit)) {
+                        debug!("VM2: {}{unit} still silent; sending it a Maple RESET", (b'A' + port) as char);
+                        let _ = bus.transact(*port, unit, MAPLE_COMMAND_RESET, &[]);
+                        reset.push((*port, unit));
+                    }
+                }
+            }
+        }
+        last = Some(state);
+    }
+    let mute: Vec<String> = last
+        .iter()
+        .flatten()
+        .flat_map(|(port, units)| {
+            units.iter().filter(|(_, ok)| !ok).map(move |(u, _)| format!("{}{u}", (b'A' + port) as char))
+        })
+        .collect();
+    if mute.is_empty() {
+        warn!("VM2: the Maple bus was still changing after {rounds} rounds; starting the title anyway");
+    } else {
+        warn!(
+            "VM2: {} reported by its controller but not answering, even after a Maple RESET. \
+             A title that enumerates the bus at boot (every KOS title) can wait for it \
+             forever on a black screen: unplug that card (and a VMUPro, restart it), \
+             plug it back, and run again",
+            mute.join(", ")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -779,6 +882,12 @@ mod tests {
         bare_ports: Vec<u8>,
         /// Slots that answer as empty until they are sent a Maple RESET.
         needs_reset: Vec<(u8, u8)>,
+        /// Transactions a card answers as empty after taking a game ID, as a
+        /// VMUPro does while it loads that game's cards.
+        reload: usize,
+        reloading: Vec<((u8, u8), usize)>,
+        /// Slots the controller reports that never answer, RESET or not.
+        stuck: Vec<(u8, u8)>,
         log: Vec<(u8, u8, u8, usize)>,
     }
 
@@ -793,6 +902,9 @@ mod tests {
                 garbage_first: 0,
                 bare_ports: Vec::new(),
                 needs_reset: Vec::new(),
+                reload: 0,
+                reloading: Vec::new(),
+                stuck: Vec::new(),
                 log: Vec::new(),
             }
         }
@@ -837,7 +949,11 @@ mod tests {
                 self.needs_reset.retain(|s| *s != (port, unit));
                 return Ok(vec![MAPLE_RESPONSE_OK as u8, 0, 0, 0]);
             }
-            if self.needs_reset.contains(&(port, unit)) {
+            if self.needs_reset.contains(&(port, unit)) || self.stuck.contains(&(port, unit)) {
+                return Ok(vec![0xff, 0, 0, 0]);
+            }
+            if let Some((_, left)) = self.reloading.iter_mut().find(|(slot, n)| *slot == (port, unit) && *n > 0) {
+                *left -= 1;
                 return Ok(vec![0xff, 0, 0, 0]);
             }
             let card = self.cards.iter().find(|(slot, _)| *slot == (port, unit)).map(|(_, e)| *e);
@@ -877,6 +993,7 @@ mod tests {
                         self.busy -= 1;
                         return Ok(vec![MAPLE_RESPONSE_AGAIN as u8, 0, 0, 0]);
                     }
+                    self.reloading.push(((port, unit), self.reload));
                     Ok(vec![MAPLE_RESPONSE_OK as u8, 0, 0, 0])
                 }
                 // Nothing at that address.
@@ -955,7 +1072,7 @@ mod tests {
     fn one_silent_slot_does_not_end_the_scan() {
         let mut console = Console::with(vec![((1, 2), b"8BITMODS VMUPro ".as_slice())]);
         console.silent = vec![(0, 0)];
-        let told = announce_on(&mut console, "MK-51035", None);
+        let told = scan(&mut console, "MK-51035", None, 0);
         assert_eq!(told, vec![Device { port: 1, unit: 2, kind: "VMUPro" }]);
         assert_eq!(console.ports_asked(), vec![0, 1, 2, 3], "all four still asked");
     }
@@ -1084,11 +1201,60 @@ mod tests {
     fn nonsense_forever_is_bounded() {
         let mut console = Console::with(vec![((0, 1), b"8BITMODS VMUPro ".as_slice())]);
         console.garbage_first = usize::MAX;
-        assert!(announce_on(&mut console, "MK-51035", None).is_empty());
+        assert!(scan(&mut console, "MK-51035", None, 0).is_empty());
         // DEVINFO re-asked, a RESET, DEVINFO re-asked again, ALLINFO re-asked:
         // bounded, and every one of them accounted for.
         let asked = console.log.iter().filter(|e| e.1 == 1 && e.0 == 0).count();
         assert_eq!(asked, 3 * PROBE_TRIES + 1, "{:?}", console.log);
+    }
+
+    /// A VM2 that reloads after taking the game ID is waited for: the title
+    /// starts on a bus where every reported slot answers.
+    #[test]
+    fn a_card_reloading_its_game_is_waited_for() {
+        let mut console = Console::with(vec![
+            ((0, 1), b"8BITMODS VMUPro ".as_slice()),
+            ((0, 2), b"Version 1.005,1999/10/26,315-6208".as_slice()),
+        ]);
+        console.reload = 12;
+        let told = scan(&mut console, "MK-51035", None, 100);
+        assert_eq!(told.len(), 1);
+        let set_id = console.log.iter().position(|e| e.2 == VM2_COMMAND_SET_ID).expect("set");
+        let after = &console.log[set_id + 1..];
+        // It answered again before the end, and was never reset for being slow.
+        assert!(console.reloading.iter().all(|(_, left)| *left == 0), "{:?}", console.reloading);
+        assert!(!after.iter().any(|e| e.2 == MAPLE_COMMAND_RESET));
+        assert!(after.iter().filter(|e| (e.0, e.1) == (0, 1) && e.2 == MAPLE_COMMAND_DEVINFO).count() > 12);
+        assert!(after.len() < 100, "settled long before the bound: {}", after.len());
+    }
+
+    /// A slot that never comes back is bounded, gets one more RESET half
+    /// way, and the title starts anyway.
+    #[test]
+    fn a_slot_that_never_answers_is_bounded() {
+        let mut console = Console::with(vec![
+            ((0, 1), b"8BITMODS VMUPro ".as_slice()),
+            ((0, 2), b"Version 1.005,1999/10/26,315-6208".as_slice()),
+        ]);
+        console.stuck = vec![(0, 2)];
+        assert_eq!(scan(&mut console, "MK-51035", None, 10).len(), 1);
+        let resets = console.log.iter().filter(|e| (e.0, e.1, e.2) == (0, 2, MAPLE_COMMAND_RESET)).count();
+        assert_eq!(resets, 2, "one in the scan, one while settling");
+        let rounds = console.log.iter().filter(|e| (e.0, e.1, e.2) == (1, 0, MAPLE_COMMAND_DEVINFO)).count();
+        assert_eq!(rounds, WARM_UP_ROUNDS + 1 + 10, "warm-up, scan, then exactly the bound");
+    }
+
+    /// A scan that changed nothing costs nothing more.
+    #[test]
+    fn an_undisturbed_bus_is_not_read_again() {
+        let mut console = Console::with(vec![((1, 2), b"Version 1.005,1999/10/26,315-6208".as_slice())]);
+        let before = {
+            let mut c = Console::with(vec![((1, 2), b"Version 1.005,1999/10/26,315-6208".as_slice())]);
+            scan(&mut c, "MK-51035", None, 0);
+            c.log.len()
+        };
+        assert!(scan(&mut console, "MK-51035", None, 100).is_empty());
+        assert_eq!(console.log.len(), before);
     }
 
     /// The sender byte of a port's main device is the only place that says

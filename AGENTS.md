@@ -144,7 +144,7 @@ A/B loader sets go in a directory of their own, passed with `--loader-dir`.
 | `DCLOAD_ZERO_LBA`, `DCLOAD_REDIRECT_ABOVE` / `_TO` | diagnostics: blank one LBA; redirect reads above an address |
 | `DCLOAD_LOAD_BAR_KB` (256, 0 = off), `DCLOAD_LOAD_IDLE_MS` (250) | in-game loading bar |
 | `DCLOAD_ZIP_INDEX_BUDGET` | MiB of deflate checkpoints per zip member (default 64) |
-| `DCLOAD_VM2_PACE_MS`, `DCLOAD_VM2_WARMUP` | VM2 scan pacing and warm-up rounds (§11) |
+| `DCLOAD_VM2_PACE_MS`, `DCLOAD_VM2_WARMUP`, `DCLOAD_VM2_SETTLE_ROUNDS` | VM2 scan pacing, warm-up and settling rounds (§11) |
 | `DCLOAD_TEST_ORIG`, `DCLOAD_TEST_PATCHED`, `DCLOAD_TEST_CDI`, `DCLOAD_TEST_KOS_BIN` | inputs of tests that need real dumps |
 
 ## 3. Tests
@@ -447,8 +447,19 @@ upload, verified, re-applied on reload, and listed by `identify`
   | Unreal Tournament | `0x8c313740..0x8cfdd000` | `0x8c05b1f8` (sbInitSystem, and a function sizing it again from the same pool), `0x8c05b2a0` (a second set-up) | `0x8cfc0000`; at `0x8c940000` (middle of unread RAM) silent after seven sector reads (2026-10-11). Its stack is moved to `0x8d000000`, above the heap. Not measured |
   | Snow Surfers | `0x8c1eaec0..0x8d000000` | `0x8c081c70`, `0x8c081d7c` (two sbInitSystems) | moves off `0x8ce00000`, where every CD-DA session ran inside the heap, to the top under what it names. Not measured |
 
-- **KOS** (`is_kos_binary`). The loader is told via `g_gd_kos`; KOS's top of
-  RAM is lowered under the loader (`kos_mem_top_patches`); the dcload magic at
+- **KOS** (`is_kos_binary`). The loader goes to the top of RAM, 0x8cff0000
+  (`wanted_loader_base_by_rules`): a KOS program fills RAM from its image up
+  (code, BSS its start-up zeroes, heap), and Super Mario 64's `SM64.BIN` ends
+  its BSS at 0x8ce6dfe0 (`kos_program_end`, read from `arch_main`'s BSS
+  memset; `disc_kos_program_ends`), over a loader at 0x8ce00000. The loader is told via `g_gd_kos`; KOS's top of
+  RAM is lowered under the loader (`kos_mem_top_patches`: startup's stack
+  pair, and, for a KOS built without the 32 MB toolchain patch, whose
+  `_arch_mem_top` is the constant 0x8d000000, the loaded literals 0x8cff0000 /
+  0x8cfeffff of the kernel thread's stack and `mm_sbrk`'s limit — lowering the
+  stack alone is "Thread stack underrun" at the first switch). The same words
+  change in the sectors served of every other KOS program of the disc's root
+  (`disc_kos_programs`): Super Mario 64's `1ST_READ.BIN` reads `SM64.BIN`
+  and `arch_exec`s it at 0x8c010000. The dcload magic at
   `0x8c004004` is pointed at the live loader (`update_dcload_magic`) so KOS's
   console reaches this host.
 
@@ -669,6 +680,14 @@ them in step).
   reports (`slots_reported`, from the sender byte) but that answers empty gets
   a Maple reset and one more try. Every rejected slot is explained
   (`explain`).
+- **The bus settles before `EXEC`** (`settle`, 2026-10-26): after a scan that
+  told a card a game (a VMUPro reloads) or reset a slot, every controller and
+  reported slot is read again, paced, until two rounds agree and every slot
+  answers, with one more reset half way; at most `SETTLE_ROUNDS` (100,
+  `DCLOAD_VM2_SETTLE_ROUNDS`), then a warning naming the silent slot. A KOS
+  title's `maple_wait_scan()` waits with no limit for every port: started on
+  a card still reloading, Super Mario 64 stayed on a black screen until the
+  cards were unplugged.
 - **Open (2026-09-20)**: on the test console a VMUPro in controller A's slot 1
   is still not found — the first transaction to it returns 32 bytes of
   non-frame data and port A's slots then answer empty, while port B works.

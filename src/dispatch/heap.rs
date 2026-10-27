@@ -1000,6 +1000,79 @@ pub fn disc_katana_heaps(disc: &dyn DiscFormat) -> Vec<DiscHeap> {
     out
 }
 
+/// Where each KOS program of the boot area's root other than the boot binary
+/// ends in RAM, run from 0x8c010000 (`kos_program_end`).
+pub fn disc_kos_program_ends(disc: &dyn DiscFormat) -> Vec<(String, u32)> {
+    disc_kos_files(disc)
+        .into_iter()
+        .filter_map(|(name, _, bytes)| kos_program_end(&bytes.ok()?, KATANA_LOAD).map(|e| (name, e)))
+        .collect()
+}
+
+/// The KOS programs of the boot area's root other than the boot binary: name,
+/// first LBA and contents.
+fn disc_kos_files(disc: &dyn DiscFormat) -> Vec<(String, u32, Result<Vec<u8>, String>)> {
+    let root = crate::disc_formats::iso9660::list_root(disc, disc.boot_sector());
+    let boot = crate::disc_formats::types::ip_bin_at(disc, disc.boot_sector())
+        .and_then(|h| crate::disc_formats::iso9660::boot_file_name(&h));
+    let mut out = vec![];
+    for e in root.iter().filter(|e| {
+        !e.is_dir
+            && e.name.to_ascii_uppercase().ends_with(".BIN")
+            && e.size >= SCAN_BYTES
+            && e.size <= crate::disc_formats::iso9660::MAX_FILE_BYTES
+            // Scrambled on the disc: its sectors are not its bytes.
+            && !boot.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(&e.name))
+    }) {
+        // startup.S's dcload probe is in the first bytes.
+        let Ok(head) = disc.read_sector(e.lba, SCAN_BYTES / 2048) else { continue };
+        if !is_kos_binary(&head) {
+            continue;
+        }
+        let bytes = disc
+            .read_sector(e.lba, e.size.div_ceil(2048))
+            .map(|mut b| {
+                b.truncate(e.size as usize);
+                b
+            })
+            .map_err(|err| format!("could not read it: {err}"));
+        out.push((e.name.clone(), e.lba, bytes));
+    }
+    out
+}
+
+/// The KOS programs of the boot area's root other than the boot binary, with
+/// the words that lower their top of RAM to `top` (`kos_mem_top_patches`) as
+/// changes to the sectors served, or why not. A KOS boot binary that loads
+/// another KOS program and `arch_exec`s it at 0x8c010000 (Super Mario 64's
+/// `1ST_READ.BIN` reading `SM64.BIN`) hands the console to a startup the
+/// upload never saw: its heap and stack would reach the loader again.
+pub fn disc_kos_programs(disc: &dyn DiscFormat, top: u32) -> Vec<(String, Result<Vec<DiscPatch>, String>)> {
+    disc_kos_files(disc)
+        .into_iter()
+        .map(|(name, lba, bytes)| {
+            let patches = bytes.and_then(|bytes| {
+                let words = kos_mem_top_patches(&bytes, KATANA_LOAD, top)?;
+                Ok(words
+                    .into_iter()
+                    .map(|(at, value)| {
+                        let off = at - KATANA_LOAD;
+                        let o = off as usize;
+                        DiscPatch {
+                            file: name.clone(),
+                            lba: lba + off / 2048,
+                            off: o % 2048,
+                            was: u32::from_le_bytes(bytes[o..o + 4].try_into().expect("4 bytes")),
+                            value,
+                        }
+                    })
+                    .collect())
+            });
+            (name, patches)
+        })
+        .collect()
+}
+
 impl DiscHeap {
     /// The constants of this program, run from 0x8c010000, that an instruction
     /// loads and that name RAM a loader at `base` occupies: what the placement
@@ -1064,6 +1137,25 @@ pub fn patch_disc_read(patches: &[DiscPatch], start: u32, buf: &mut [u8]) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs `DCLOAD_TEST_KOS_CDI`: a disc whose KOS boot binary runs another
+    /// KOS program (Super Mario 64: `SM64.BIN`). Its four words land in its
+    /// sectors, each found there as `was`; the scrambled boot binary is left out.
+    #[test]
+    fn a_kos_program_on_the_disc_has_its_top_of_ram_lowered() {
+        let Ok(p) = std::env::var("DCLOAD_TEST_KOS_CDI") else { return };
+        let src = crate::disc_formats::source::FileSource::open(std::path::Path::new(&p)).expect("open");
+        let cdi = crate::disc_formats::cdi::Cdi::new(Box::new(src)).expect("parse cdi");
+        assert_eq!(disc_kos_program_ends(&cdi), vec![("SM64.BIN".to_string(), 0x8ce6_dfe0)]);
+        let found = disc_kos_programs(&cdi, 0x8cff_0000);
+        assert_eq!(found.len(), 1, "{:?}", found.iter().map(|f| &f.0).collect::<Vec<_>>());
+        let patches = found[0].1.as_ref().expect("patched");
+        assert_eq!(patches.len(), 4, "{patches:x?}");
+        for d in patches {
+            let mut s = cdi.read_sector(d.lba, 1).expect("sector");
+            assert_eq!(patch_disc_read(std::slice::from_ref(d), d.lba, &mut s), 1, "{d:x?}");
+        }
+    }
 
     /// Shenmue II's pool (PAL 1.001, 1ST_READ at 0x8c010000), at 0x8c051968.
     fn shenmue2_like() -> Vec<u8> {

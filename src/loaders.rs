@@ -914,9 +914,12 @@ pub fn parse_version_payload(data: &[u8], size: usize) -> VersionReply {
     }
 }
 
-/// RAM is 0x8c000000..0x8d000000, and a loader has to leave room for itself.
+/// RAM is 0x8c000000..0x8d000000, and a loader has to leave room for itself:
+/// up to the last 64 KB of RAM included: a high loader there ends exactly at
+/// 0x8d000000, and that is where a KOS title wants it (its RAM in one piece
+/// under it). `search_free_base` already had that ceiling; this refused it.
 fn plausible_base(addr: u32) -> bool {
-    (0x8c00_0000..0x8cff_0000).contains(&addr) && addr % 4 == 0
+    (0x8c00_0000..=0x8d00_0000 - LOADER_SPAN).contains(&addr) && addr % 4 == 0
 }
 
 /// Climb from `start` looking for the directory that holds `Cargo.toml`.
@@ -1890,6 +1893,21 @@ mod tests {
                 loadable(&native),
                 "relocated to 0x{base:08x} is not the native link"
             );
+        }
+    }
+
+    /// The last 64 KB of RAM is a base (a KOS title's), and its span ends
+    /// exactly at the end of RAM; one step further is not.
+    #[test]
+    fn the_top_of_ram_is_a_base() {
+        let top = 0x8d00_0000 - LOADER_SPAN;
+        assert!(could_relocate_to(top));
+        assert_eq!(live_footprint(top), vec![(top, 0x8d00_0000)]);
+        assert!(relocate(&tiny_elf(0x8ce0_0000, 0x8ce0_1234), top).is_ok());
+        assert!(!could_relocate_to(top + FREE_BASE_STEP));
+        let set = LoaderSet::discover(None);
+        if let Some(Ok(src)) = set.relocatable().map(std::fs::read) {
+            relocate(&src, top).expect("the relocatable image at the top of RAM");
         }
     }
 
