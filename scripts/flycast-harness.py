@@ -118,6 +118,50 @@ def kill_all():
             raise HarnessError(f"{name} survived taskkill; refusing to start another")
 
 
+def close_flycast(timeout=8.0):
+    """Ask every flycast window to close before anything kills it. flycast
+    writes a VMU block with an unflushed `fwrite` and flushes only at `fclose`,
+    so `taskkill /F` drops the last writes of a run: the card left behind had
+    a directory naming blocks its FAT gave to the next title's file (2026-10-29,
+    Crazy Taxi's file over Super Mario 64's, "Échec du chargement" at boot,
+    Sonic Adventure hanging on "create file 1")."""
+    pids = running("flycast.exe")
+    for pid in pids:
+        hwnd = flycast_window(pid)
+        if hwnd:
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    deadline = time.monotonic() + timeout
+    while pids and running("flycast.exe") and time.monotonic() < deadline:
+        time.sleep(0.25)
+
+
+def cdi_product(cdi):
+    """The product number of the dcload CDI's IP.BIN: flycast names the per-game
+    A1 card after it (`<product>_vmu_save_A1.bin`)."""
+    with open(cdi, "rb") as fh:
+        data = fh.read(8 << 20)
+    at = data.find(b"SEGA SEGAKATANA ")
+    if at < 0:
+        return None
+    return data[at + 0x40:at + 0x4a].decode("ascii", "replace").strip() or None
+
+
+def fresh_card(flycast_dir, cdi, out_dir):
+    """Give the run a blank A1 card: the one left by earlier runs goes into the
+    run's directory (vmu-A1-before.bin) and flycast formats a new one, so a
+    title meets the same card every run and a save one run broke cannot fail
+    the next. Returns the card's path, copied out as vmu-A1-after.bin later."""
+    product = cdi_product(cdi)
+    if not product:
+        log(f"WARNING: no IP.BIN product in {cdi}; the A1 card is left as it is")
+        return None
+    name = re.sub(r'[ /\\:*?|<>"]', "_", product) + "_vmu_save_A1.bin"
+    card = flycast_dir / "data" / name
+    if card.exists():
+        shutil.move(str(card), str(out_dir / "vmu-A1-before.bin"))
+    return card
+
+
 class HarnessError(Exception):
     pass
 
@@ -647,6 +691,7 @@ class Run:
         self.exec_t = None
         self.flycast = None
         self.host = None
+        self.card = None
 
     def now(self):
         return round(time.monotonic() - self.t0, 1)
@@ -663,8 +708,10 @@ class Run:
 
     def start_flycast(self):
         o = self.o
+        close_flycast()
         kill_all()
         assert_emu_cfg(o.flycast_dir)
+        self.card = None if o.keep_card else fresh_card(o.flycast_dir, o.cdi, self.dir)
         flog = o.flycast_dir / "flycast.log"
         try:
             flog.unlink()
@@ -907,6 +954,10 @@ class Run:
     def stop(self):
         if self.exec_t is not None and self.flycast and self.flycast.poll() is None:
             self.probe(save_as="final.png", step=1)
+        if self.host and self.host.poll() is None:
+            self.host.kill()
+        if self.flycast and self.flycast.poll() is None:
+            close_flycast()
         for p in (self.host, self.flycast):
             if p and p.poll() is None:
                 p.kill()
@@ -925,6 +976,11 @@ class Run:
             shutil.copyfile(self.o.flycast_dir / "flycast.log", self.dir / "flycast.log")
         except OSError:
             pass
+        if self.card:
+            try:
+                shutil.copyfile(self.card, self.dir / "vmu-A1-after.bin")
+            except OSError:
+                pass
 
     def execute(self):
         log(f"=== {self.image.name}")
@@ -990,6 +1046,9 @@ def setup_options(ap):
                     help="options for dcload-ip-rs before the subcommand, e.g. '--no-marks'")
     ap.add_argument("--learn", action="store_true",
                     help="let the runs write the real game-memory.tsv")
+    ap.add_argument("--keep-card", action="store_true",
+                    help="boot on the A1 card the last run left (default: a blank card per "
+                         "run, the old one kept as vmu-A1-before.bin)")
     ap.add_argument("--ra", action="store_true",
                     help="keep RetroAchievements on (reports to retroachievements.org)")
     run_options(ap)
@@ -1074,7 +1133,7 @@ def cmd_start(argv):
         "host_pid": run.host and run.host.pid, "host_log": str(out / "host.log"),
         "flycast_log": str(o.flycast_dir / "flycast.log"), "exec_s": ms.get("exec"),
         "started": run.r["started"], "stale_host": stale, "host_exe": str(o.host_exe),
-        "loader_dir": str(o.loader_dir),
+        "loader_dir": str(o.loader_dir), "card": str(run.card) if run.card else None,
     }
     SESSION.parent.mkdir(parents=True, exist_ok=True)
     SESSION.write_text(json.dumps(session, indent=2), encoding="utf-8")
@@ -1224,12 +1283,18 @@ def cmd_stop(argv):
         s = load_session()
     except SystemExit:
         pass
+    close_flycast()
     kill_all()
     if s:
         try:
             shutil.copyfile(s["flycast_log"], Path(s["dir"]) / "flycast.log")
         except OSError:
             pass
+        if s.get("card"):
+            try:
+                shutil.copyfile(s["card"], Path(s["dir"]) / "vmu-A1-after.bin")
+            except OSError:
+                pass
         SESSION.unlink(missing_ok=True)
         print(f"stopped; logs in {s['dir']}")
     else:
@@ -1272,8 +1337,13 @@ def main():
             # The harness's per-run options; anything else goes to u-exec.
             sub = argparse.ArgumentParser(add_help=False)
             run_options(sub)
+            # Global options of dcload-ip-rs (--loader-base, ...) must come
+            # before the subcommand: a line gives them with --host-global too.
+            sub.add_argument("--host-global")
             per, unknown = sub.parse_known_args(shlex.split(extra, posix=False),
                                                 namespace=argparse.Namespace(**vars(o)))
+            if isinstance(per.host_global, str):
+                per.host_global = o.host_global + shlex.split(per.host_global.strip('"'))
             per.host_extra = o.host_extra + [a for a in unknown if a != "--"]
             jobs.append((Path(path.strip().strip('"')), per))
     if o.dir:

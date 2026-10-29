@@ -42,8 +42,11 @@ ADPCM decoding).
    - Presets below `0x8c004000` cannot be built; a split vote including one
      (`low_family_contested`) or a low base the set cannot provide
      (`LoaderSet::can_provide`) moves the loader off the low family. A high
-     preset refused by the constant scan is read as a window
-     (`preset_window_base`). Off the low family the search starts at
+     preset refused by the constant scan is **not** read as a window any more
+     (the loader against the lowest address named above the preset): that
+     put 51 KB of the span in RAM isoldr never vouched for, and Crazy Taxi
+     PAL writes 36 bytes at `0x8cfe7fc0`, between two witness words
+     (flycast, 2026-10-29). Off the low family the search starts at
      `ISOLDR_HIGH_ADDR` for a known title, `SCRATCH_BASE` otherwise.
    - Windows CE (§5) and KOS (§5) titles have their own rules, and so does a
      title with an HLib heap (§5): the loader goes at its bottom. A base the
@@ -176,7 +179,14 @@ to gameplay step by step: `start <image>`, `screen [png]`, `peek <addr> [len]`,
 come from `wsl -d Debian -- bash scripts/flycast-build-loader.sh` (a static
 192.168.1.130, since DHCP never completes through flycast's bridge; built in a
 copy of the loader tree; `dcload-resident-net.elf` does not fit with a static
-IP and is left out). The harness copies `game-memory.tsv` per run (`--learn`
+IP and is left out). **Each run boots on a blank A1 card** (`--keep-card` to
+keep it): the CDI's card (`<product>_vmu_save_A1.bin` in flycast's `data/`)
+moves into the run directory (`vmu-A1-before.bin`, `-after.bin` at the end)
+and flycast formats a new one; flycast is asked to close (WM_CLOSE) before it
+is killed, since it writes card blocks with an unflushed `fwrite` and a
+`taskkill` lost the last ones -- a FAT naming blocks twice failed Crazy Taxi's
+load and froze Sonic Adventure's "create file" (2026-10-29). A `--list` line
+takes `--host-global "..."` for options that go before `u-exec`. The harness copies `game-memory.tsv` per run (`--learn`
 writes the real one), and passes `--no-ra --no-vm2 --keepalive 0` (keepalive
 ended a live session at a title screen). **Any GDB connection makes flycast
 halt for good at the guest's next illegal instruction** (`attached` is never

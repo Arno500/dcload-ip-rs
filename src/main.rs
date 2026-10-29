@@ -707,57 +707,6 @@ fn region_reaching_loader(boot: &[u8], address: u32, base: u32) -> Option<u32> {
         .find(|&c| lo <= c && c < hi)
 }
 
-/// Where the loader goes when DreamShell's preset is right about the RAM but
-/// our loader is too big for it.
-///
-/// A PRESET IS A WINDOW, NOT ONLY AN ADDRESS. DreamShell's `memory` is where
-/// isoldr ran for this title, and isoldr is 13 KB: what the preset tells us is
-/// that the title leaves `preset..` alone for at least that far. The title's
-/// own constants say where the window ends -- the lowest address it names
-/// above the preset. When our 64 KB span does not fit (the case where the
-/// constant scan refuses the preset itself), the least surprising place is
-/// against that ceiling: the most of our span inside the window, the least
-/// below it.
-///
-/// Shenmue II: preset 0x8cfe8000, ceiling 0x8cff0000 (its Maple DMA list, as
-/// for Sonic Adventure 2), so 0x8cfe0000 -- measured to run where the old
-/// search's 0x8cfd0000 reset the console (2026-09-30).
-///
-/// Tested with no margin against the map, like a preset: a margin is a guess
-/// about an allocator heading somewhere, and this candidate is DreamShell's
-/// evidence. Everything else `base_is_clear` asks still applies, the region
-/// rule included -- it is what refuses 0x8cfd0000 for Shenmue II.
-fn preset_window_base(
-    loaders: &loaders::LoaderSet,
-    boot: &[u8],
-    address: u32,
-    preset: u32,
-    seen: Option<&memmap::MemoryMap>,
-    sp_min: Option<u32>,
-) -> Option<(u32, u32)> {
-    if !loaders::is_high(preset) {
-        return None;
-    }
-    let ceiling = preset_window_ceiling(boot, address, preset)?;
-    let base = ceiling.checked_sub(loaders::LOADER_SPAN)? & !(loaders::LAYOUT_PAGE - 1);
-    if base == preset || !loaders::is_high(base) || !loaders.can_provide(base) {
-        return None;
-    }
-    base_is_clear(loaders, boot, address, base, seen, sp_min, 0).then_some((base, ceiling))
-}
-
-/// The lowest RAM address above `preset` the title names: a loaded literal or
-/// a region start.
-fn preset_window_ceiling(boot: &[u8], address: u32, preset: u32) -> Option<u32> {
-    let loaded = dispatch::loaded_literals_in(boot, address, &[(preset + 1, 0x8d00_0000)])
-        .into_iter()
-        .map(|(at, _)| at);
-    let regions = dispatch::region_starts(boot, address)
-        .into_iter()
-        .filter(|&c| c > preset);
-    loaded.chain(regions).min()
-}
-
 /// Does a loader at `base` fit under this title's stack?
 ///
 /// THE THIRD TEST, AND THE ONLY ONE THAT SEES A STACK. The other two look for
@@ -1838,28 +1787,18 @@ fn wanted_loader_base_by_rules(
              asks for, though nothing in its binary names it. Looking for somewhere else.",
             preset.title, preset.memory
         );
-    } else if let Some((alt, ceiling)) = preset_window_base(
-        &loaders,
-        &boot,
-        args.address,
-        preset.memory,
-        seen.as_ref(),
-        sp_min,
-    ) {
-        // THE PRESET'S WINDOW, when only our size is the problem. See
-        // `preset_window_base`.
-        warn!(
-            "'{}': its preset 0x{:08x} is where DreamShell's 13 KB loader ran, and the \
-             title names 0x{ceiling:08x} just above it (the constant at 0x{:08x}), so a 64 KB \
-             loader does not fit there. Using 0x{alt:08x}, against that ceiling: as much of \
-             the preset's free window as possible, and nothing the title is known to use. Pin \
-             it with --loader-base to override.",
-            preset.title,
-            preset.memory,
-            hits[0].1,
-        );
-        return Some(alt);
     }
+    // NOT THE PRESET'S WINDOW. A high preset refused by the constant scan used
+    // to be read as a window: the loader went against the lowest address the
+    // title names above the preset, which puts 51 KB of our 64 KB span under
+    // the preset, in RAM DreamShell's 13 KB isoldr never vouched for. Crazy
+    // Taxi PAL: preset 0x8cfe8000, ceiling 0x8cff0000, so 0x8cfe0000, and the
+    // title writes 36 bytes at 0x8cfe7fc0 (between two witness words, so the
+    // marks never see it): the loader's `_irq_tick` overwritten, the SH4 at
+    // address 0 within a second of the first reads (flycast, 2026-10-29). The
+    // one title measured to run that way, Shenmue II, is placed by its HLib
+    // heap since. What `pick_clear_base` chooses below (0x8cfd0000 for Crazy
+    // Taxi) reaches gameplay, as does 0x8cf00000.
     match pick_clear_base(
         &loaders,
         &boot,
@@ -2889,9 +2828,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
             (None, None) => info!("startup  : no fill of a constant range found"),
         }
     }
-    // `is_preset`: `base` is the title's own preset, whose window is tried
-    // first (`preset_window_base`), as `uexec` does.
-    let report_collisions = |base: u32, is_preset: bool| {
+    let report_collisions = |base: u32| {
         let Some(bytes) = boot_bytes.as_deref() else {
             return;
         };
@@ -2920,18 +2857,6 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
         // cannot drift from what a run would actually do. The answer is what
         // the reader actually needs; without it "pick another base" is an
         // invitation to guess, and a guess costs a session per attempt.
-        if is_preset
-            && let Some((alt, ceiling)) =
-                preset_window_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min)
-        {
-            info!(
-                "           uexec would use 0x{alt:08x} instead: the top of the preset's \
-                 window, under 0x{ceiling:08x}, the lowest address the title names above it \
-                 (relocating {} there -- no rebuild).",
-                loaders::RELOCATABLE_NAME
-            );
-            return;
-        }
         match pick_clear_base(&loaders, bytes, args.address, base, seen.as_ref(), sp_min) {
             Some(alt) => info!(
                 "           uexec would use 0x{alt:08x} instead ({}).",
@@ -2961,7 +2886,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
              upload; the preset is not consulted",
             if args.wince_loader_top { "the top" } else { "the bottom" }
         );
-        report_collisions(base, false);
+        report_collisions(base);
         return ExitCode::SUCCESS;
     }
     let (db_path, db_searched) = game_db_path(args, &loaders);
@@ -2994,7 +2919,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             db.len(),
                             loaders::DEFAULT_BASE
                         );
-                        report_collisions(alt, false);
+                        report_collisions(alt);
                     }
                     None => {
                         info!(
@@ -3003,7 +2928,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                             db.len(),
                             loaders::DEFAULT_BASE
                         );
-                        report_collisions(loaders::DEFAULT_BASE, false);
+                        report_collisions(loaders::DEFAULT_BASE);
                     }
                 }
             }
@@ -3013,7 +2938,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                     db.len(),
                     loaders::DEFAULT_BASE
                 );
-                report_collisions(loaders::DEFAULT_BASE, false);
+                report_collisions(loaders::DEFAULT_BASE);
             }
             Some((p, kind)) => {
                 let how = match kind {
@@ -3073,7 +2998,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                                 loaders::ISOLDR_DEFAULT_ADDR,
                                 loaders::ISOLDR_HIGH_ADDR
                             );
-                            report_collisions(alt, false);
+                            report_collisions(alt);
                         }
                         None => info!(
                             "would use: nothing clear of this title could be produced; the \
@@ -3128,7 +3053,7 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                                  workable",
                                 loaders::ISOLDR_HIGH_ADDR
                             );
-                            report_collisions(alt, false);
+                            report_collisions(alt);
                         }
                         None => {
                             info!(
@@ -3136,11 +3061,11 @@ fn identify_only(args: &Args, disc: &str) -> ExitCode {
                                  the preset's 0x{:08x} would be used anyway",
                                 p.memory
                             );
-                            report_collisions(p.memory, false);
+                            report_collisions(p.memory);
                         }
                     }
                 } else {
-                    report_collisions(p.memory, true);
+                    report_collisions(p.memory);
                 }
             }
         },
