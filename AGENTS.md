@@ -164,6 +164,26 @@ Past `EXEC`, verification needs a console or flycast. Without one:
 Python UDP stub on `127.0.0.1:53535` that answers `VERS`, echoes `LBIN` and
 answers `DBIN` with the first missing part can drive a whole `upload`.
 
+**flycast harness** (`scripts/flycast-harness.py`, Windows Python, stdlib
+only): boots flycast on a static-IP dcload CDI and runs `u-exec` on an image.
+Batch mode (`<images>`, `--dir`, `--list scripts/flycast-games.txt`) watches each
+title for `--duration` s after EXEC, presses `--input` keys (`TIME:KEY[*N][:HOLD]`, milliseconds), and writes a
+verdict (`RUNNING`, `FROZEN`, `BLACK`, `LOADER_HIT`, `CRASH`, `BIOS_MENU`, …),
+screenshots and logs to `harness-runs/`. Interactive mode, for driving a title
+to gameplay step by step: `start <image>`, `screen [png]`, `peek <addr> [len]`,
+`press <key>...`, `status`, `check` (CPU state, PC named in the loader, loader
+`.text` vs its relocated ELF), `stop`. The CDI and the `loaders-flycast/` set
+come from `wsl -d Debian -- bash scripts/flycast-build-loader.sh` (a static
+192.168.1.130, since DHCP never completes through flycast's bridge; built in a
+copy of the loader tree; `dcload-resident-net.elf` does not fit with a static
+IP and is left out). The harness copies `game-memory.tsv` per run (`--learn`
+writes the real one), and passes `--no-ra --no-vm2 --keepalive 0` (keepalive
+ended a live session at a title screen). **Any GDB connection makes flycast
+halt for good at the guest's next illegal instruction** (`attached` is never
+cleared), and the harness connects once to resume a GDB-server build, so a
+title that runs `0x0000` (a loader overwritten) freezes rather than taking an
+exception: `check` reports that state.
+
 Watch `cargo test` warnings: a `#[test]` separated from its function by a doc
 comment silently stops the test running (happened twice).
 

@@ -1,0 +1,8 @@
+# Images for scripts/flycast-harness.py --list. One per line; after " ;; ",
+# harness options for that image (--duration, --input, --grace, ...) and any
+# other option, which goes to u-exec. --input is TIME:KEY[*COUNT][:HOLD], in
+# milliseconds after EXEC (HOLD: how long the key is held, default --hold 120).
+C:\Users\arnod\Downloads\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi ;; --duration 150 --input 60000:start,70000:start:200
+C:\Users\arnod\Downloads\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!]\Crazy Taxi v1.000 (2000)(Sega)(PAL)[!].gdi
+V:\Téléchargements\DreamcastCollectionByGhostwareMulti-region\Jet Set Radio v1.002 (2000)(Sega)(PAL)(M4)[!].zip ;; --duration 180
+V:\Téléchargements\DreamcastCollectionByGhostwareMulti-region\Snow Surfers v1.001 (1999)(Sega)(PAL)[!].zip
